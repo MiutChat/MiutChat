@@ -1,0 +1,22 @@
+User-agent: *
+Disallow: /private/
+Disallow: /tmp/
+Allow: /
+
+# Sitemap location
+Sitemap: https://miutchat.pages.dev/sitemap.xml
+
+
+# Specific rules for Googlebot
+User-agent: Googlebot
+Allow: /
+
+# Specific rules for Bingbot
+User-agent: Bingbot
+Allow: /
+
+# Block bad bots
+User-agent: AhrefsBot
+Disallow: /
+User-agent: MJ12bot
+Disallow: /

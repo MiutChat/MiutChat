@@ -1,0 +1,3 @@
+Contact: https://github.com/MiutChat/MiutChat/issues
+Policy: https://miutchat.pages.dev/privacy.html
+Expires: 2027-01-01T00:00:00Z

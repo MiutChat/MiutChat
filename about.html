@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>About MiutChat — Anonymous Encrypted Chat</title>
+<meta name="description" content="About MiutChat: an open-source, anonymous, end-to-end encrypted ephemeral chat application built on AES-256-GCM and ECDSA. Zero knowledge, zero accounts."/>
+<meta name="robots" content="index,follow"/>
+<link rel="canonical" href="https://miutchat.pages.dev/about.html"/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="About MiutChat — Zero Knowledge Encrypted Chat"/>
+<meta property="og:description" content="MiutChat is a privacy-first encrypted anonymous chat platform. No accounts, no servers that can read your messages, no digital footprint."/>
+<meta property="og:url" content="https://miutchat.pages.dev/about.html"/>
+<meta property="og:image" content="https://miutchat.pages.dev/icons/icon-512.png"/>
+<meta name="theme-color" content="#050d0c"/>
+<link rel="icon" type="image/png" href="icons/icon-192.png"/>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebPage","name":"About MiutChat","url":"https://miutchat.pages.dev/about.html","description":"MiutChat is an open-source anonymous encrypted chat application built with AES-256-GCM, ECDSA, and HKDF. Zero knowledge architecture.","isPartOf":{"@type":"WebSite","name":"MiutChat","url":"https://miutchat.pages.dev/"}}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet"/>
+<style>
+:root{--t:#4ecdc4;--t2:#39bdb4;--tdim:rgba(78,205,196,.08);--tb:rgba(78,205,196,.17);--bg:#050d0c;--bg2:#091413;--g:rgba(9,18,17,.75);--g2:rgba(12,22,21,.88);--s2:#172c2a;--bdr:rgba(78,205,196,.12);--bdr2:rgba(78,205,196,.06);--tx:#cdeae7;--tx2:#4e7a77;--fui:'Syne',sans-serif;--fm:'Space Mono',monospace;--r:16px;--r2:22px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font-family:var(--fm);-webkit-font-smoothing:antialiased;line-height:1.75}
+a{color:var(--t);text-decoration:none}a:hover{text-decoration:underline}
+nav{position:sticky;top:0;z-index:100;height:62px;display:flex;align-items:center;justify-content:space-between;padding:0 6%;background:rgba(5,13,12,.88);border-bottom:1px solid var(--bdr);backdrop-filter:blur(24px)}
+.nlogo{display:flex;align-items:center;gap:10px}
+.nlogo img{width:30px;height:30px;border-radius:9px}
+.nlogo span{font-family:var(--fui);font-size:.85rem;font-weight:800;letter-spacing:4px;color:#fff}
+.nlaunch{padding:9px 20px;background:var(--t);color:var(--bg);font-family:var(--fui);font-size:.64rem;font-weight:800;letter-spacing:2px;border-radius:var(--r);transition:background .14s,transform .14s}
+.nlaunch:hover{background:var(--t2);transform:scale(1.04);text-decoration:none}
+.hero{padding:100px 6% 80px;text-align:center;position:relative;overflow:hidden}
+.hbg{position:absolute;inset:0;background:radial-gradient(ellipse 68% 58% at 50% 44%,rgba(78,205,196,.10) 0%,transparent 62%);pointer-events:none}
+.hlbl{font-family:var(--fui);font-size:.6rem;font-weight:700;letter-spacing:4px;color:var(--t);margin-bottom:16px;position:relative}
+h1{font-family:var(--fui);font-size:clamp(2rem,5vw,3.2rem);font-weight:800;color:#fff;line-height:1.1;margin-bottom:18px;position:relative}
+.hsub{font-family:var(--fm);font-size:.88rem;color:var(--tx2);line-height:1.88;max-width:580px;margin:0 auto;position:relative}
+main{max-width:900px;margin:0 auto;padding:0 6% 96px}
+section{padding:64px 0;border-top:1px solid var(--bdr)}
+.slbl{font-family:var(--fui);font-size:.6rem;font-weight:700;letter-spacing:4px;color:var(--t);margin-bottom:14px}
+h2{font-family:var(--fui);font-size:1.5rem;font-weight:800;color:#fff;line-height:1.14;margin-bottom:16px}
+h3{font-family:var(--fui);font-size:.92rem;font-weight:700;color:var(--tx);letter-spacing:.5px;margin:24px 0 10px}
+p{font-size:.78rem;color:var(--tx2);line-height:1.88;margin-bottom:14px}
+ul,ol{padding-left:22px;margin-bottom:14px}
+li{font-size:.78rem;color:var(--tx2);line-height:1.88;margin-bottom:6px}
+li strong{color:var(--tx)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:32px}
+.card{padding:24px 20px;background:var(--g);border:1px solid var(--bdr);border-radius:var(--r2);transition:border-color .18s,transform .18s}
+.card:hover{border-color:var(--tb);transform:translateY(-3px)}
+.card-icon{width:44px;height:44px;border-radius:13px;background:var(--tdim);border:1px solid var(--tb);display:flex;align-items:center;justify-content:center;margin-bottom:16px;color:var(--t)}
+.card-title{font-family:var(--fui);font-size:.82rem;font-weight:700;color:#fff;margin-bottom:9px}
+.card-desc{font-family:var(--fm);font-size:.7rem;color:var(--tx2);line-height:1.75}
+.tech-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}
+.tech-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;background:var(--tdim);border:1px solid var(--tb);border-radius:100px;font-family:var(--fui);font-size:.6rem;font-weight:700;letter-spacing:1.5px;color:var(--t)}
+.pipeline{display:flex;flex-direction:column;gap:0;margin-top:28px;border:1px solid var(--bdr);border-radius:var(--r2);overflow:hidden}
+.pipe-step{display:flex;align-items:flex-start;gap:16px;padding:18px 20px;border-bottom:1px solid var(--bdr2)}
+.pipe-step:last-child{border-bottom:none}
+.pipe-n{width:28px;height:28px;border-radius:50%;background:var(--t);color:var(--bg);font-family:var(--fui);font-size:.72rem;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px}
+.pipe-text strong{font-family:var(--fui);font-size:.78rem;font-weight:700;color:var(--tx);display:block;margin-bottom:4px}
+.pipe-text span{font-family:var(--fm);font-size:.7rem;color:var(--tx2);line-height:1.7}
+.hl{background:var(--tdim);border:1px solid var(--tb);border-radius:var(--r);padding:18px 20px;margin:20px 0}
+.hl p{margin:0;color:var(--tx);font-size:.78rem}
+footer{border-top:1px solid var(--bdr);padding:24px 6%;text-align:center;font-size:.62rem;color:var(--tx2);letter-spacing:.5px}
+footer a{color:var(--t)}
+@media(max-width:600px){.grid{grid-template-columns:1fr}.hero{padding:80px 6% 60px}}
+</style>
+  <meta name="google-adsense-account" content="ca-pub-3612530304259447">
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3612530304259447" crossorigin="anonymous"></script>
+</head>
+<body>
+<nav>
+  <a href="landing.html" class="nlogo">
+    <img src="icons/icon-192.png" alt="MiutChat"/>
+    <span>MIUT</span>
+  </a>
+  <a href="index.html" class="nlaunch">Launch App &#8594;</a>
+</nav>
+
+<div class="hero">
+  <div class="hbg"></div>
+  <div class="hlbl">ABOUT MIUTCHAT</div>
+  <h1>Built for trust.<br/>Designed for ghosts.</h1>
+  <p class="hsub">MiutChat is an open-source, anonymous, end-to-end encrypted ephemeral chat application. No accounts. No persistent data. No digital footprint. Messages exist only in memory — then vanish.</p>
+</div>
+
+<main>
+  <section>
+    <div class="slbl">MISSION</div>
+    <h2>Why MiutChat exists.</h2>
+    <p>The overwhelming majority of chat applications are built on a foundational conflict of interest: the platform needs your data to monetize, and your privacy is the cost. MiutChat was built to eliminate this conflict entirely by making it technically impossible for us to access your communications.</p>
+    <p>We believe in the right to private communication as a fundamental human right. MiutChat is the engineering expression of that belief: a system architected so that even compelled disclosure cannot reveal your messages, because we do not have them.</p>
+  </section>
+
+  <section>
+    <div class="slbl">ENCRYPTION ARCHITECTURE</div>
+    <h2>How the cryptography works.</h2>
+    <p>Every aspect of the encryption pipeline was chosen for maximum security and verifiability using only the browser's native Web Crypto API — no third-party cryptographic libraries, no external dependencies that could be compromised.</p>
+
+    <div class="pipeline">
+      <div class="pipe-step">
+        <div class="pipe-n">1</div>
+        <div class="pipe-text"><strong>Text Normalization</strong><span>Input is normalized to NFKC Unicode form before encryption to ensure deterministic byte representation across platforms and locales.</span></div>
+      </div>
+      <div class="pipe-step">
+        <div class="pipe-n">2</div>
+        <div class="pipe-text"><strong>Adaptive Compression</strong><span>Deflate-raw compression via CompressionStream reduces payload before encryption. Already-compressed formats (JPEG, MP4, WebP, ZIP) skip this step to avoid size increase.</span></div>
+      </div>
+      <div class="pipe-step">
+        <div class="pipe-n">3</div>
+        <div class="pipe-text"><strong>HKDF Key Derivation</strong><span>Per-message keys are derived using HKDF-SHA-256 with context binding: roomCode, epoch, timestamp, and chunk index. No two messages ever share a key.</span></div>
+      </div>
+      <div class="pipe-step">
+        <div class="pipe-n">4</div>
+        <div class="pipe-text"><strong>AES-256-GCM Encryption</strong><span>Each message or chunk is encrypted with a unique 96-bit cryptographically random IV. Additional Authenticated Data (AAD) binds the ciphertext to its context, preventing replay and cross-room attacks.</span></div>
+      </div>
+      <div class="pipe-step">
+        <div class="pipe-n">5</div>
+        <div class="pipe-text"><strong>ECDSA P-256 Signing</strong><span>Every message is signed with a per-device ECDSA P-256 private key stored in IndexedDB. The corresponding public key is published to the room for recipient verification. Tampered messages are silently dropped.</span></div>
+      </div>
+      <div class="pipe-step">
+        <div class="pipe-n">6</div>
+        <div class="pipe-text"><strong>Epoch Rotation</strong><span>The room's encryption epoch increments periodically or on demand. Each epoch uses a freshly derived base key from PBKDF2, providing forward secrecy: past epoch keys cannot decrypt future messages.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="slbl">FEATURES</div>
+    <h2>What MiutChat offers.</h2>
+    <div class="grid">
+      <div class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" stroke-width="1.6"/><path d="M7 11V7a5 5 0 0110 0v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+        <div class="card-title">Zero Knowledge</div>
+        <div class="card-desc">All encryption occurs in your browser. The server stores only ciphertext it cannot decrypt. No key escrow. No backdoor.</div>
+      </div>
+      <div class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M12 2a10 10 0 100 20A10 10 0 0012 2z" stroke="currentColor" stroke-width="1.6"/><path d="M15 9l-3 3-3-3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="card-title">Ephemeral Rooms</div>
+        <div class="card-desc">Rooms self-destruct when empty. Messages, keys, and member records are permanently wiped — not archived.</div>
+      </div>
+      <div class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.6"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></div>
+        <div class="card-title">Anonymous Identity</div>
+        <div class="card-desc">No email, phone, or name required. A random callsign is assigned per session. Firebase Anonymous Auth provides a disposable session token only.</div>
+      </div>
+      <div class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>
+        <div class="card-title">Real-Time Messaging</div>
+        <div class="card-desc">Instant delivery via Firestore live subscriptions. Typing indicators, read receipts, reactions, threaded replies — all encrypted.</div>
+      </div>
+      <div class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="card-title">Encrypted File Transfer</div>
+        <div class="card-desc">Files up to 25MB encrypted client-side and chunked adaptively for Firestore's 1MB document limit. Stream-based processing minimizes memory usage.</div>
+      </div>
+      <div class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M1 6l5 5 4-4 8 8 5-5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="card-title">Offline Support</div>
+        <div class="card-desc">Service Worker with Cache-First strategy. IndexedDB message cache. Full PWA — installable, works offline for reading cached messages.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="slbl">TECHNOLOGY STACK</div>
+    <h2>Built with.</h2>
+    <div class="tech-row">
+      <span class="tech-badge">AES-256-GCM</span>
+      <span class="tech-badge">ECDSA P-256</span>
+      <span class="tech-badge">HKDF-SHA-256</span>
+      <span class="tech-badge">PBKDF2</span>
+      <span class="tech-badge">Web Crypto API</span>
+      <span class="tech-badge">Firebase Firestore</span>
+      <span class="tech-badge">Cloudflare Pages</span>
+      <span class="tech-badge">Cloudflare Workers KV</span>
+      <span class="tech-badge">Service Worker</span>
+      <span class="tech-badge">IndexedDB</span>
+      <span class="tech-badge">CompressionStream API</span>
+      <span class="tech-badge">Vanilla JavaScript</span>
+    </div>
+    <div class="hl" style="margin-top:28px">
+      <p><strong>No framework. No bundled dependencies.</strong> MiutChat is written in pure browser JavaScript to minimize attack surface. The only third-party runtime dependency is the Firebase compat SDK for Firestore and Anonymous Authentication — loaded from Google's CDN and constrained by a strict Content Security Policy.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="slbl">OPEN SOURCE</div>
+    <h2>Built in public.</h2>
+    <p>MiutChat is fully open source under the MIT License. Every line of encryption code, every Firestore security rule, every Cloudflare Worker — visible, auditable, and forkable.</p>
+    <p>We believe security through obscurity is not security. The strength of MiutChat's security model derives from the strength of the algorithms and their correct implementation — not from keeping them secret.</p>
+    <p>Contributions, security disclosures, and audits are welcome at: <a href="https://github.com/MiutChat/MiutChat" target="_blank" rel="noopener">github.com/MiutChat/MiutChat</a></p>
+  </section>
+
+  <section>
+    <div class="slbl">LIMITATIONS</div>
+    <h2>What MiutChat cannot protect against.</h2>
+    <p>Encryption is not a panacea. MiutChat provides strong guarantees for data in transit and at rest on our servers. It cannot protect against:</p>
+    <ul>
+      <li><strong>Endpoint compromise:</strong> Malware, keyloggers, or physical access to a device can expose messages before encryption or after decryption;</li>
+      <li><strong>Screen capture:</strong> Anyone with access to your screen can capture displayed messages;</li>
+      <li><strong>Social engineering:</strong> A malicious participant in your room can see all decrypted messages;</li>
+      <li><strong>Browser extension attacks:</strong> Untrusted browser extensions have access to page content;</li>
+      <li><strong>Room code interception:</strong> If your room code is intercepted during sharing, a third party can join your room.</li>
+    </ul>
+    <p>For high-stakes communications involving journalism, legal strategy, or personal safety, consider using a dedicated, independently audited end-to-end encrypted secure messaging application as a more mature alternative.</p>
+  </section>
+</main>
+
+<footer>
+  &#169; 2025 MiutChat &nbsp;&#183;&nbsp;
+  <a href="/privacy.html">Privacy Policy</a> &nbsp;&#183;&nbsp;
+  <a href="/terms.html">Terms of Service</a> &nbsp;&#183;&nbsp;
+  <a href="mailto:feedback.miut@zohomail.in">Contact</a> &nbsp;&#183;&nbsp;
+  <a href="/landing.html">Home</a> &nbsp;&#183;&nbsp;
+  <a href="https://github.com/MiutChat/MiutChat" target="_blank" rel="noopener">GitHub</a>
+</footer>
+</body>
+</html>

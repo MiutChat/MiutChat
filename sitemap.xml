@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://miutchat.pages.dev/landing.html</loc>
+    <changefreq>monthly</changefreq>
+    <priority>1.0</priority>
+    <lastmod>2026-04-01</lastmod>
+  </url>
+  <url>
+    <loc>https://miutchat.pages.dev/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+    <lastmod>2026-04-01</lastmod>
+  </url>
+  <url>
+    <loc>https://miutchat.pages.dev/about.html</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+    <lastmod>2026-04-01</lastmod>
+  </url>
+  <url>
+    <loc>https://miutchat.pages.dev/privacy.html</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+    <lastmod>2026-04-01</lastmod>
+  </url>
+  <url>
+    <loc>https://miutchat.pages.dev/terms.html</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+    <lastmod>2026-04-01</lastmod>
+  </url>
+</urlset>
