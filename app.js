@@ -2226,30 +2226,46 @@ function startChatListeners() {
       if (ch.type === 'modified') { patchMsg(ch.doc.id, ch.doc.data()); return; }
       if (ch.type !== 'added') return;
       const id = ch.doc.id, data = ch.doc.data();
-      if (_renderedIds.has(id)) return;
-      // Canary check — detect replay/injection (async, non-blocking)
-      _registerCanary(id, data.enc || data.encData || '').catch(() => {});
-      _renderedIds.add(id);
-      // PART 8: replay protection — reject stale or duplicate messages
-      const _msgTs = data.ts || 0;
-      if (_msgTs && typeof validateMessageTimestamp === 'function' && !validateMessageTimestamp(_msgTs)) {
-        // stale message outside replay window — skip render
-      } else {
-        if (typeof trackNonce === 'function' && !trackNonce(id)) {
-          // exact duplicate nonce — skip render
+      // Own messages sent via sendMessage() are already rendered optimistically
+      // and reconciled into _renderedIds before this snapshot fires (see
+      // _reconcileSentMessage) — skip re-rendering them, but still cache and
+      // advance _lastCachedTs so history/offline state stays correct.
+      let alreadyRendered = _renderedIds.has(id);
+      // Race guard: this snapshot can in rare cases arrive before the add()
+      // promise above resolves. If so, reconcile against the still-pending
+      // optimistic bubble instead of rendering a duplicate.
+      if (!alreadyRendered && data.senderId === state.me?.id && data.ts && _pendingByTs.has(data.ts)) {
+        const _localId = _pendingByTs.get(data.ts);
+        _pendingByTs.delete(data.ts);
+        _pendingMsgPayloads.delete(_localId);
+        _reconcileSentMessage(_localId, id, data);
+        alreadyRendered = true;
+      }
+      if (!alreadyRendered) {
+        // Canary check — detect replay/injection (async, non-blocking)
+        _registerCanary(id, data.enc || data.encData || '').catch(() => {});
+        _renderedIds.add(id);
+        // PART 8: replay protection — reject stale or duplicate messages
+        const _msgTs = data.ts || 0;
+        if (_msgTs && typeof validateMessageTimestamp === 'function' && !validateMessageTimestamp(_msgTs)) {
+          // stale message outside replay window — skip render
         } else {
-          $('msg-skeleton') && ($('msg-skeleton').style.display = 'none'); $('room-welcome')?.style && ($('room-welcome').style.display = 'none');
-          // PART 5: afterReceive hook
-          let _rcvPayload = { id, data };
-          if (typeof runHooks === 'function') _rcvPayload = await runHooks('afterReceive', _rcvPayload);
-          renderMsg(_rcvPayload.data || data, _rcvPayload.id || id);
-        } // end trackNonce
-      } // end validateMessageTimestamp
-      hasNew = true;
+          if (typeof trackNonce === 'function' && !trackNonce(id)) {
+            // exact duplicate nonce — skip render
+          } else {
+            $('msg-skeleton') && ($('msg-skeleton').style.display = 'none'); $('room-welcome')?.style && ($('room-welcome').style.display = 'none');
+            // PART 5: afterReceive hook
+            let _rcvPayload = { id, data };
+            if (typeof runHooks === 'function') _rcvPayload = await runHooks('afterReceive', _rcvPayload);
+            renderMsg(_rcvPayload.data || data, _rcvPayload.id || id);
+          } // end trackNonce
+        } // end validateMessageTimestamp
+        hasNew = true;
+      }
       const docTs = data.ts || 0;
       if (docTs > _lastCachedTs) _lastCachedTs = docTs;
       cacheMsg(id, code, data).catch(() => {});
-      if (data.type === 'text' && data.senderId !== state.me?.id) {
+      if (!alreadyRendered && data.type === 'text' && data.senderId !== state.me?.id) {
         playSound('receive');
         // Queue read receipt for incoming text messages
         if (!document.hidden) _queueReadAck(id);
@@ -3049,12 +3065,18 @@ function _wireLongPress(wrap, docId) {
   let timer = null;
   const START_EVENTS = ['touchstart','mousedown'];
   const END_EVENTS   = ['touchend','touchcancel','mouseup','mouseleave'];
+  // Read docId live off the element rather than the closure — an
+  // optimistically-rendered message gets its dataset.docId swapped from a
+  // temporary local id to the real Firestore id once the server acks it
+  // (see _reconcileSentMessage), and this handler must follow that swap
+  // instead of acting on the now-stale id it was first wired with.
+  const currentId = () => wrap.dataset.docId || docId;
 
   START_EVENTS.forEach(ev => wrap.addEventListener(ev, () => {
     timer = setTimeout(() => {
       if (navigator.vibrate) navigator.vibrate(28);
       if (!_selectMode) _enterSelectMode();
-      _toggleSelectMsg(docId, wrap);
+      _toggleSelectMsg(currentId(), wrap);
     }, 500);
   }, { passive: true }));
   END_EVENTS.forEach(ev => wrap.addEventListener(ev, () => {
@@ -3064,7 +3086,7 @@ function _wireLongPress(wrap, docId) {
   wrap.addEventListener('click', e => {
     if (_selectMode) {
       e.stopPropagation();
-      _toggleSelectMsg(docId, wrap);
+      _toggleSelectMsg(currentId(), wrap);
     }
   });
 }
@@ -3236,8 +3258,24 @@ async function sendMessage() {
 
   // Extend room expiry on activity (30min from last message)
   _extendRoomTtl();
+
+  // Optimistic render: show the bubble immediately instead of waiting for
+  // the Firestore round trip. This matters because createdAt uses
+  // serverTimestamp(), which stays unresolved (null) in the local cache
+  // until the server acks it — the live listener's `createdAt > since`
+  // filter won't surface an unresolved doc, so without this the sender's
+  // own message would visibly lag even on a fast connection.
+  const _localId = 'local_' + ts_client + '_' + Math.random().toString(36).slice(2, 8);
+  _pendingMsgPayloads.set(_localId, msgData); // kept for tap-to-retry on failure
+  _pendingByTs.set(ts_client, _localId);
+  await renderMsg(msgData, _localId);
+  scrollBottom();
+
   db.collection('rooms').doc(state.roomCode).collection('messages').add(msgData)
-    .then(() => {
+    .then(ref => {
+      _pendingMsgPayloads.delete(_localId);
+      _pendingByTs.delete(ts_client);
+      _reconcileSentMessage(_localId, ref.id, msgData);
       _ping('message_sent');
       // Auto-rotate epoch every N messages (admin only, silent)
       if (_isAdmin) {
@@ -3247,18 +3285,86 @@ async function sendMessage() {
         }
       }
     })
-    .catch(e => { toast('Send failed', e.message, 'err'); });
+    .catch(e => {
+      _markMessageFailed(_localId);
+      toast('Send failed', e.message, 'err');
+    });
   playSound('send');
 }
-async function sendSys(text) {
-  if (!state.roomCode || !state.me?.id) return;
+
+const _pendingMsgPayloads = new Map(); // localId → full msgData, kept only until reconciled (for tap-to-retry)
+// ts_client → localId. Lets the live listener recognize a race where its own
+// 'added' event for this doc arrives before the add() promise resolves, so it
+// reconciles instead of rendering a duplicate bubble.
+const _pendingByTs = new Map();
+
+/**
+ * _reconcileSentMessage — once the server acks an optimistically-rendered
+ * message, swap its temporary local id for the real Firestore docId (so
+ * later edit/delete/reply-by-id actions work) and flip its status badge
+ * from "sending" to "sent". Also registers the real id so the live
+ * listener's own eventual 'added' event for this doc is recognized as
+ * already-rendered and skipped instead of duplicating the bubble.
+ */
+function _reconcileSentMessage(localId, realId, msgData) {
+  _renderedIds.add(realId);
+  const wrap = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(localId)}"]`);
+  if (!wrap) return;
+  wrap.dataset.docId = realId; // _wireLongPress reads this live, no re-wiring needed
+  const statusEl = wrap.querySelector('.msg-status');
+  if (statusEl) statusEl.outerHTML = _readStatusBadge(msgData, realId);
+}
+
+/** _markMessageFailed — flip a still-pending optimistic bubble into a
+ * visibly failed state with a tap-to-retry affordance. */
+function _markMessageFailed(localId) {
+  const wrap = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(localId)}"]`);
+  if (!wrap) return;
+  wrap.classList.add('send-failed');
+  const statusEl = wrap.querySelector('.msg-status');
+  if (statusEl) {
+    statusEl.outerHTML = '<span class="msg-status msg-status-failed" title="Not sent — tap to retry">!</span>';
+  }
+  const bubble = wrap.querySelector('.msg-bubble');
+  const retry = () => _retrySendFailed(localId);
+  bubble?.addEventListener('click', retry, { once: true });
+  wrap.querySelector('.msg-status-failed')?.addEventListener('click', retry, { once: true });
+}
+
+/** _retrySendFailed — re-attempts sending a failed optimistic message
+ * using its original (already-encrypted) payload, no re-encryption needed. */
+function _retrySendFailed(localId) {
+  const wrap = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(localId)}"]`);
+  const msgData = _pendingMsgPayloads.get(localId);
+  if (!wrap || !msgData || !state.roomCode || !db) return;
+
+  wrap.classList.remove('send-failed');
+  const statusEl = wrap.querySelector('.msg-status');
+  if (statusEl) statusEl.outerHTML = '<span class="msg-status msg-status-pending" title="Sending…">○</span>';
+
+  msgData.createdAt = ts_now(); // refresh — the old sentinel already failed once
+  db.collection('rooms').doc(state.roomCode).collection('messages').add(msgData)
+    .then(ref => {
+      _pendingMsgPayloads.delete(localId);
+      _pendingByTs.delete(msgData.ts);
+      _reconcileSentMessage(localId, ref.id, msgData);
+    })
+    .catch(e => { _markMessageFailed(localId); toast('Send failed', e.message, 'err'); });
+}
+async function sendSys(text, roomCodeOverride, meOverride) {
+  // Optional overrides let callers running after global `state` has been
+  // cleared (e.g. background leave-room cleanup) still send correctly —
+  // see handleLogout / _handoffAdminRole.
+  const _roomCode = roomCodeOverride || state.roomCode;
+  const _me       = meOverride || state.me;
+  if (!_roomCode || !_me?.id) return;
   const _sts  = Date.now();
-  const _senc = await enc(text, state.roomCode);
+  const _senc = await enc(text, _roomCode);
   // senderId required by Firestore rules (hasAll check on messages create)
-  await db.collection('rooms').doc(state.roomCode).collection('messages').add({
+  await db.collection('rooms').doc(_roomCode).collection('messages').add({
     type:      'system',
     enc:       _senc,
-    senderId:  state.me.id,   // ← required by security rules
+    senderId:  _me.id,   // ← required by security rules
     createdAt: ts_now(),
     ts:        _sts,
   }).catch(() => {});
@@ -3527,8 +3633,14 @@ let _searchActive  = false;
 /**
  * _readStatusBadge — builds the ✓ / ✓✓ span for sent messages.
  * Reads readBy map safely; never throws.
+ * docId is checked for the 'local_' prefix used by optimistic sends —
+ * those get a pending indicator instead of a real read/sent status
+ * until the server ack reconciles them (see sendMessage / _reconcileSentMessage).
  */
-function _readStatusBadge(data) {
+function _readStatusBadge(data, docId) {
+  if (docId && String(docId).startsWith('local_')) {
+    return '<span class="msg-status msg-status-pending" title="Sending…">○</span>';
+  }
   try {
     const readBy  = data.readBy || {};
     const sender  = data.senderId || '';
@@ -3653,7 +3765,7 @@ async function renderMsg(data, docId) {
           <div class="msg-bubble">${bubble}</div>
           <div class="msg-meta">
             <span class="msg-time-sm">${fmtTime(data.ts)}</span>
-            ${isMine ? _readStatusBadge(data) : ''}
+            ${isMine ? _readStatusBadge(data, docId) : ''}
           </div>
           <div class="msg-reactions" data-rid="${esc(docId || '')}"></div>
         </div>
@@ -4616,10 +4728,15 @@ function toggleVis(inputId, btnId) {
   btn.querySelector('.eye-closed').style.display = inp.type === 'password' ? 'none'  : 'block';
 }
 
-async function _handoffAdminRole() {
-  if (!state.roomCode || !state.me) return;
+async function _handoffAdminRole(roomCodeOverride, meOverride) {
+  // Optional overrides let this run safely in background cleanup after
+  // handleLogout has already cleared the global `state` — every reference
+  // below uses these captured values, not `state.*`.
+  const _roomCode = roomCodeOverride || state.roomCode;
+  const _me       = meOverride || state.me;
+  if (!_roomCode || !_me) return;
   try {
-    const snap = await db.collection('rooms').doc(state.roomCode)
+    const snap = await db.collection('rooms').doc(_roomCode)
       .collection('members')
       .where('online', '==', true)
       .where('approved', '==', true)
@@ -4629,7 +4746,7 @@ async function _handoffAdminRole() {
 
     // First try online members
     snap.forEach(doc => {
-      if (doc.id !== state.me.id && doc.data().role !== 'admin' && !nextUid) {
+      if (doc.id !== _me.id && doc.data().role !== 'admin' && !nextUid) {
         nextUid  = doc.id;
         nextName = doc.data().name;
       }
@@ -4637,12 +4754,12 @@ async function _handoffAdminRole() {
 
     // If no online members found, fall back to any approved member (even offline)
     if (!nextUid) {
-      const allSnap = await db.collection('rooms').doc(state.roomCode)
+      const allSnap = await db.collection('rooms').doc(_roomCode)
         .collection('members')
         .where('approved', '==', true)
         .get();
       allSnap.forEach(doc => {
-        if (doc.id !== state.me.id && doc.data().role !== 'admin' && !nextUid) {
+        if (doc.id !== _me.id && doc.data().role !== 'admin' && !nextUid) {
           nextUid  = doc.id;
           nextName = doc.data().name;
         }
@@ -4650,10 +4767,10 @@ async function _handoffAdminRole() {
     }
 
     if (nextUid) {
-      await db.collection('rooms').doc(state.roomCode)
+      await db.collection('rooms').doc(_roomCode)
         .collection('members').doc(nextUid)
         .update({ role: 'admin' });
-      await sendSys(`${nextName} is now an admin ◆`);
+      await sendSys(`${nextName} is now an admin ◆`, _roomCode, _me);
     }
   } catch {}
 }
@@ -4662,7 +4779,11 @@ async function handleLogout() {
   const ok = await showConfirm('Leave Room?', 'You can rejoin at any time using the room code.', 'LEAVE');
   if (!ok) return;
 
-  const _leavingRoomCode = state.roomCode; // captured before teardown clears it
+  // Snapshot everything the background cleanup below will need — state.*
+  // gets cleared in the next few lines so the UI can close instantly.
+  const _leavingRoomCode = state.roomCode;
+  const _leavingMe       = state.me;
+  const _wasAdmin        = state.me?.role === 'admin';
 
   clearMyTyping();
   clearInterval(_heartbeat);
@@ -4671,24 +4792,10 @@ async function handleLogout() {
   if (_unsubApproval) { try { _unsubApproval(); } catch {} _unsubApproval = null; }
   _isAdmin = false;
 
-  // Network/Firestore steps are best-effort — a hiccup here (offline, slow
-  // connection, permission timing) must never block local teardown or the
-  // feedback prompt below. Each failure is caught and logged, never thrown.
-  if (state.roomCode && state.me) {
-    try {
-      if (state.me.role === 'admin') await _handoffAdminRole();
-    } catch (e) { console.warn('[MIUT] Admin handoff failed:', e); }
-
-    try {
-      await sendSys(`${state.me.name} left the room`);
-    } catch (e) { console.warn('[MIUT] Leave system message failed:', e); }
-
-    try {
-      await db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
-        .update({ online: false });
-    } catch (e) { console.warn('[MIUT] Marking offline failed:', e); }
-  }
-
+  // ── Instant local close ────────────────────────────────────────────────
+  // Everything below is local-only (no network waits), so the room view
+  // closes and the feedback prompt appears immediately, instead of waiting
+  // on the Firestore round trips below.
   try {
     stopListeners();
     localStorage.removeItem(CONFIG.SESSION_KEY);
@@ -4718,6 +4825,26 @@ async function handleLogout() {
     // (a sibling of /rooms in Firestore). Runs even if a step above failed,
     // so a network hiccup never silently swallows the prompt.
     showFeedbackModal(_leavingRoomCode).catch(() => {});
+  }
+
+  // ── Background network cleanup (fire-and-forget) ───────────────────────
+  // Runs after the UI has already closed. Each step is independently
+  // caught — a failure here never affects what the person already sees.
+  if (_leavingRoomCode && _leavingMe) {
+    (async () => {
+      try {
+        if (_wasAdmin) await _handoffAdminRole(_leavingRoomCode, _leavingMe);
+      } catch (e) { console.warn('[MIUT] Admin handoff failed:', e); }
+
+      try {
+        await sendSys(`${_leavingMe.name} left the room`, _leavingRoomCode, _leavingMe);
+      } catch (e) { console.warn('[MIUT] Leave system message failed:', e); }
+
+      try {
+        await db.collection('rooms').doc(_leavingRoomCode).collection('members').doc(_leavingMe.id)
+          .update({ online: false });
+      } catch (e) { console.warn('[MIUT] Marking offline failed:', e); }
+    })();
   }
 }
 
