@@ -381,9 +381,9 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .reaction-chip:active{transform:scale(.9)}
 .reaction-chip.mine{border-color:var(--teal-b);background:var(--teal-dim)}
 /* Force emoji font — prevents monospace font overriding system emoji glyphs */
-.reaction-emoji{font-family:"Apple Color Emoji","Noto Color Emoji","Segoe UI Emoji",sans-serif;font-size:1rem;line-height:1;display:inline-block}
+.reaction-emoji{font-size:1rem;line-height:1;display:inline-block}
 /* Also fix emoji in the quick-react strip and grid */
-.strip-emoji,.strip-emoji-grid-btn{font-family:"Apple Color Emoji","Noto Color Emoji","Segoe UI Emoji",sans-serif!important}
+.strip-emoji,.strip-emoji-grid-btn,.reaction-emoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol","Noto Color Emoji","Twemoji Mozilla",sans-serif!important;font-variant-emoji:emoji}
 .reaction-count{font-family:var(--fui);font-size:.6rem;font-weight:700;color:var(--text2);min-width:10px}
 .reaction-chip.mine .reaction-count{color:var(--teal)}
 .msg-actions{display:flex;flex-direction:column;gap:4px;opacity:0;flex-shrink:0;margin:0 4px;transition:opacity var(--fast) ease}
@@ -395,7 +395,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .msg-delete-btn:hover{color:var(--danger);border-color:var(--danger);background:var(--d-dim);transform:scale(1.14)}
 .msg-reply-btn:active,.msg-react-btn:active,.msg-delete-btn:active{transform:scale(.82)}
 /* Action strip */
-.msg-action-strip{position:absolute;bottom:calc(100% + 10px);z-index:80;display:flex;flex-direction:column;gap:0;background:var(--glass2);border:1px solid var(--border);border-radius:22px;padding:6px;box-shadow:var(--sh-lg);min-width:248px;max-width:295px;opacity:0;transform:scale(.84) translateY(14px);transition:opacity .17s ease,transform .22s var(--spring);pointer-events:none;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
+.msg-action-strip{position:absolute;bottom:calc(100% + 10px);z-index:80;display:flex;flex-direction:column;gap:0;background:var(--glass2);border:1px solid var(--border);border-radius:22px;padding:6px;box-shadow:var(--sh-lg);min-width:248px;max-width:295px;opacity:0;transform:scale(.84) translateY(14px);transition:opacity .17s ease,transform .22s var(--spring);pointer-events:none;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
 .msg-action-strip.visible{opacity:1;transform:none;pointer-events:all}
 .msg-wrapper.sent .msg-action-strip{right:0;left:auto;transform-origin:bottom right}
 .msg-wrapper.received .msg-action-strip{left:0;right:auto;transform-origin:bottom left}

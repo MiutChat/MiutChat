@@ -2017,23 +2017,30 @@ async function fetchHistoryOnce(code) {
     }
 
     let hasNew = false;
-    docs.forEach(doc => {
-      if (_renderedIds.has(doc.id)) return;
+    for (const doc of docs) {
+      if (_renderedIds.has(doc.id)) continue;
       const data = doc.data();
       _renderedIds.add(doc.id);
       $('msg-skeleton') && ($('msg-skeleton').style.display = 'none'); $('room-welcome')?.style && ($('room-welcome').style.display = 'none');
-      renderMsg(data, doc.id);
+      // Awaited deliberately — renderMsg is async (it awaits decryption
+      // before appending to the DOM). Firing these off unawaited inside a
+      // loop let each message's decrypt finish in a different order than it
+      // was sent, scrambling history order for anyone loading a room fresh.
+      await renderMsg(data, doc.id);
       hasNew = true;
       // Defer IDB write to idle time — doesn't block rendering
       (window.requestIdleCallback || setTimeout)(() => cacheMsg(doc.id, code, data).catch(() => {}));
       const docTs = data.createdAt?.toMillis?.() ?? data.ts ?? 0;
       if (docTs > _lastCachedTs) _lastCachedTs = docTs;
-    });
+    }
 
     if (hasNew) scrollBottom();
 
     // Show "load earlier" button if there are more messages
     if (!_lastCachedTs) _updateLoadEarlierBtn();
+
+    // Backfill any image/video whose chunks straddled this page's boundary
+    _healIncompleteChunkGroups().catch(() => {});
   } catch (e) {
   }
 }
@@ -2060,17 +2067,25 @@ async function loadEarlierMessages() {
 
     const area = $('messages-area');
     const prevScrollHeight = area?.scrollHeight ?? 0;
+    // Fixed reference to the current oldest rendered message — every message
+    // in this older batch gets inserted right before it, in ascending order,
+    // so the batch lands correctly above without needing to re-look-up a
+    // moving "first child" target on each iteration.
+    const boundaryEl = area?.querySelector('.msg-wrapper, .msg-system') || null;
 
-    docs.forEach(doc => {
-      if (_renderedIds.has(doc.id)) return;
+    for (const doc of docs) {
+      if (_renderedIds.has(doc.id)) continue;
       const data = doc.data();
       _renderedIds.add(doc.id);
-      renderMsg(data, doc.id, true); // prepend=true
+      await renderMsg(data, doc.id, boundaryEl); // sequential — see fetchHistoryOnce note
       cacheMsg(doc.id, state.roomCode, data).catch(() => {});
-    });
+    }
 
     // Preserve scroll position after prepending
     if (area) area.scrollTop += (area.scrollHeight - prevScrollHeight);
+
+    // Backfill any image/video whose chunks straddled this page's boundary
+    _healIncompleteChunkGroups().catch(() => {});
   } catch (e) {
   } finally {
     _updateLoadEarlierBtn();
@@ -2221,62 +2236,68 @@ function startChatListeners() {
   q = q.where('createdAt', '>', firebase.firestore.Timestamp.fromMillis(since));
 
   _unsubMsgs = q.onSnapshot(snap => {
-    let hasNew = false;
-    snap.docChanges().forEach(async ch => {
-      if (ch.type === 'modified') { patchMsg(ch.doc.id, ch.doc.data()); return; }
-      if (ch.type !== 'added') return;
-      const id = ch.doc.id, data = ch.doc.data();
-      // Own messages sent via sendMessage() are already rendered optimistically
-      // and reconciled into _renderedIds before this snapshot fires (see
-      // _reconcileSentMessage) — skip re-rendering them, but still cache and
-      // advance _lastCachedTs so history/offline state stays correct.
-      let alreadyRendered = _renderedIds.has(id);
-      // Race guard: this snapshot can in rare cases arrive before the add()
-      // promise above resolves. If so, reconcile against the still-pending
-      // optimistic bubble instead of rendering a duplicate.
-      if (!alreadyRendered && data.senderId === state.me?.id && data.ts && _pendingByTs.has(data.ts)) {
-        const _localId = _pendingByTs.get(data.ts);
-        _pendingByTs.delete(data.ts);
-        _pendingMsgPayloads.delete(_localId);
-        _reconcileSentMessage(_localId, id, data);
-        alreadyRendered = true;
-      }
-      if (!alreadyRendered) {
-        // Canary check — detect replay/injection (async, non-blocking)
-        _registerCanary(id, data.enc || data.encData || '').catch(() => {});
-        _renderedIds.add(id);
-        // PART 8: replay protection — reject stale or duplicate messages
-        const _msgTs = data.ts || 0;
-        if (_msgTs && typeof validateMessageTimestamp === 'function' && !validateMessageTimestamp(_msgTs)) {
-          // stale message outside replay window — skip render
-        } else {
-          if (typeof trackNonce === 'function' && !trackNonce(id)) {
-            // exact duplicate nonce — skip render
-          } else {
-            $('msg-skeleton') && ($('msg-skeleton').style.display = 'none'); $('room-welcome')?.style && ($('room-welcome').style.display = 'none');
-            // PART 5: afterReceive hook
-            let _rcvPayload = { id, data };
-            if (typeof runHooks === 'function') _rcvPayload = await runHooks('afterReceive', _rcvPayload);
-            renderMsg(_rcvPayload.data || data, _rcvPayload.id || id);
-          } // end trackNonce
-        } // end validateMessageTimestamp
-        hasNew = true;
-      }
-      const docTs = data.ts || 0;
-      if (docTs > _lastCachedTs) _lastCachedTs = docTs;
-      cacheMsg(id, code, data).catch(() => {});
-      if (!alreadyRendered && data.type === 'text' && data.senderId !== state.me?.id) {
-        playSound('receive');
-        // Queue read receipt for incoming text messages
-        if (!document.hidden) _queueReadAck(id);
-        if (document.hidden) {
-          _unreadCount++;
-          document.title = `(${_unreadCount}) MIUT`;
+    // Processed as a sequential async IIFE (not .forEach(async ...)) so a
+    // batch of several messages arriving in one snapshot — e.g. catching up
+    // after being briefly offline — renders in the order they were sent
+    // instead of whichever order each one's decrypt happens to finish in.
+    (async () => {
+      let hasNew = false;
+      for (const ch of snap.docChanges()) {
+        if (ch.type === 'modified') { patchMsg(ch.doc.id, ch.doc.data()); continue; }
+        if (ch.type !== 'added') continue;
+        const id = ch.doc.id, data = ch.doc.data();
+        // Own messages sent via sendMessage() are already rendered optimistically
+        // and reconciled into _renderedIds before this snapshot fires (see
+        // _reconcileSentMessage) — skip re-rendering them, but still cache and
+        // advance _lastCachedTs so history/offline state stays correct.
+        let alreadyRendered = _renderedIds.has(id);
+        // Race guard: this snapshot can in rare cases arrive before the add()
+        // promise above resolves. If so, reconcile against the still-pending
+        // optimistic bubble instead of rendering a duplicate.
+        if (!alreadyRendered && data.senderId === state.me?.id && data.ts && _pendingByTs.has(data.ts)) {
+          const _localId = _pendingByTs.get(data.ts);
+          _pendingByTs.delete(data.ts);
+          _pendingMsgPayloads.delete(_localId);
+          _reconcileSentMessage(_localId, id, data);
+          alreadyRendered = true;
         }
-        showScrollFab();
+        if (!alreadyRendered) {
+          // Canary check — detect replay/injection (async, non-blocking)
+          _registerCanary(id, data.enc || data.encData || '').catch(() => {});
+          _renderedIds.add(id);
+          // PART 8: replay protection — reject stale or duplicate messages
+          const _msgTs = data.ts || 0;
+          if (_msgTs && typeof validateMessageTimestamp === 'function' && !validateMessageTimestamp(_msgTs)) {
+            // stale message outside replay window — skip render
+          } else {
+            if (typeof trackNonce === 'function' && !trackNonce(id)) {
+              // exact duplicate nonce — skip render
+            } else {
+              $('msg-skeleton') && ($('msg-skeleton').style.display = 'none'); $('room-welcome')?.style && ($('room-welcome').style.display = 'none');
+              // PART 5: afterReceive hook
+              let _rcvPayload = { id, data };
+              if (typeof runHooks === 'function') _rcvPayload = await runHooks('afterReceive', _rcvPayload);
+              await renderMsg(_rcvPayload.data || data, _rcvPayload.id || id);
+            } // end trackNonce
+          } // end validateMessageTimestamp
+          hasNew = true;
+        }
+        const docTs = data.ts || 0;
+        if (docTs > _lastCachedTs) _lastCachedTs = docTs;
+        cacheMsg(id, code, data).catch(() => {});
+        if (!alreadyRendered && data.type === 'text' && data.senderId !== state.me?.id) {
+          playSound('receive');
+          // Queue read receipt for incoming text messages
+          if (!document.hidden) _queueReadAck(id);
+          if (document.hidden) {
+            _unreadCount++;
+            document.title = `(${_unreadCount}) MIUT`;
+          }
+          showScrollFab();
+        }
       }
-    });
-    if (hasNew) { scrollBottom(); setTimeout(_markVisibleAsRead, 300); }
+      if (hasNew) { scrollBottom(); setTimeout(_markVisibleAsRead, 300); }
+    })();
   }, () => {});
   // Typing
   if (_unsubTyping) _unsubTyping();
@@ -3074,6 +3095,13 @@ function _wireLongPress(wrap, docId) {
 
   START_EVENTS.forEach(ev => wrap.addEventListener(ev, () => {
     timer = setTimeout(() => {
+      // A long-press directly on the bubble/media/file already opened the
+      // quick-react strip (see the shorter 480ms timer wired on those
+      // specific elements in renderMsg) — don't also enter multi-select for
+      // the same physical press, that's what made selection feel like it
+      // was firing on a hair trigger. Long-pressing empty wrap space (e.g.
+      // around the sender name/timestamp) still enters multi-select as before.
+      if (wrap.querySelector('.msg-action-strip')) return;
       if (navigator.vibrate) navigator.vibrate(28);
       if (!_selectMode) _enterSelectMode();
       _toggleSelectMsg(currentId(), wrap);
@@ -3385,19 +3413,29 @@ function _queueReadAck(docId) {
 async function _flushReadAcks() {
   _readReceiptTimer = null;
   if (!_pendingReadAcks.size || !state.roomCode || !state.me) return;
-  const ids = [..._pendingReadAcks];
-  _pendingReadAcks.clear();
+  // Bug fix: this used to .clear() the ENTIRE queue up front but only ever
+  // batch-write the first 50 of it — anything beyond 50 pending receipts
+  // (easy to hit for a new member catching up on 100 history messages) was
+  // silently discarded and those messages would never show as read. Now we
+  // only remove the ids we're actually about to write, and re-schedule a
+  // follow-up flush for whatever's left over.
+  const ids = [..._pendingReadAcks].slice(0, 50);
+  ids.forEach(id => _pendingReadAcks.delete(id));
 
   // Batch write — max 499 ops per Firestore batch, but we cap at 50 receipts/flush
   const batch = db.batch();
   let count = 0;
-  for (const docId of ids.slice(0, 50)) {
+  for (const docId of ids) {
     const ref = db.collection('rooms').doc(state.roomCode)
                   .collection('messages').doc(docId);
     batch.update(ref, { [`readBy.${state.me.id}`]: Date.now() });
     count++;
   }
   if (count) batch.commit().catch(() => {});
+
+  if (_pendingReadAcks.size && !_readReceiptTimer) {
+    _readReceiptTimer = setTimeout(_flushReadAcks, 300);
+  }
 }
 
 // Mark all visible messages in the viewport as read
@@ -3655,7 +3693,7 @@ function _readStatusBadge(data, docId) {
   } catch { return '<span class="msg-status">✓</span>'; }
 }
 
-async function renderMsg(data, docId) {
+async function renderMsg(data, docId, insertBeforeEl) {
   const area = $('messages-area'); if (!area) return;
 
   if (data.type === 'chunk' || (data.groupId && data.chunkOf > 1)) {
@@ -3673,7 +3711,8 @@ async function renderMsg(data, docId) {
     // AES-GCM auth tag verification and render as '[encrypted]'.
     const text = await dec(data.enc, state.roomCode);
     div.innerHTML = `<span>${esc(text)}</span>`;
-    area.appendChild(div); return;
+    (insertBeforeEl && insertBeforeEl.parentNode === area) ? area.insertBefore(div, insertBeforeEl) : area.appendChild(div);
+    return;
   }
 
   const wrap = document.createElement('div');
@@ -3835,10 +3874,9 @@ async function renderMsg(data, docId) {
   // Swipe-left-to-reply gesture on the bubble
   addSwipeReply(wrap, data, plainText);
 
-  area.appendChild(wrap);
-
-  // D3: verify signature after DOM paint (async, non-blocking)
+  (insertBeforeEl && insertBeforeEl.parentNode === area) ? area.insertBefore(wrap, insertBeforeEl) : area.appendChild(wrap);
   if (data.sig && data.type === 'text') {
+    // D3: verify signature after DOM paint (async, non-blocking)
     requestAnimationFrame(() => verifyAndBadge(data, docId));
   }
 }
@@ -3904,6 +3942,46 @@ function assembleChunk(data, docId) {
     const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
     delete _chunkGroups[gid];
     renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type }, g.docId);
+  }
+}
+
+/**
+ * _healIncompleteChunkGroups — large images/videos are split across many
+ * small Firestore documents (one per chunk, see sendFile). History is
+ * fetched in pages (see _HISTORY_PAGE) ordered by time, so it's entirely
+ * possible for a file's chunk set to straddle a page boundary — e.g. a new
+ * member's initial 100-message fetch contains chunks 0–30 of a 43-chunk
+ * video but not 31–42. Without this, assembleChunk's part count never
+ * reaches g.total and the media silently never renders — exactly the
+ * "image/video doesn't work" symptom. This runs after each history fetch
+ * and directly queries by groupId (unrestricted by the page window) for
+ * any group still missing pieces, so the file completes regardless of
+ * where its chunks happen to fall relative to a page cutoff.
+ */
+async function _healIncompleteChunkGroups() {
+  const gids = Object.keys(_chunkGroups);
+  if (!gids.length || !state.roomCode) return;
+  for (const gid of gids) {
+    const g = _chunkGroups[gid];
+    if (!g || Object.keys(g.parts).length >= g.total) continue;
+    try {
+      const snap = await db.collection('rooms').doc(state.roomCode)
+        .collection('messages').where('groupId', '==', gid).get();
+      snap.forEach(doc => {
+        const d = doc.data();
+        if (g.parts[d.chunkIdx] === undefined) {
+          g.parts[d.chunkIdx] = d.encData;
+          if (d.chunkIdx === 0) { g.meta = d; g.docId = doc.id; }
+        }
+      });
+      // Re-check the group is still pending (another path — e.g. the live
+      // listener — could have completed and deleted it while we awaited above).
+      if (_chunkGroups[gid] && Object.keys(g.parts).length === g.total) {
+        const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
+        delete _chunkGroups[gid];
+        await renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type }, g.docId);
+      }
+    } catch (e) { console.warn('[MIUT] Could not heal chunk group', gid, e); }
   }
 }
 
@@ -4079,6 +4157,9 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
   function _reactWith(emoji) {
     toggleReaction(docId, emoji);
     strip.remove();
+    // Reacting is a single, complete action — leaving multi-select open
+    // afterward (if it happened to be active) is confusing, so close it too.
+    if (_selectMode) _exitSelectMode();
   }
 
   // Makes a quick-react OR grid emoji button
@@ -4118,17 +4199,20 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
   function _openGrid() {
     if (_grid && strip.contains(_grid)) return; // already open
     _grid = document.createElement('div');
-    _grid.className = 'strip-emoji-grid';
+    // Add 'open' (which adds the extra padding) BEFORE measuring height,
+    // not after — measuring without that padding then adding it mid-animation
+    // made the animated max-height ceiling too short, clipping the last
+    // emoji row via overflow:hidden once the padding kicked in.
+    _grid.className = 'strip-emoji-grid open';
     EXTENDED_EMOJIS.forEach(e2 => _grid.appendChild(makeEmojiBtn(e2, true)));
     const divider = strip.querySelector('.strip-divider');
     if (divider) strip.insertBefore(_grid, divider);
     else strip.appendChild(_grid);
-    // Animate open
+    // Animate open — measured height now correctly includes final padding
     const h = _grid.scrollHeight;
     _grid.style.maxHeight = '0';
     requestAnimationFrame(() => requestAnimationFrame(() => {
       _grid.style.maxHeight = h + 'px';
-      _grid.classList.add('open');
     }));
     moreBtn.classList.add('active');
     _gridOpen = true;
@@ -5457,6 +5541,10 @@ function _wireAllHandlers() {
 
   // ── Post-leave feedback modal ────────────────────────────────────────────────
   _fbWireOnce();
+
+  // ── Version label (Settings) ─────────────────────────────────────────────────
+  const _vLabel = $('app-version-label');
+  if (_vLabel) _vLabel.textContent = 'v' + (typeof APP_VERSION !== 'undefined' ? APP_VERSION : '?');
 }
 
 // ── Public API — only these names escape the IIFE onto window ─────────────────

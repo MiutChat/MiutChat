@@ -13,6 +13,14 @@ const isProd = process.env.NODE_ENV !== 'development';
 const START  = Date.now();
 const ESB    = path.join(ROOT, 'node_modules/.bin/esbuild');
 
+const { maybeBumpVersion } = require('./version.js');
+// Single source of truth for the app version — see version.js for the bump
+// scheme. Only actually increments on a real Cloudflare Pages deploy
+// (process.env.CF_PAGES === '1'); local builds just read the current value.
+// Every file below that shows/embeds a version gets THIS value stamped in,
+// so they can never drift out of sync with each other again.
+const VERSION = maybeBumpVersion();
+
 const C = { reset:'\x1b[0m',bold:'\x1b[1m',green:'\x1b[32m',teal:'\x1b[36m',red:'\x1b[31m',gray:'\x1b[90m',yellow:'\x1b[33m' };
 const log = (tag, msg, col) => {
   col = col||C.teal;
@@ -26,6 +34,7 @@ if (!fs.existsSync(ESB)) die('esbuild not found — run: npm install');
 if (fs.existsSync(DIST)) fs.rmSync(DIST, { recursive: true, force: true });
 fs.mkdirSync(path.join(DIST, 'functions', 'api'), { recursive: true });
 log('CLEAN', 'dist/ wiped');
+log('VERSION', VERSION + (process.env.CF_PAGES === '1' ? '  (bumped for this deploy)' : '  (unchanged — not a CF Pages build)'));
 
 function run(cmd) {
   const r = spawnSync(cmd, { shell:true, stdio:['ignore','pipe','pipe'] });
@@ -93,7 +102,12 @@ const JS_JOBS = [
 ];
 for (const [inp, out, tgt] of JS_JOBS) {
   if (!fs.existsSync(path.join(ROOT, inp))) { log('  skip', inp+' not found', C.yellow); continue; }
-  const tmp = prepTmp(inp); tmps.push(tmp);
+  // app.js declares `const APP_VERSION = '...'` — stamp the unified VERSION
+  // in at build time so it's never hand-edited out of sync (see version.js).
+  const versionTransform = inp === 'app.js'
+    ? t => t.replace(/const APP_VERSION\s*=\s*'[^']*';/, `const APP_VERSION = '${VERSION}';`)
+    : undefined;
+  const tmp = prepTmp(inp, versionTransform); tmps.push(tmp);
   const orig = fs.statSync(path.join(ROOT,inp)).size;
   run(ESB+' '+tmp+' '+baseFlags+' --target='+tgt+' --platform=browser --outfile='+DIST+'/'+out);
   const min = fs.statSync(DIST+'/'+out).size;
@@ -106,7 +120,8 @@ const swFiles = [
 ];
 for (const [inp, out, tgt] of swFiles) {
   if (!fs.existsSync(path.join(ROOT, inp))) { log('  skip', inp, C.yellow); continue; }
-  const tmp = prepTmp(inp); tmps.push(tmp);
+  const tmp = prepTmp(inp, t => t.replace(/const SW_VERSION\s*=\s*'[^']*';/, `const SW_VERSION = '${VERSION}';`));
+  tmps.push(tmp);
   const orig = fs.statSync(path.join(ROOT,inp)).size;
   run(ESB+' '+tmp+' '+baseFlags+' --target='+tgt+' --platform=browser --outfile='+DIST+'/'+out);
   const min = fs.statSync(DIST+'/'+out).size;
@@ -147,7 +162,12 @@ const CF_JOBS = [
 ];
 for (const f of CF_JOBS) {
   if (!fs.existsSync(path.join(ROOT, f))) continue;
-  const tmp = prepTmp(f); tmps.push(tmp);
+  // health.js has a hardcoded fallback version literal for when
+  // MIUT_VERSION isn't set as an env var — keep it in sync too.
+  const versionTransform = f.endsWith('health.js')
+    ? t => t.replace(/env\.MIUT_VERSION\s*\|\|\s*'[^']*'/, `env.MIUT_VERSION || '${VERSION}'`)
+    : undefined;
+  const tmp = prepTmp(f, versionTransform); tmps.push(tmp);
   run(ESB+' '+tmp+' --bundle=false --minify --platform=neutral --format=esm --target=es2020 --outfile='+DIST+'/'+f);
   log('  cf', f.replace('functions/api/',''));
 }
@@ -193,9 +213,11 @@ html = html
   .trim()+'\n';
 // Stamp version into HTML
 html = html.replace(/<meta name="application-version"[^>]*\/>/,
-  '<meta name="application-version" content="2.0.1"/>');
+  `<meta name="application-version" content="${VERSION}"/>`);
+// Stamp any {{APP_VERSION}} placeholders too (e.g. a visible "vX.Y.Z" label)
+html = html.replace(/\{\{APP_VERSION\}\}/g, VERSION);
 fs.writeFileSync(DIST+'/index.html', html);
-log('  stamp', 'version 2.0.1 applied to index.html');
+log('  stamp', 'version '+VERSION+' applied to index.html');
 
 log('STATIC', 'copy assets');
 const STATIC = [
@@ -204,14 +226,55 @@ const STATIC = [
   'terms.html','about.html','404.html','maintenance.html','vault.html',
   'robots.txt','ads.txt','sitemap.xml','wrangler.toml','CNAME',
 ];
+// Files that need the unified VERSION text-stamped in rather than a plain
+// byte copy. manifest.json/wrangler.toml carry their own version fields;
+// the marketing pages get a {{APP_VERSION}} placeholder replaced (same
+// convention as index.html above) wherever a "vX.Y.Z" credit is shown.
+const VERSIONED_STATIC = new Set([
+  'manifest.json', 'wrangler.toml',
+  'privacy.html', 'landing.html', 'terms.html', 'about.html',
+]);
 let nc = 0;
 for (const f of STATIC) {
-  const s = path.join(ROOT,f);
-  if (fs.existsSync(s)) { fs.copyFileSync(s, DIST+'/'+f); nc++; }
+  const s = path.join(ROOT, f);
+  if (!fs.existsSync(s)) continue;
+  if (VERSIONED_STATIC.has(f)) {
+    let txt = fs.readFileSync(s, 'utf8');
+    txt = txt.replace(/\{\{APP_VERSION\}\}/g, VERSION);
+    if (f === 'manifest.json') {
+      txt = txt
+        .replace(/"version"\s*:\s*"[^"]*"/, `"version": "${VERSION}"`)
+        .replace(/MiutChat v[\d.]+/g, `MiutChat v${VERSION}`);
+    } else if (f === 'wrangler.toml') {
+      txt = txt.replace(/MIUT_VERSION\s*=\s*"[^"]*"/, `MIUT_VERSION  = "${VERSION}"`);
+    }
+    fs.writeFileSync(DIST + '/' + f, txt);
+  } else {
+    fs.copyFileSync(s, DIST + '/' + f);
+  }
+  nc++;
 }
 copyDir(path.join(ROOT,'icons'), DIST+'/icons');
-copyDir(path.join(ROOT,'functions'), DIST+'/functions');
+// Copy functions/ raw EXCEPT the files CF_JOBS already built above (minified
+// + version-stamped for health.js) — a plain copyDir here used to silently
+// clobber that work by overwriting it with the untouched source right after,
+// which meant every edge function was always shipping unminified and, for
+// health.js specifically, with a stale hardcoded version fallback no matter
+// what build.js stamped in above.
+const CF_JOBS_SET = new Set(CF_JOBS.map(f => path.join(ROOT, f)));
+function copyDirExcept(src, dest, exclude) {
+  if (!fs.existsSync(src)) return;
+  fs.mkdirSync(dest, { recursive: true });
+  for (const f of fs.readdirSync(src)) {
+    const s = path.join(src, f), d = path.join(dest, f);
+    if (fs.statSync(s).isDirectory()) { copyDirExcept(s, d, exclude); continue; }
+    if (exclude.has(s)) continue; // already built by CF_JOBS — don't clobber it
+    fs.copyFileSync(s, d);
+  }
+}
+copyDirExcept(path.join(ROOT,'functions'), DIST+'/functions', CF_JOBS_SET);
 log('  done', nc+' files + icons/ + functions/');
+log('  stamp', 'version '+VERSION+' applied to manifest.json, wrangler.toml, marketing pages');
 
 if (isProd) {
   log('COMPRESS', 'brotli-11 + gzip-9');
