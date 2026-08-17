@@ -72,12 +72,21 @@ function getVersion() { return readPkgVersion(); }
 
 /**
  * maybeBumpVersion() → the version build.js should stamp everywhere.
- * Auto-bumps (patch, with rollover) and persists to package.json only on a
- * real Cloudflare Pages build; otherwise returns the current version as-is.
+ * Bumps (patch, with rollover) and persists to package.json on every call
+ * — i.e. every time build.js runs — UNLESS explicitly opted out via
+ * SKIP_VERSION_BUMP=1. This used to only bump when process.env.CF_PAGES
+ * was set, on the assumption Cloudflare's own build phase would always run
+ * this script. That assumption doesn't hold for every deploy path — e.g.
+ * building locally/in CI and then running `wrangler pages deploy dist`
+ * uploads an already-built folder without Cloudflare ever running a build
+ * command itself, so CF_PAGES is never set and the bump silently never
+ * fired. Defaulting to "always bump, opt out for local iteration" is safer
+ * and matches "the version should increase every time I deploy" regardless
+ * of which path is used to actually deploy.
  */
 function maybeBumpVersion() {
   const current = readPkgVersion();
-  if (process.env.CF_PAGES !== '1') return current;
+  if (process.env.SKIP_VERSION_BUMP === '1') return current;
   const next = nextVersion(current, 'patch');
   writePkgVersion(next);
   return next;
