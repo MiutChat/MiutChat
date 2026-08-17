@@ -1380,7 +1380,7 @@ async function handleCreate() {
     const _autoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + 1800000);
     await db.collection('rooms').doc(code).set({
       createdAt: ts_now(), creatorId: uid, epoch: 0, salt: roomSalt,
-      autoDeleteAt: _autoDeleteAt,
+      autoDeleteAt: _autoDeleteAt, inactivityTtlMs: 1800000,
       lastActivity: ts_now(),
     }, { merge: true });
     _roomEpoch = 0;
@@ -1448,6 +1448,7 @@ async function handleEnter() {
     if (_expired) { setLoading(btn, false); return; }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
+    { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 1800000; }
 
     const memberSnap  = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData    = memberSnap.exists ? memberSnap.data() : null;
@@ -1606,6 +1607,7 @@ async function checkApprovalAndBoot() {
     if (roomSnap.exists) {
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
+      { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 1800000; }
     }
 
     const snap = await db.collection('rooms').doc(state.roomCode)
@@ -1754,7 +1756,22 @@ function startRoomListener() {
   if (_unsubRoom) { try { _unsubRoom(); } catch {} _unsubRoom = null; }
   _unsubRoom = db.collection('rooms').doc(state.roomCode)
     .onSnapshot(snap => {
-      if (!snap.exists) return;
+      if (!snap.exists) {
+        // Room doc is gone — either it expired or an admin used "Clean Up
+        // Now". Previously this case was silently ignored, leaving anyone
+        // still viewing stuck on a dead room with no explanation.
+        if (state.roomCode) {
+          toast('Room closed', 'This room no longer exists.', 'clock');
+          const code = state.roomCode;
+          stopListeners();
+          clearCacheForRoom(code).catch(() => {});
+          localStorage.removeItem(CONFIG.SESSION_KEY);
+          localStorage.removeItem(CONFIG.ROOM_KEY);
+          state.me = null; state.roomCode = null;
+          showScreen('join-screen');
+        }
+        return;
+      }
       const d = snap.data() || {};
       // Epoch rotation
       const newEpoch = d.epoch || 0;
@@ -1768,6 +1785,15 @@ function startRoomListener() {
         _roomTtlMs = newTtl;
         const ttlEl = $('ttl-display');
         if (ttlEl) ttlEl.textContent = _fmtTtl(_roomTtlMs);
+      }
+      // Room (inactivity) expiry — 0 = never, otherwise milliseconds.
+      // Falls back to the historical hardcoded 30 min for older rooms that
+      // predate this being a stored/configurable field.
+      const newRoomExpiry = d.inactivityTtlMs !== undefined ? d.inactivityTtlMs : 1800000;
+      if (newRoomExpiry !== _roomExpiryMs) {
+        _roomExpiryMs = newRoomExpiry;
+        const rTtlEl = $('room-ttl-display');
+        if (rTtlEl) rTtlEl.textContent = _fmtRoomTtl(_roomExpiryMs);
       }
     }, () => {});
 }
@@ -1926,6 +1952,71 @@ async function setRoomTtl(ms) {
       ms ? 'clock' : '∞'
     );
   } catch (e) { toast('Failed to set expiry', e.message, 'err'); }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Room (inactivity) expiry — the whole room auto-deletes after this long
+// with no activity, separate from per-message TTL above. Admin-configurable.
+let _roomExpiryMs = 1800000; // 30 min default, matches the room's own baseline at creation
+
+/** Format a room-expiry ms value to a human label ("Never" instead of "Off" at 0) */
+function _fmtRoomTtl(ms) {
+  if (!ms) return 'Never';
+  if (ms < 3600000)  return Math.round(ms / 60000) + ' min';
+  if (ms < 86400000) return Math.round(ms / 3600000) + ' hour' + (ms === 3600000 ? '' : 's');
+  return Math.round(ms / 86400000) + ' day' + (ms === 86400000 ? '' : 's');
+}
+
+/**
+ * Admin sets how long the room can sit inactive before it's auto-deleted.
+ * 0 = never — implemented by removing autoDeleteAt entirely rather than
+ * writing some far-future date, so the existing cleanup query
+ * (`autoDeleteAt <= now`, see functions/api/cleanup.js) naturally never
+ * matches a room missing that field — no server-side changes needed.
+ */
+async function setRoomExpiry(ms) {
+  if (!_isAdmin || !state.roomCode) return;
+  try {
+    const update = { inactivityTtlMs: ms };
+    update.autoDeleteAt = ms > 0
+      ? firebase.firestore.Timestamp.fromMillis(Date.now() + ms)
+      : firebase.firestore.FieldValue.delete();
+    await db.collection('rooms').doc(state.roomCode).update(update);
+    _roomExpiryMs = ms;
+    const rTtlEl = $('room-ttl-display');
+    if (rTtlEl) rTtlEl.textContent = _fmtRoomTtl(ms);
+    toast(
+      ms ? `Room expires after ${_fmtRoomTtl(ms)} of inactivity` : 'Room expiry off',
+      ms ? 'Resets every time someone sends a message.' : 'This room will never auto-delete.',
+      ms ? 'clock' : '∞'
+    );
+  } catch (e) { toast('Failed to set room expiry', e.message, 'err'); }
+}
+
+/**
+ * Admin-only: immediately deletes the room for everyone, instead of waiting
+ * for the configured inactivity expiry. Everyone currently in the room
+ * (including the admin) gets redirected via the room-doc listener picking
+ * up the deletion — see startRoomListener's !snap.exists handling.
+ */
+async function cleanupRoomNow() {
+  if (!_isAdmin || !state.roomCode) return;
+  const ok = await showConfirm(
+    'Delete room now?',
+    'Everyone currently in this room will be disconnected immediately. This cannot be undone.',
+    'DELETE NOW'
+  );
+  if (!ok) return;
+  const code = state.roomCode;
+  try {
+    await wipeRoom(code, db);
+    _ping('room_cleanup_now');
+    // The admin's own client also gets redirected via the room-doc
+    // listener's !snap.exists branch once the delete above lands — no
+    // separate local teardown needed here.
+  } catch (e) {
+    toast('Cleanup failed', e.message, 'err');
+  }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2542,14 +2633,15 @@ function _unblurScreen() {
   if (_screenshotBlurTimer) { clearTimeout(_screenshotBlurTimer); _screenshotBlurTimer = null; }
 }
 
-/** Extend room autoDeleteAt by 30 min from now (debounced) */
+/** Extend room autoDeleteAt from now, using the admin-configured room expiry (default 30 min, 0 = never) */
 let _extendTimer = null;
 function _extendRoomTtl() {
   if (!state.roomCode || !db) return;
+  if (!_roomExpiryMs) return;         // "Never" — nothing to extend, autoDeleteAt intentionally absent
   if (_extendTimer) return;           // already scheduled this second
   _extendTimer = setTimeout(() => {
     _extendTimer = null;
-    const newExpiry = firebase.firestore.Timestamp.fromMillis(Date.now() + 1800000);
+    const newExpiry = firebase.firestore.Timestamp.fromMillis(Date.now() + _roomExpiryMs);
     db.collection('rooms').doc(state.roomCode)
       .update({ autoDeleteAt: newExpiry, lastActivity: ts_now() })
       .catch(() => {});
@@ -3368,7 +3460,7 @@ function _retrySendFailed(localId) {
 
   wrap.classList.remove('send-failed');
   const statusEl = wrap.querySelector('.msg-status');
-  if (statusEl) statusEl.outerHTML = '<span class="msg-status msg-status-pending" title="Sending…">○</span>';
+  if (statusEl) statusEl.outerHTML = '<span class="msg-status msg-status-pending" title="Sending…">Sending…</span>';
 
   msgData.createdAt = ts_now(); // refresh — the old sentinel already failed once
   db.collection('rooms').doc(state.roomCode).collection('messages').add(msgData)
@@ -3462,7 +3554,7 @@ function _renderReadBadge(wrapEl, readBy) {
   const senderId = wrapEl.dataset.senderId || '';
   const allReaders = Object.keys(readBy || {}).filter(uid => uid !== senderId);
   if (allReaders.length === 0) {
-    statusEl.textContent = 'ok';
+    statusEl.textContent = '✓';
     statusEl.title = 'Sent';
     statusEl.classList.remove('msg-status-read');
   } else {
@@ -3677,7 +3769,7 @@ let _searchActive  = false;
  */
 function _readStatusBadge(data, docId) {
   if (docId && String(docId).startsWith('local_')) {
-    return '<span class="msg-status msg-status-pending" title="Sending…">○</span>';
+    return '<span class="msg-status msg-status-pending" title="Sending…">Sending…</span>';
   }
   try {
     const readBy  = data.readBy || {};
@@ -3688,7 +3780,7 @@ function _readStatusBadge(data, docId) {
     const hasRead = allReaders.length > 0;
     const cls   = hasRead ? ' msg-status-read' : '';
     const title = hasRead ? `Read by ${allReaders.length} member${allReaders.length !== 1 ? 's' : ''}` : 'Sent';
-    const tick  = hasRead ? '✓✓' : 'ok';
+    const tick  = hasRead ? '✓✓' : '✓';
     return `<span class="msg-status${cls}" title="${title}">${tick}</span>`;
   } catch { return '<span class="msg-status">✓</span>'; }
 }
@@ -4091,12 +4183,65 @@ async function patchMsg(id, data) {
   }
 }
 function renderTextContent(text) {
-  return esc(text)
-    .replace(/\n/g, '<br>')
-    .replace(/@([A-Za-z][A-Za-z0-9]+(?: [A-Za-z][A-Za-z0-9]+)*)/gi, '<span class="mention">@$1</span>');
+  let html = esc(text).replace(/\n/g, '<br>');
+
+  // Linkify URLs before the @mention pass below, stashing them behind
+  // placeholder tokens first. Without this, a URL containing "@" (e.g. a
+  // mailto: or user@host link) would get its own text mangled by the
+  // mention regex mid-substitution, since both operate on the same string.
+  const urlRe = /\b(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi;
+  const stash = [];
+  html = html.replace(urlRe, raw => {
+    // Trim common trailing prose punctuation that isn't really part of the URL
+    let url = raw, trail = '';
+    const m = url.match(/([.,;:!?)\]]+)$/);
+    if (m) { trail = m[1]; url = url.slice(0, -trail.length); }
+    if (!url) return raw;
+    const href = /^https?:\/\//i.test(url) ? url : 'https://' + url;
+    const token = `\u0000${stash.length}\u0000`;
+    stash.push(`<a href="${href}" target="_blank" rel="noopener noreferrer nofollow" class="msg-link">${url}</a>${trail}`);
+    return token;
+  });
+
+  html = html.replace(/@([A-Za-z][A-Za-z0-9]+(?: [A-Za-z][A-Za-z0-9]+)*)/gi, '<span class="mention">@$1</span>');
+
+  return html.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);
 }
+// Last known reactions per message, keyed by docId — single source of truth
+// used both to actually render and as the base state for optimistic toggles
+// below (so a reaction toggle doesn't need to wait on a Firestore round trip
+// to know what to render immediately).
+const _lastReactionsCache = new Map();
+
+/** Shared double-fire guard for tap targets that wire both touchend and click
+ * (some mobile browsers don't reliably suppress the synthetic click after
+ * touchend's preventDefault(), firing both for one physical tap). */
+function _debounceFire(el) {
+  const now = Date.now();
+  if (now - (el._miutLastFire || 0) < 500) return true; // already handled this tap
+  el._miutLastFire = now;
+  return false;
+}
+
 async function toggleReaction(docId, emoji) {
   if (!docId || !state.roomCode || !state.me) return;
+
+  // Optimistic: show the toggle immediately using the last known reaction
+  // state, instead of waiting for the transaction below to round-trip.
+  // Runs in the background; the live listener → patchMsg reconciles with
+  // the authoritative result once it lands (or this rolls back on failure).
+  const wrap     = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(docId)}"]`);
+  const reactRow = wrap?.querySelector('.msg-reactions');
+  if (reactRow) {
+    const optimistic = Object.assign({}, _lastReactionsCache.get(docId) || {});
+    const users = Object.assign({}, optimistic[emoji] || {});
+    if (users[state.me.id]) delete users[state.me.id];
+    else users[state.me.id] = state.me.name;
+    if (Object.keys(users).length === 0) delete optimistic[emoji];
+    else optimistic[emoji] = users;
+    renderReactionsInto(reactRow, optimistic, docId);
+  }
+
   try {
     const ref = db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId);
     await db.runTransaction(async tx => {
@@ -4111,10 +4256,17 @@ async function toggleReaction(docId, emoji) {
       tx.update(ref, { reactions });
     });
   } catch (e) {
+    // Roll back the optimistic guess to whatever's actually in Firestore
+    if (reactRow) {
+      db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).get()
+        .then(s => renderReactionsInto(reactRow, s.exists ? (s.data()?.reactions || {}) : {}, docId))
+        .catch(() => {});
+    }
   }
 }
 
 function renderReactionsInto(container, reactions, docId) {
+  _lastReactionsCache.set(docId, reactions || {});
   container.innerHTML = '';
   const entries = Object.entries(reactions || {}).filter(([, u]) => Object.keys(u).length > 0);
   if (!entries.length) return;
@@ -4136,8 +4288,8 @@ function renderReactionsInto(container, reactions, docId) {
     rcnt.textContent  = count;
     btn.appendChild(espan);
     btn.appendChild(rcnt);
-    btn.addEventListener('click',    e => { e.stopPropagation(); toggleReaction(docId, emoji); });
-    btn.addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation(); toggleReaction(docId, emoji); }, { passive: false });
+    btn.addEventListener('click',    e => { e.stopPropagation(); if (!_debounceFire(btn)) toggleReaction(docId, emoji); });
+    btn.addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation(); if (!_debounceFire(btn)) toggleReaction(docId, emoji); }, { passive: false });
     container.appendChild(btn);
   });
 }
@@ -4170,15 +4322,23 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     btn.textContent = emoji;
     btn.setAttribute('aria-label', 'React with ' + emoji);
     let _touched = false;
+    // Guard against double-fire: touchend calls preventDefault() specifically
+    // to suppress the browser's synthetic click that normally follows a tap,
+    // but some mobile browsers (notably some Android WebViews) don't reliably
+    // honor that, firing both handlers for one physical tap. Since reacting
+    // is a TOGGLE, a double-fire adds the reaction then immediately removes
+    // it again — which looked like tapping an emoji "only selected" it
+    // instead of reacting, and cost an extra round trip on top (the "slow"
+    // report). This timestamp guard makes whichever event fires first win.
     btn.addEventListener('touchstart', () => { _touched = false; }, { passive: true });
     btn.addEventListener('touchmove',  () => { _touched = true;  }, { passive: true });
     btn.addEventListener('touchend',   e => {
       e.preventDefault(); e.stopPropagation();
-      if (!_touched) _reactWith(emoji); // only fire if not a scroll
+      if (!_touched && !_debounceFire(btn)) _reactWith(emoji); // only fire if not a scroll
     }, { passive: false });
     btn.addEventListener('click', e => {
       e.stopPropagation();
-      _reactWith(emoji);
+      if (!_debounceFire(btn)) _reactWith(emoji);
     });
     return btn;
   }
@@ -4767,6 +4927,7 @@ async function joinFromInvite() {
     _saveWrongState({ wrongCount: 0, lockedUntil: 0 });
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
+    { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 1800000; }
     const memberSnap = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData   = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
@@ -4860,7 +5021,10 @@ async function _handoffAdminRole(roomCodeOverride, meOverride) {
 }
 
 async function handleLogout() {
-  const ok = await showConfirm('Leave Room?', 'You can rejoin at any time using the room code.', 'LEAVE');
+  const _rejoinNote = _roomExpiryMs
+    ? `You can rejoin using the room code — this room auto-deletes after ${_fmtRoomTtl(_roomExpiryMs)} of inactivity.`
+    : 'You can rejoin at any time using the room code — this room never auto-expires.';
+  const ok = await showConfirm('Leave Room?', _rejoinNote, 'LEAVE');
   if (!ok) return;
 
   // Snapshot everything the background cleanup below will need — state.*
@@ -4952,6 +5116,15 @@ function openSettings() {
     }
     const ttlEl = $('ttl-display'); if (ttlEl) ttlEl.textContent = _fmtTtl(_roomTtlMs);
   }
+  const roomTtlRow = $('room-ttl-row');
+  if (roomTtlRow) {
+    roomTtlRow.style.display = _isAdmin ? 'flex' : 'none';
+    const rSel = $('room-ttl-select');
+    if (rSel) rSel.value = String(_roomExpiryMs);
+    const rTtlEl = $('room-ttl-display'); if (rTtlEl) rTtlEl.textContent = _fmtRoomTtl(_roomExpiryMs);
+  }
+  const cleanupRow = $('room-cleanup-row');
+  if (cleanupRow) cleanupRow.style.display = _isAdmin ? 'flex' : 'none';
   const epochEl = $('epoch-display');
   if (epochEl) epochEl.textContent = String(_roomEpoch);
 
@@ -5525,6 +5698,8 @@ function _wireAllHandlers() {
   on('anim-toggle',     'change', () => toggleAnimations());
   on('approval-toggle', 'change', () => toggleApprovalGate());
   on('ttl-select',      'change', e => setRoomTtl(+e.target.value));
+  on('room-ttl-select', 'change', e => setRoomExpiry(+e.target.value));
+  on('room-cleanup-btn','click',  () => cleanupRoomNow());
 
   const rotateBtn = document.querySelector('#rotate-key-row .btn-rotate-key');
   if (rotateBtn) rotateBtn.addEventListener('click', () => { rotateKey(); closeSettings(); });
@@ -5542,9 +5717,9 @@ function _wireAllHandlers() {
   // ── Post-leave feedback modal ────────────────────────────────────────────────
   _fbWireOnce();
 
-  // ── Version label (Settings) ─────────────────────────────────────────────────
+  // ── Version label (Settings) — single unified source, see version.js ─────────
   const _vLabel = $('app-version-label');
-  if (_vLabel) _vLabel.textContent = 'v' + (typeof APP_VERSION !== 'undefined' ? APP_VERSION : '?');
+  if (_vLabel) _vLabel.textContent = 'MIUT v' + (typeof APP_VERSION !== 'undefined' ? APP_VERSION : '?');
 }
 
 // ── Public API — only these names escape the IIFE onto window ─────────────────
