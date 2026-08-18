@@ -555,27 +555,15 @@
       <div id="room-ttl-row" class="setting-item" style="display:none">
         <div class="setting-label-group">
           <label>ROOM EXPIRY</label>
-          <span class="setting-sublabel">Auto-deletes room after inactivity: <strong id="room-ttl-display">30 min</strong></span>
+          <span class="setting-sublabel" id="room-ttl-sublabel">Auto-deletes 5 min after everyone leaves</span>
         </div>
         <select id="room-ttl-select" class="ttl-select">
-          <option value="1800000">30 min</option>
+          <option value="0">Instant</option>
+          <option value="300000" selected>5 min</option>
           <option value="3600000">1 hour</option>
           <option value="86400000">24 hours</option>
-          <option value="0">Never</option>
+          <option value="-1">Never</option>
         </select>
-      </div>
-
-      <div id="room-cleanup-row" class="setting-item" style="display:none">
-        <div class="setting-label-group">
-          <label>CLEAN UP NOW</label>
-          <span class="setting-sublabel">Delete this room immediately, for everyone — skips the expiry timer</span>
-        </div>
-        <button class="btn-rotate-key ripple-btn danger" id="room-cleanup-btn">
-          <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
-            <path d="M2 4h12M5.5 4V2.5a1 1 0 011-1h3a1 1 0 011 1V4m-8 0v9a1 1 0 001 1h6a1 1 0 001-1V4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          DELETE NOW
-        </button>
       </div>
 
       <button class="btn-join ripple-btn small" style="margin-top:16px">

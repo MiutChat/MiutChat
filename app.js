@@ -207,6 +207,7 @@ const _pubKeyCache = _lruMap(200); // LRU-capped; was unbounded Map
 let _unsubApproval   = null;
 let _isAdmin         = false;
 let _presenceSettled = false;
+let _roomWasEmpty    = false; // tracks whether the room-expiry countdown is currently pending (see startPresenceListener)
 
 // ── Vault auth token (set when passkey matched, cleared on exit) ──
 let _vaultToken = null;
@@ -1376,11 +1377,15 @@ async function handleCreate() {
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const roomSalt  = _b64uEnc(saltBytes.buffer);
     _roomSalt = roomSalt;
-    // autoDeleteAt = 30 min from now — extended on each message send
+    // autoDeleteAt = 30 min bootstrap safety net (independent of the Room
+    // Expiry preference below) — covers the case where the creator abandons
+    // the room before anyone ever properly joins. Once the room is actually
+    // used and later becomes empty, startPresenceListener takes over and
+    // reschedules autoDeleteAt based on inactivityTtlMs instead.
     const _autoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + 1800000);
     await db.collection('rooms').doc(code).set({
       createdAt: ts_now(), creatorId: uid, epoch: 0, salt: roomSalt,
-      autoDeleteAt: _autoDeleteAt, inactivityTtlMs: 1800000,
+      autoDeleteAt: _autoDeleteAt, inactivityTtlMs: 300000, // 5 min — the "after everyone leaves" default
       lastActivity: ts_now(),
     }, { merge: true });
     _roomEpoch = 0;
@@ -1448,7 +1453,7 @@ async function handleEnter() {
     if (_expired) { setLoading(btn, false); return; }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
-    { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 1800000; }
+    { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
 
     const memberSnap  = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData    = memberSnap.exists ? memberSnap.data() : null;
@@ -1564,6 +1569,7 @@ function bootApp() {
   _lastCachedTs    = 0;
   _onlineCount     = 0;
   _presenceSettled = false;  // reset — first snapshot must not trigger wipe
+  _roomWasEmpty    = false;
   _isAdmin         = state.me?.role === 'admin';
 
   // Update UI
@@ -1607,7 +1613,7 @@ async function checkApprovalAndBoot() {
     if (roomSnap.exists) {
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
-      { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 1800000; }
+      { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     }
 
     const snap = await db.collection('rooms').doc(state.roomCode)
@@ -1786,14 +1792,14 @@ function startRoomListener() {
         const ttlEl = $('ttl-display');
         if (ttlEl) ttlEl.textContent = _fmtTtl(_roomTtlMs);
       }
-      // Room (inactivity) expiry — 0 = never, otherwise milliseconds.
-      // Falls back to the historical hardcoded 30 min for older rooms that
-      // predate this being a stored/configurable field.
-      const newRoomExpiry = d.inactivityTtlMs !== undefined ? d.inactivityTtlMs : 1800000;
+      // Room expiry (how long the room persists after everyone leaves) —
+      // -1 = never, 0 = instant, otherwise milliseconds. Falls back to 5 min
+      // for older rooms that predate this being a stored/configurable field.
+      const newRoomExpiry = d.inactivityTtlMs !== undefined ? d.inactivityTtlMs : 300000;
       if (newRoomExpiry !== _roomExpiryMs) {
         _roomExpiryMs = newRoomExpiry;
-        const rTtlEl = $('room-ttl-display');
-        if (rTtlEl) rTtlEl.textContent = _fmtRoomTtl(_roomExpiryMs);
+        const rTtlEl = $('room-ttl-sublabel');
+        if (rTtlEl) rTtlEl.textContent = _fmtRoomExpirySentence(_roomExpiryMs);
       }
     }, () => {});
 }
@@ -1955,68 +1961,51 @@ async function setRoomTtl(ms) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ─── Room (inactivity) expiry — the whole room auto-deletes after this long
-// with no activity, separate from per-message TTL above. Admin-configurable.
-let _roomExpiryMs = 1800000; // 30 min default, matches the room's own baseline at creation
+// ─── Room expiry — how long the room persists after it becomes EMPTY (no
+// one online), not general inactivity. Admin-configurable. Value scheme:
+//   0   = Instant — deleted the moment the last person leaves
+//   >0  = milliseconds to wait, once empty, before auto-deleting
+//   -1  = Never — the room is never auto-deleted for being empty
+// See startPresenceListener for where this is actually acted on.
+let _roomExpiryMs = 300000; // 5 min default, matches the room's own baseline at creation
 
-/** Format a room-expiry ms value to a human label ("Never" instead of "Off" at 0) */
+/** Format a room-expiry ms value to a human label. */
 function _fmtRoomTtl(ms) {
-  if (!ms) return 'Never';
+  if (ms === -1) return 'Never';
+  if (ms === 0)  return 'Instant';
   if (ms < 3600000)  return Math.round(ms / 60000) + ' min';
   if (ms < 86400000) return Math.round(ms / 3600000) + ' hour' + (ms === 3600000 ? '' : 's');
   return Math.round(ms / 86400000) + ' day' + (ms === 86400000 ? '' : 's');
 }
 
+/** Full sentence version for the settings sublabel — reads correctly for
+ * every value instead of just substituting a word into a fixed template. */
+function _fmtRoomExpirySentence(ms) {
+  if (ms === -1) return 'Never auto-deletes — the room persists indefinitely';
+  if (ms === 0)  return 'Auto-deletes instantly once everyone leaves';
+  return `Auto-deletes ${_fmtRoomTtl(ms)} after everyone leaves`;
+}
+
 /**
- * Admin sets how long the room can sit inactive before it's auto-deleted.
- * 0 = never — implemented by removing autoDeleteAt entirely rather than
- * writing some far-future date, so the existing cleanup query
- * (`autoDeleteAt <= now`, see functions/api/cleanup.js) naturally never
- * matches a room missing that field — no server-side changes needed.
+ * Admin sets how long the room persists after everyone leaves. This only
+ * saves the preference — it does NOT touch autoDeleteAt itself, since the
+ * room is presumably occupied right now (the admin is in Settings using
+ * it). The actual expiry countdown starts when the room is later detected
+ * as empty; see startPresenceListener.
  */
 async function setRoomExpiry(ms) {
   if (!_isAdmin || !state.roomCode) return;
   try {
-    const update = { inactivityTtlMs: ms };
-    update.autoDeleteAt = ms > 0
-      ? firebase.firestore.Timestamp.fromMillis(Date.now() + ms)
-      : firebase.firestore.FieldValue.delete();
-    await db.collection('rooms').doc(state.roomCode).update(update);
+    await db.collection('rooms').doc(state.roomCode).update({ inactivityTtlMs: ms });
     _roomExpiryMs = ms;
-    const rTtlEl = $('room-ttl-display');
-    if (rTtlEl) rTtlEl.textContent = _fmtRoomTtl(ms);
+    const rTtlEl = $('room-ttl-sublabel');
+    if (rTtlEl) rTtlEl.textContent = _fmtRoomExpirySentence(ms);
     toast(
-      ms ? `Room expires after ${_fmtRoomTtl(ms)} of inactivity` : 'Room expiry off',
-      ms ? 'Resets every time someone sends a message.' : 'This room will never auto-delete.',
-      ms ? 'clock' : '∞'
+      ms === -1 ? 'Room expiry off' : `Room auto-deletes ${ms === 0 ? 'instantly' : _fmtRoomTtl(ms) + ' after'} everyone leaves`,
+      ms === -1 ? 'This room will never auto-delete.' : 'Takes effect next time the room is empty.',
+      ms === -1 ? '∞' : 'clock'
     );
   } catch (e) { toast('Failed to set room expiry', e.message, 'err'); }
-}
-
-/**
- * Admin-only: immediately deletes the room for everyone, instead of waiting
- * for the configured inactivity expiry. Everyone currently in the room
- * (including the admin) gets redirected via the room-doc listener picking
- * up the deletion — see startRoomListener's !snap.exists handling.
- */
-async function cleanupRoomNow() {
-  if (!_isAdmin || !state.roomCode) return;
-  const ok = await showConfirm(
-    'Delete room now?',
-    'Everyone currently in this room will be disconnected immediately. This cannot be undone.',
-    'DELETE NOW'
-  );
-  if (!ok) return;
-  const code = state.roomCode;
-  try {
-    await wipeRoom(code, db);
-    _ping('room_cleanup_now');
-    // The admin's own client also gets redirected via the room-doc
-    // listener's !snap.exists branch once the delete above lands — no
-    // separate local teardown needed here.
-  } catch (e) {
-    toast('Cleanup failed', e.message, 'err');
-  }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2251,10 +2240,10 @@ function startPresenceListener() {
         try {
           const allApproved = await db.collection('rooms').doc(code)
             .collection('members').where('approved', '==', true).get();
+          const roomRef = db.collection('rooms').doc(code);
           if (allApproved.empty) {
             // two tabs from both triggering wipeRoom simultaneously. The first tab
             // to set emptyAt wins; if it's already set by another tab, skip the wipe.
-            const roomRef = db.collection('rooms').doc(code);
             let shouldWipe = false;
             try {
               await db.runTransaction(async tx => {
@@ -2280,8 +2269,71 @@ function startPresenceListener() {
               await wipeRoom(code, db);
               await clearCacheForRoom(code);
             }
+          } else if (!_roomWasEmpty) {
+            // There ARE approved members — they've just all gone offline right
+            // now. This is the "room emptied out" moment the configured Room
+            // Expiry setting counts from (see setRoomExpiry / _roomExpiryMs):
+            //   -1 (Never)   → leave the room alone entirely
+            //    0 (Instant) → wipe it right now, same as the fully-abandoned case
+            //   >0            → schedule autoDeleteAt for that many ms from now;
+            //                    the existing cleanup cron (functions/api/cleanup.js)
+            //                    picks it up naturally once that time passes
+            _roomWasEmpty = true;
+            if (_roomExpiryMs === -1) {
+              // never — nothing to schedule
+            } else if (_roomExpiryMs === 0) {
+              let shouldWipe = false;
+              try {
+                await db.runTransaction(async tx => {
+                  const txSnap = await tx.get(roomRef);
+                  if (!txSnap.exists) return;
+                  if (txSnap.data()?.emptyAt) return;
+                  tx.update(roomRef, { emptyAt: ts_now() });
+                  shouldWipe = true;
+                });
+              } catch { /* another tab likely won, or denied — skip */ }
+              if (shouldWipe) {
+                toast('Room closed', 'Everyone left — room deleted instantly (Room Expiry: Instant).', 'trash');
+                await wipeRoom(code, db);
+                await clearCacheForRoom(code);
+              }
+            } else {
+              let scheduled = false;
+              const newAutoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + _roomExpiryMs);
+              try {
+                await db.runTransaction(async tx => {
+                  const txSnap = await tx.get(roomRef);
+                  if (!txSnap.exists) return;
+                  if (txSnap.data()?.emptyAt) return;
+                  tx.update(roomRef, { emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
+                  scheduled = true;
+                });
+              } catch (_txErr) {
+                // Same non-admin fallback as the wipe branches above —
+                // Firestore rules allow creatorId to set these without an
+                // admin doc, but the transaction API itself may still be
+                // rules-restricted for non-admins.
+                try {
+                  const freshSnap = await roomRef.get();
+                  if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
+                    await roomRef.update({ emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
+                    scheduled = true;
+                  }
+                } catch (_e2) { /* fail open — worst case the room just doesn't get an expiry set this time */ }
+              }
+              if (!scheduled) { /* another tab already scheduled it, or write was denied — nothing more to do */ }
+            }
           }
         } catch { /* silently skip wipe on error */ }
+      } else if (_realOnlineCount > 0 && _roomWasEmpty) {
+        // Someone (re)joined before the empty-room countdown fired — rescue
+        // the room by clearing the pending schedule, otherwise it could get
+        // deleted out from under whoever just came back.
+        _roomWasEmpty = false;
+        db.collection('rooms').doc(code).update({
+          emptyAt: firebase.firestore.FieldValue.delete(),
+          autoDeleteAt: firebase.firestore.FieldValue.delete(),
+        }).catch(() => {});
       }
       _presenceSettled = true;
     }, () => {});
@@ -2633,17 +2685,20 @@ function _unblurScreen() {
   if (_screenshotBlurTimer) { clearTimeout(_screenshotBlurTimer); _screenshotBlurTimer = null; }
 }
 
-/** Extend room autoDeleteAt from now, using the admin-configured room expiry (default 30 min, 0 = never) */
+/** Safety net: clear any pending "room is empty, delete it soon" schedule
+ * whenever there's message activity, so an actively-used room never gets
+ * wiped out from under people due to a stray countdown (e.g. a brief empty
+ * window right before someone reconnects). The real countdown is set by
+ * startPresenceListener when the room is actually detected as empty — not
+ * here; while people are chatting, nothing should be scheduled at all. */
 let _extendTimer = null;
 function _extendRoomTtl() {
   if (!state.roomCode || !db) return;
-  if (!_roomExpiryMs) return;         // "Never" — nothing to extend, autoDeleteAt intentionally absent
   if (_extendTimer) return;           // already scheduled this second
   _extendTimer = setTimeout(() => {
     _extendTimer = null;
-    const newExpiry = firebase.firestore.Timestamp.fromMillis(Date.now() + _roomExpiryMs);
     db.collection('rooms').doc(state.roomCode)
-      .update({ autoDeleteAt: newExpiry, lastActivity: ts_now() })
+      .update({ autoDeleteAt: firebase.firestore.FieldValue.delete(), lastActivity: ts_now() })
       .catch(() => {});
   }, 2000);                          // debounce 2s so rapid typing = 1 write
 }
@@ -3161,14 +3216,15 @@ async function _deleteSelected(forEveryone) {
   _exitSelectMode();
   let deleted = 0;
   for (const id of ids) {
-    try {
-      const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
-      if (forEveryone && w?.classList.contains('sent')) {
-        await db.collection('rooms').doc(state.roomCode).collection('messages').doc(id).delete();
-      }
-      w?.remove();
+    const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
+    if (forEveryone && w?.classList.contains('sent')) {
+      _softDeleteLocal(w);     // instant
+      _softDeleteRemote(id);   // background
       deleted++;
-    } catch(e) { console.warn('delete failed', id, e); }
+    } else if (!forEveryone) {
+      w?.remove(); // "delete for me" — local-only, doesn't touch Firestore
+      deleted++;
+    }
   }
   if (deleted) toast(`${deleted} message${deleted>1?'s':''} deleted`, '', forEveryone ? 'trash' : 'ok');
 }
@@ -3817,6 +3873,21 @@ async function renderMsg(data, docId, insertBeforeEl) {
   // Long-press to select (runs once per element)
   if (docId && !wrap.dataset.lpWired) { wrap.dataset.lpWired='1'; _wireLongPress(wrap, docId); }
 
+  // Already-deleted message (e.g. a new member loading history that
+  // includes a message someone deleted before they joined) — render the
+  // tombstone directly. Its enc/encData is stripped server-side by
+  // _softDeleteRemote, so there's nothing to decrypt or build a real
+  // bubble from; skip straight past all the type-specific branches below.
+  if (data.deleted) {
+    wrap.classList.add('deleted');
+    wrap.innerHTML = `
+      <div class="msg-bubble-wrap">
+        <div class="msg-bubble"><span class="msg-deleted-text">This message was deleted</span></div>
+      </div>`;
+    (insertBeforeEl && insertBeforeEl.parentNode === area) ? area.insertBefore(wrap, insertBeforeEl) : area.appendChild(wrap);
+    return;
+  }
+
   // Decoded text (used for reply preview)
   const plainText = data.type === 'text' ? await dec(data.enc, state.roomCode) : null;
 
@@ -4136,29 +4207,54 @@ function addSwipeReply(wrap, data, plainText) {
   }, { passive: true });
 }
 
-async function confirmDeleteMsg(docId, wrapEl) {
-  if (!docId || !state.roomCode) return;
-  const ok = await showConfirm('Delete message?', 'This removes it for everyone.', 'DELETE');
-  if (!ok) return;
+/**
+ * Soft-delete: replaces a message with a "This message was deleted"
+ * tombstone that every member sees, instead of a hard Firestore delete —
+ * which used to vanish the doc with zero trace, leaving nobody else in the
+ * room any indication a message had even been there.
+ *
+ * The local bubble updates INSTANTLY (no network wait); the actual
+ * Firestore write happens in the background via _softDeleteRemote so
+ * deleting never feels like it's blocked on a round trip.
+ */
+function _softDeleteLocal(wrap) {
+  if (!wrap || wrap.classList.contains('deleted')) return;
+  wrap.classList.add('deleted');
+  const bubble = wrap.querySelector('.msg-bubble');
+  if (bubble) {
+    bubble.innerHTML = '<span class="msg-deleted-text">This message was deleted</span>';
+  }
+  wrap.querySelector('.msg-reactions')?.remove();
+}
+
+async function _softDeleteRemote(docId) {
+  if (!docId || !state.roomCode || !db) return;
   try {
-    await db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).delete();
-    // Also remove from IDB cache
+    await db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).update({
+      deleted: true,
+      deletedBy: state.me?.id || null,
+      deletedAt: ts_now(),
+      enc: null, encData: null, fileName: null, mime: null, groupId: null, reactions: null,
+    });
+  } catch (e) { console.warn('[MIUT] Soft-delete failed:', e); }
+  // Local IDB cache no longer needs the (now-stripped) content either
+  try {
     const db2 = await openIDB();
     await new Promise(res => {
       const tx = db2.transaction('msgs', 'readwrite');
       tx.objectStore('msgs').delete(docId);
       tx.oncomplete = res;
     });
-    // Animate out and remove from DOM
-    wrapEl.style.transition = 'opacity 0.2s, transform 0.2s';
-    wrapEl.style.opacity    = '0';
-    wrapEl.style.transform  = 'scaleY(0.8)';
-    setTimeout(() => wrapEl.remove(), 220);
-    _renderedIds.delete(docId);
-  } catch (e) {
+  } catch {}
+}
 
-    toast('Delete failed', e.message, 'err');
-  }
+async function confirmDeleteMsg(docId, wrapEl) {
+  if (!docId || !state.roomCode) return;
+  const ok = await showConfirm('Delete message?', 'This removes it for everyone — replaced with "This message was deleted".', 'DELETE');
+  if (!ok) return;
+  _softDeleteLocal(wrapEl);     // instant — no network wait
+  _softDeleteRemote(docId);     // background
+  _renderedIds.delete(docId);
 }
 
 function scrollToMsg(docId) {
@@ -4173,6 +4269,7 @@ function scrollToMsg(docId) {
 async function patchMsg(id, data) {
   const wrapEl = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
   if (!wrapEl) return;
+  if (data.deleted) { _softDeleteLocal(wrapEl); return; } // tombstone — nothing else to patch
   const reactRow = wrapEl.querySelector('.msg-reactions');
   if (reactRow) renderReactionsInto(reactRow, data.reactions || {}, id);
   if (data.readBy) _renderReadBadge(wrapEl, data.readBy);
@@ -4189,7 +4286,19 @@ function renderTextContent(text) {
   // placeholder tokens first. Without this, a URL containing "@" (e.g. a
   // mailto: or user@host link) would get its own text mangled by the
   // mention regex mid-substitution, since both operate on the same string.
-  const urlRe = /\b(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi;
+  //
+  // Matches http(s)/www URLs AND bare domains typed with no prefix at all
+  // (e.g. "highwayrush.pages.dev") — the latter needs a curated TLD list to
+  // avoid false-positiving on ordinary prose like "e.g." or "Mr. Smith".
+  // List favors common gTLDs, a handful of ccTLDs, and popular free-hosting
+  // second-level suffixes (pages.dev, vercel.app, etc).
+  const _TLDS = '(?:com|org|net|edu|gov|mil|int|io|dev|app|co|me|xyz|info|biz|name|pro|tech|online|site|store|space|club|live|life|world|art|blog|shop|cloud|ai|to|gg|tv|fm|so|sh|it|ly|is|us|uk|ca|in|au|de|fr|jp|cn|nl|se|no|ru|br|es|it|ch|pages\\.dev|vercel\\.app|netlify\\.app|github\\.io|web\\.app|firebaseapp\\.com|workers\\.dev)';
+  const urlRe = new RegExp(
+    '\\b(?:https?:\\/\\/[^\\s<]+' +                                                    // scheme-prefixed
+    '|www\\.[^\\s<]+' +                                                                // www.-prefixed
+    '|(?<!@)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+' + _TLDS + '(?:\\/[^\\s<]*)?' + // bare domain, curated TLDs, not an email's domain half
+    ')\\b', 'gi'
+  );
   const stash = [];
   html = html.replace(urlRe, raw => {
     // Trim common trailing prose punctuation that isn't really part of the URL
@@ -4927,7 +5036,7 @@ async function joinFromInvite() {
     _saveWrongState({ wrongCount: 0, lockedUntil: 0 });
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
-    { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 1800000; }
+    { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     const memberSnap = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData   = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
@@ -5021,9 +5130,20 @@ async function _handoffAdminRole(roomCodeOverride, meOverride) {
 }
 
 async function handleLogout() {
-  const _rejoinNote = _roomExpiryMs
-    ? `You can rejoin using the room code — this room auto-deletes after ${_fmtRoomTtl(_roomExpiryMs)} of inactivity.`
-    : 'You can rejoin at any time using the room code — this room never auto-expires.';
+  // Note: this only warns about expiry if leaving would empty the room —
+  // if others are still online, the room stays alive regardless of the
+  // expiry setting (expiry only counts once everyone has left).
+  const _leavingEmptiesRoom = _onlineCount <= 1;
+  let _rejoinNote;
+  if (!_leavingEmptiesRoom) {
+    _rejoinNote = 'You can rejoin using the room code — others are still in the room, so it stays open.';
+  } else if (_roomExpiryMs === -1) {
+    _rejoinNote = 'You can rejoin at any time using the room code — this room never auto-expires.';
+  } else if (_roomExpiryMs === 0) {
+    _rejoinNote = "You'll be the last one out — this room deletes instantly once you leave (Room Expiry: Instant).";
+  } else {
+    _rejoinNote = `You'll be the last one out — this room auto-deletes ${_fmtRoomTtl(_roomExpiryMs)} after you leave, unless someone rejoins first.`;
+  }
   const ok = await showConfirm('Leave Room?', _rejoinNote, 'LEAVE');
   if (!ok) return;
 
@@ -5121,10 +5241,8 @@ function openSettings() {
     roomTtlRow.style.display = _isAdmin ? 'flex' : 'none';
     const rSel = $('room-ttl-select');
     if (rSel) rSel.value = String(_roomExpiryMs);
-    const rTtlEl = $('room-ttl-display'); if (rTtlEl) rTtlEl.textContent = _fmtRoomTtl(_roomExpiryMs);
+    const rTtlEl = $('room-ttl-sublabel'); if (rTtlEl) rTtlEl.textContent = _fmtRoomExpirySentence(_roomExpiryMs);
   }
-  const cleanupRow = $('room-cleanup-row');
-  if (cleanupRow) cleanupRow.style.display = _isAdmin ? 'flex' : 'none';
   const epochEl = $('epoch-display');
   if (epochEl) epochEl.textContent = String(_roomEpoch);
 
@@ -5699,7 +5817,6 @@ function _wireAllHandlers() {
   on('approval-toggle', 'change', () => toggleApprovalGate());
   on('ttl-select',      'change', e => setRoomTtl(+e.target.value));
   on('room-ttl-select', 'change', e => setRoomExpiry(+e.target.value));
-  on('room-cleanup-btn','click',  () => cleanupRoomNow());
 
   const rotateBtn = document.querySelector('#rotate-key-row .btn-rotate-key');
   if (rotateBtn) rotateBtn.addEventListener('click', () => { rotateKey(); closeSettings(); });

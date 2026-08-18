@@ -343,6 +343,8 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .msg-wrapper.sent .msg-inner{align-items:flex-end}
 .msg-sender{font-family:var(--fui);font-size:.6rem;font-weight:700;letter-spacing:1.5px;margin-bottom:4px;padding-left:2px}
 .msg-bubble{padding:10px 14px;border-radius:20px;font-family:var(--fmono),"Apple Color Emoji","Noto Color Emoji","Segoe UI Emoji";font-size:.87rem;line-height:1.64;word-break:break-word;overflow-wrap:anywhere;letter-spacing:.1px;transition:box-shadow var(--fast) ease,border-color var(--fast) ease}
+.msg-wrapper.deleted .msg-bubble{background:transparent!important;border:1px dashed var(--border);box-shadow:none!important;cursor:default}
+.msg-deleted-text{font-style:italic;color:var(--text3);font-size:.85em}
 .msg-wrapper.sent .msg-bubble{background:linear-gradient(135deg,var(--teal) 0%,var(--teal2) 100%);color:var(--bg);border-bottom-right-radius:6px;box-shadow:0 2px 14px rgba(78,205,196,.22)}
 .msg-wrapper.sent.consecutive .msg-bubble{border-bottom-right-radius:20px}
 .msg-wrapper.received .msg-bubble{background:var(--surf2);color:var(--text);border:1px solid var(--border2);border-bottom-left-radius:6px}
@@ -439,6 +441,9 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .mention{font-family:var(--fui);font-size:.82em;font-weight:700;letter-spacing:.5px;color:var(--teal);background:var(--teal-dim);border-radius:5px;padding:0 3px}
 .msg-link{color:var(--teal);text-decoration:underline;text-decoration-color:var(--teal-b);word-break:break-word;transition:text-decoration-color var(--fast) ease}
 .msg-link:hover,.msg-link:active{text-decoration-color:var(--teal)}
+/* While selecting messages for bulk actions, tapping a link should toggle
+   selection like tapping anywhere else on the bubble — not navigate away. */
+.msg-wrapper.selectable .msg-link{pointer-events:none}
 .msg-wrapper.sent .msg-link{color:var(--bg);text-decoration-color:rgba(5,13,12,.5)}
 .msg-wrapper.sent .msg-link:hover,.msg-wrapper.sent .msg-link:active{text-decoration-color:var(--bg)}
 .msg-wrapper.sent .mention{color:var(--bg);background:rgba(0,0,0,.2)}
