@@ -1,0 +1,47 @@
+name: Bump version
+
+on:
+  push:
+    branches: [main]
+    # Ignore pushes that only touched files that can't affect the deployed
+    # app, so e.g. editing README.md doesn't burn a version number.
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'LICENSE'
+
+permissions:
+  contents: write
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    # Skip commits made BY this workflow itself — without this it would
+    # trigger itself in an infinite loop (bump → push → triggers push event → bump)
+    if: ${{ !contains(github.event.head_commit.message, '[skip version bump]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A workflow-triggered push needs to use a token that can itself
+          # trigger further workflow runs is NOT what we want here (that's
+          # what the [skip version bump] guard above prevents regardless),
+          # but it DOES need write access to push the commit at all.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Bump version (patch, with 25→next-minor rollover)
+        run: node version.js patch
+
+      - name: Commit and push the bumped version
+        run: |
+          NEW_VERSION=$(node -e "console.log(require('./package.json').version)")
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore: bump version to v${NEW_VERSION} [skip version bump]"
+          git push
+          
