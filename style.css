@@ -589,7 +589,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 
 .feedback-comment-label{display:block;font-family:var(--fui);font-size:.62rem;font-weight:700;letter-spacing:1.5px;color:var(--text);margin:0 2px 8px}
 .feedback-textarea{width:100%;min-height:76px;max-height:160px;resize:vertical;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px;color:var(--text);font-family:var(--fmono);font-size:.72rem;line-height:1.6;outline:none;transition:border-color var(--fast) ease,box-shadow var(--fast) ease}
-.feedback-textarea::placeholder{color:var(--text3)}
+.feedback-textarea::placeholder{color:var(--text2)}
 .feedback-textarea:focus{border-color:var(--teal-b);box-shadow:0 0 0 2px var(--teal-glow)}
 
 .feedback-charcount{text-align:right;font-family:var(--fmono);font-size:.58rem;color:var(--text3);margin:5px 2px 18px}

@@ -2237,94 +2237,7 @@ function startPresenceListener() {
       });
 
       if (_presenceSettled && _realOnlineCount === 0 && state.me) {
-        try {
-          const allApproved = await db.collection('rooms').doc(code)
-            .collection('members').where('approved', '==', true).get();
-          const roomRef = db.collection('rooms').doc(code);
-          if (allApproved.empty) {
-            // two tabs from both triggering wipeRoom simultaneously. The first tab
-            // to set emptyAt wins; if it's already set by another tab, skip the wipe.
-            let shouldWipe = false;
-            try {
-              await db.runTransaction(async tx => {
-                const txSnap = await tx.get(roomRef);
-                if (!txSnap.exists) return;
-                if (txSnap.data()?.emptyAt) return; // another tab already won
-                tx.update(roomRef, { emptyAt: ts_now() });
-                shouldWipe = true;
-              });
-            } catch (_txErr) {
-              // Transaction denied (non-admin member) — try direct update.
-              // Firestore rules allow creatorId to set emptyAt without admin doc.
-              try {
-                const freshSnap = await roomRef.get();
-                if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
-                  await roomRef.update({ emptyAt: ts_now() });
-                  shouldWipe = true;
-                }
-              } catch (_e2) { /* fail open */ }
-            }
-            if (shouldWipe) {
-              toast('Room closed', 'Last member left — room data wiped.', 'trash');
-              await wipeRoom(code, db);
-              await clearCacheForRoom(code);
-            }
-          } else if (!_roomWasEmpty) {
-            // There ARE approved members — they've just all gone offline right
-            // now. This is the "room emptied out" moment the configured Room
-            // Expiry setting counts from (see setRoomExpiry / _roomExpiryMs):
-            //   -1 (Never)   → leave the room alone entirely
-            //    0 (Instant) → wipe it right now, same as the fully-abandoned case
-            //   >0            → schedule autoDeleteAt for that many ms from now;
-            //                    the existing cleanup cron (functions/api/cleanup.js)
-            //                    picks it up naturally once that time passes
-            _roomWasEmpty = true;
-            if (_roomExpiryMs === -1) {
-              // never — nothing to schedule
-            } else if (_roomExpiryMs === 0) {
-              let shouldWipe = false;
-              try {
-                await db.runTransaction(async tx => {
-                  const txSnap = await tx.get(roomRef);
-                  if (!txSnap.exists) return;
-                  if (txSnap.data()?.emptyAt) return;
-                  tx.update(roomRef, { emptyAt: ts_now() });
-                  shouldWipe = true;
-                });
-              } catch { /* another tab likely won, or denied — skip */ }
-              if (shouldWipe) {
-                toast('Room closed', 'Everyone left — room deleted instantly (Room Expiry: Instant).', 'trash');
-                await wipeRoom(code, db);
-                await clearCacheForRoom(code);
-              }
-            } else {
-              let scheduled = false;
-              const newAutoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + _roomExpiryMs);
-              try {
-                await db.runTransaction(async tx => {
-                  const txSnap = await tx.get(roomRef);
-                  if (!txSnap.exists) return;
-                  if (txSnap.data()?.emptyAt) return;
-                  tx.update(roomRef, { emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
-                  scheduled = true;
-                });
-              } catch (_txErr) {
-                // Same non-admin fallback as the wipe branches above —
-                // Firestore rules allow creatorId to set these without an
-                // admin doc, but the transaction API itself may still be
-                // rules-restricted for non-admins.
-                try {
-                  const freshSnap = await roomRef.get();
-                  if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
-                    await roomRef.update({ emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
-                    scheduled = true;
-                  }
-                } catch (_e2) { /* fail open — worst case the room just doesn't get an expiry set this time */ }
-              }
-              if (!scheduled) { /* another tab already scheduled it, or write was denied — nothing more to do */ }
-            }
-          }
-        } catch { /* silently skip wipe on error */ }
+        await _handleRoomBecameEmpty(code);
       } else if (_realOnlineCount > 0 && _roomWasEmpty) {
         // Someone (re)joined before the empty-room countdown fired — rescue
         // the room by clearing the pending schedule, otherwise it could get
@@ -2337,6 +2250,111 @@ function startPresenceListener() {
       }
       _presenceSettled = true;
     }, () => {});
+}
+
+/**
+ * Decides what happens when a room is detected as empty (no one online),
+ * per the admin's Room Expiry setting. Called from two places:
+ *
+ *   1. startPresenceListener, above — reactive: some OTHER still-connected
+ *      client notices everyone else went offline.
+ *   2. handleLogout, directly — proactive, and this is the one that
+ *      actually matters most: if you're the LAST person leaving, your own
+ *      client tearing down its listeners (as part of closing instantly —
+ *      see handleLogout) means nobody's presence listener is left running
+ *      to ever notice the room emptied. Relying solely on (1) meant the
+ *      single most common case — the last person leaving normally — never
+ *      triggered any expiry at all, which is exactly why "Instant" and
+ *      every other Room Expiry setting appeared to silently not work.
+ *      Calling this directly from the leaving client, before it tears down,
+ *      closes that gap.
+ */
+async function _handleRoomBecameEmpty(code) {
+  if (!code || !db) return;
+  try {
+    const allApproved = await db.collection('rooms').doc(code)
+      .collection('members').where('approved', '==', true).get();
+    const roomRef = db.collection('rooms').doc(code);
+    if (allApproved.empty) {
+      // Room was abandoned before anyone was ever properly approved —
+      // wipe immediately regardless of the Room Expiry setting. Guard
+      // against two clients/tabs both trying this at once: the first to
+      // set emptyAt wins.
+      let shouldWipe = false;
+      try {
+        await db.runTransaction(async tx => {
+          const txSnap = await tx.get(roomRef);
+          if (!txSnap.exists) return;
+          if (txSnap.data()?.emptyAt) return; // another tab already won
+          tx.update(roomRef, { emptyAt: ts_now() });
+          shouldWipe = true;
+        });
+      } catch (_txErr) {
+        // Transaction denied (non-admin member) — try direct update.
+        // Firestore rules allow creatorId to set emptyAt without admin doc.
+        try {
+          const freshSnap = await roomRef.get();
+          if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
+            await roomRef.update({ emptyAt: ts_now() });
+            shouldWipe = true;
+          }
+        } catch (_e2) { /* fail open */ }
+      }
+      if (shouldWipe) {
+        await wipeRoom(code, db);
+        await clearCacheForRoom(code);
+      }
+    } else if (!_roomWasEmpty) {
+      // There ARE approved members — they've just all gone offline right
+      // now. This is the "room emptied out" moment the configured Room
+      // Expiry setting counts from (see setRoomExpiry / _roomExpiryMs):
+      //   -1 (Never)   → leave the room alone entirely
+      //    0 (Instant) → wipe it right now, same as the fully-abandoned case
+      //   >0            → schedule autoDeleteAt for that many ms from now;
+      //                    the existing cleanup cron (functions/api/cleanup.js)
+      //                    picks it up naturally once that time passes
+      _roomWasEmpty = true;
+      if (_roomExpiryMs === -1) {
+        // never — nothing to schedule
+      } else if (_roomExpiryMs === 0) {
+        let shouldWipe = false;
+        try {
+          await db.runTransaction(async tx => {
+            const txSnap = await tx.get(roomRef);
+            if (!txSnap.exists) return;
+            if (txSnap.data()?.emptyAt) return;
+            tx.update(roomRef, { emptyAt: ts_now() });
+            shouldWipe = true;
+          });
+        } catch { /* another tab likely won, or denied — skip */ }
+        if (shouldWipe) {
+          await wipeRoom(code, db);
+          await clearCacheForRoom(code);
+        }
+      } else {
+        let scheduled = false;
+        const newAutoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + _roomExpiryMs);
+        try {
+          await db.runTransaction(async tx => {
+            const txSnap = await tx.get(roomRef);
+            if (!txSnap.exists) return;
+            if (txSnap.data()?.emptyAt) return;
+            tx.update(roomRef, { emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
+            scheduled = true;
+          });
+        } catch (_txErr) {
+          try {
+            const freshSnap = await roomRef.get();
+            if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
+              await roomRef.update({ emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
+              scheduled = true;
+            }
+          } catch (_e2) { /* fail open — worst case the room just doesn't get an expiry set this time */ }
+        }
+        if (!scheduled) { /* another tab already scheduled it, or write was denied — nothing more to do */ }
+      }
+    }
+  } catch { /* silently skip on error */ }
 }
 
 function updateOnlineUI() {
@@ -3188,15 +3206,20 @@ function _updateSelectBar() {
   const count  = _selectedIds.size;
   const countEl = document.getElementById('msa-count');
   if (countEl) countEl.textContent = `${count} selected`;
-  // Only show "delete for everyone" for own messages
-  const allOwn = [..._selectedIds].every(id => {
+  // "Delete for everyone" is allowed for your own messages always, and for
+  // ANY message if you're the room admin — moderating other people's
+  // messages is a normal admin capability, not just self-deletion. This
+  // used to require every selected message be your own regardless of
+  // admin status, so an admin selecting someone else's message never saw
+  // the option at all.
+  const canDeleteAll = [..._selectedIds].every(id => {
     const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
-    return w?.classList.contains('sent');
+    return _isAdmin || w?.classList.contains('sent');
   });
   const delMe  = document.getElementById('msa-del-me');
   const delAll = document.getElementById('msa-del-all');
   if (delMe)  delMe.style.display  = count ? '' : 'none';
-  if (delAll) delAll.style.display = (count && allOwn) ? '' : 'none';
+  if (delAll) delAll.style.display = (count && canDeleteAll) ? '' : 'none';
 }
 
 function _toggleSelectMsg(docId, el) {
@@ -3217,7 +3240,9 @@ async function _deleteSelected(forEveryone) {
   let deleted = 0;
   for (const id of ids) {
     const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
-    if (forEveryone && w?.classList.contains('sent')) {
+    // Admins can delete-for-everyone on any message, not just their own —
+    // matches the "Everyone" button's own visibility rule in _updateSelectBar.
+    if (forEveryone && (_isAdmin || w?.classList.contains('sent'))) {
       _softDeleteLocal(w);     // instant
       _softDeleteRemote(id);   // background
       deleted++;
@@ -4015,6 +4040,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
       el.addEventListener('touchstart', () => {
         pressTimer = setTimeout(() => {
           pressTimer = null;
+          if (wrap.classList.contains('deleted')) return; // no react/reply/edit on a tombstone
           if (navigator.vibrate) navigator.vibrate(18);
           showInlineActions(wrap, docId, plainText, data.ts, isMine);
         }, 480);
@@ -4023,6 +4049,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
       el.addEventListener('touchmove', () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } }, { passive: true });
       el.addEventListener('contextmenu', e => {
         e.preventDefault();
+        if (wrap.classList.contains('deleted')) return;
         showInlineActions(wrap, docId, plainText, data.ts, isMine);
       });
     });
@@ -4160,6 +4187,7 @@ function addSwipeReply(wrap, data, plainText) {
 
   bubbleWrap.addEventListener('touchstart', e => {
     if (e.target.closest('button')) return;
+    if (wrap.classList.contains('deleted')) return; // can't reply to a tombstone
     startX   = e.touches[0].clientX;
     startY   = e.touches[0].clientY;
     dx       = 0;
@@ -4225,6 +4253,12 @@ function _softDeleteLocal(wrap) {
     bubble.innerHTML = '<span class="msg-deleted-text">This message was deleted</span>';
   }
   wrap.querySelector('.msg-reactions')?.remove();
+  // A deleted message shouldn't be reactable, replyable, or re-editable —
+  // remove the reply/react icon buttons that normally sit beside every
+  // bubble (these are separate DOM elements from .msg-bubble itself, so
+  // clearing the bubble's content alone left them behind and still
+  // clickable on an already-rendered message).
+  wrap.querySelector('.msg-actions')?.remove();
 }
 
 async function _softDeleteRemote(docId) {
@@ -5212,6 +5246,22 @@ async function handleLogout() {
         await db.collection('rooms').doc(_leavingRoomCode).collection('members').doc(_leavingMe.id)
           .update({ online: false });
       } catch (e) { console.warn('[MIUT] Marking offline failed:', e); }
+
+      // This is the critical piece that makes Room Expiry (Instant, 5 min,
+      // etc.) actually take effect: startPresenceListener's empty-room
+      // detection only runs on a client that still has an active presence
+      // listener, but stopListeners() above already tore this client's
+      // down as part of closing instantly. If you're the last person out,
+      // nobody's listener is left running to ever notice the room emptied
+      // — so without calling this directly here, Instant (and every other
+      // Room Expiry setting) silently never fired, and the room stayed
+      // rejoinable indefinitely. Calling it explicitly from the leaving
+      // client closes that gap regardless of whether anyone else happens
+      // to be watching.
+      if (_leavingEmptiesRoom) {
+        try { await _handleRoomBecameEmpty(_leavingRoomCode); }
+        catch (e) { console.warn('[MIUT] Empty-room expiry check failed:', e); }
+      }
     })();
   }
 }
@@ -5451,8 +5501,13 @@ function _fbWireOnce() {
   stars?.addEventListener('click', e => {
     const btn = e.target.closest('.star-btn');
     if (!btn) return;
+    const firstRating = _fbRating === 0;
     _fbRating = +btn.dataset.value;
     _fbRenderStars();
+    // Open the keyboard on the comment box right after a first rating —
+    // saves a tap, and the low-contrast placeholder fix above means people
+    // can actually read what they're being asked once it's focused.
+    if (firstRating) setTimeout(() => comment?.focus(), 200);
   });
 
   tagsWrap?.addEventListener('click', e => {
