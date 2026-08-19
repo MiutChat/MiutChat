@@ -361,7 +361,7 @@ function _applySubst(bytes, table) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Auto epoch rotation counters ────────────────────────────────────────────
-const _AUTO_EPOCH_MSG_COUNT = 200; // rotate key every N messages (admin only)
+const _AUTO_EPOCH_MSG_COUNT = 100; // rotate key every N messages (admin only)
 let   _msgsSinceEpoch       = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2009,6 +2009,21 @@ async function setRoomExpiry(ms) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Required Firestore Security Rule for epoch rotation — this repo doesn't
+// commit a firestore.rules file (see the /feedback rule comment elsewhere
+// in this file for why), so add this in the Firebase Console. It MUST key
+// off the room's members subcollection role, not a fixed creatorId,
+// because admin can be handed off (see _handoffAdminRole) — a rule that
+// only allows request.auth.uid == resource.data.creatorId to write `epoch`
+// will silently reject a handed-off admin's rotation attempts:
+//
+//   match /rooms/{roomCode} {
+//     allow update: if request.resource.data.diff(resource.data)
+//         .affectedKeys().hasOnly(['epoch'])
+//       ? exists(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid))
+//         && get(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid)).data.role == 'admin'
+//       : true; // other room-doc updates keep whatever rule they already have
+//   }
 async function _autoRotateEpoch(reason) {
   if (!_isAdmin || !state.roomCode || !db) return;
   try {
@@ -2017,7 +2032,22 @@ async function _autoRotateEpoch(reason) {
     _roomEpoch = newEpoch;
     _msgsSinceEpoch = 0;
     await sendSys(`Key auto-rotated 🔑 (${reason}) — epoch ${newEpoch} active`);
-  } catch { /* silent — non-critical */ }
+  } catch (e) {
+    // This used to fail completely silently. Auto-rotation on a member
+    // leaving is the ONLY mechanism this app has for cutting off a departed
+    // member's ability to decrypt future messages — there's no separate
+    // kick/block feature. A silent failure here means that protection can
+    // quietly stop working with zero indication, which is a real security
+    // gap, not just a missed feature. Surface it instead:
+    console.warn(`[MIUT] Epoch auto-rotation failed (${reason}):`, e);
+    // Likely cause: Firestore security rules restricting the epoch field
+    // update to the room's original creatorId rather than "whoever
+    // currently holds the admin role" — a handed-off admin would get
+    // silently rejected. If you see this warning, check that your rules
+    // allow epoch updates for any member whose role == 'admin', not just
+    // request.auth.uid == resource.data.creatorId.
+    toast('Key rotation failed', 'Encryption key did not auto-rotate — check console for details.', 'err');
+  }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2446,6 +2476,21 @@ function startChatListeners() {
         const docTs = data.ts || 0;
         if (docTs > _lastCachedTs) _lastCachedTs = docTs;
         cacheMsg(id, code, data).catch(() => {});
+        // Message-count-based epoch rotation (admin only). This counts
+        // every genuine new message in the room — not just ones this
+        // client itself sent, which was the previous behavior. That meant
+        // an admin who wasn't the most active chatter could go long past
+        // the intended 25-message threshold without ever rotating, since
+        // the counter only advanced on the admin's own successful sends.
+        // Skips system messages and file chunks (a single image/video
+        // would otherwise inflate the count by however many pieces it was
+        // split into).
+        if (_isAdmin && data.type !== 'system' && data.type !== 'chunk') {
+          _msgsSinceEpoch++;
+          if (_msgsSinceEpoch >= _AUTO_EPOCH_MSG_COUNT) {
+            _autoRotateEpoch('message limit').catch(() => {});
+          }
+        }
         if (!alreadyRendered && data.type === 'text' && data.senderId !== state.me?.id) {
           playSound('receive');
           // Queue read receipt for incoming text messages
@@ -3457,7 +3502,8 @@ async function sendMessage() {
     clearReply();
   }
 
-  // Extend room expiry on activity (30min from last message)
+  // Clear any pending "room is empty" auto-delete schedule — see
+  // _extendRoomTtl's own comment for why sending a message should do this.
   _extendRoomTtl();
 
   // Optimistic render: show the bubble immediately instead of waiting for
@@ -3478,13 +3524,8 @@ async function sendMessage() {
       _pendingByTs.delete(ts_client);
       _reconcileSentMessage(_localId, ref.id, msgData);
       _ping('message_sent');
-      // Auto-rotate epoch every N messages (admin only, silent)
-      if (_isAdmin) {
-        _msgsSinceEpoch++;
-        if (_msgsSinceEpoch >= _AUTO_EPOCH_MSG_COUNT) {
-          _autoRotateEpoch('message limit').catch(() => {});
-        }
-      }
+      // Message-count-based epoch rotation is tracked in the live listener
+      // (startChatListeners) instead of here — see the comment there for why.
     })
     .catch(e => {
       _markMessageFailed(_localId);

@@ -13,13 +13,15 @@ const isProd = process.env.NODE_ENV !== 'development';
 const START  = Date.now();
 const ESB    = path.join(ROOT, 'node_modules/.bin/esbuild');
 
-const { maybeBumpVersion } = require('./version.js');
-// Single source of truth for the app version — see version.js for the bump
-// scheme. Only actually increments on a real Cloudflare Pages deploy
-// (process.env.CF_PAGES === '1'); local builds just read the current value.
-// Every file below that shows/embeds a version gets THIS value stamped in,
-// so they can never drift out of sync with each other again.
-const VERSION = maybeBumpVersion();
+const { getVersion } = require('./version.js');
+// Single source of truth for the app version — see version.js. build.js only
+// READS it here; the automatic bump itself happens in the GitHub Action at
+// .github/workflows/bump-version.yml, which commits the new number back to
+// the repo on every push. (An earlier version of this file tried bumping
+// during the build itself — that didn't persist across separate CI builds,
+// see version.js for why.) Every file below that shows/embeds a version
+// gets THIS value stamped in, so they can never drift out of sync again.
+const VERSION = getVersion();
 
 const C = { reset:'\x1b[0m',bold:'\x1b[1m',green:'\x1b[32m',teal:'\x1b[36m',red:'\x1b[31m',gray:'\x1b[90m',yellow:'\x1b[33m' };
 const log = (tag, msg, col) => {
@@ -34,7 +36,7 @@ if (!fs.existsSync(ESB)) die('esbuild not found — run: npm install');
 if (fs.existsSync(DIST)) fs.rmSync(DIST, { recursive: true, force: true });
 fs.mkdirSync(path.join(DIST, 'functions', 'api'), { recursive: true });
 log('CLEAN', 'dist/ wiped');
-log('VERSION', VERSION + (process.env.CF_PAGES === '1' ? '  (bumped for this deploy)' : '  (unchanged — not a CF Pages build)'));
+log('VERSION', VERSION + '  (bumped by the GitHub Action on push, not by this build step)');
 
 function run(cmd) {
   const r = spawnSync(cmd, { shell:true, stdio:['ignore','pipe','pipe'] });
