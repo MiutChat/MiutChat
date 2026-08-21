@@ -448,12 +448,45 @@
     </div>
 
     <div class="input-area" id="input-area">
-      <button class="icon-btn attach-btn ripple-btn" title="Attach file">
-        <svg viewBox="0 0 20 20" fill="none" width="19" height="19">
-          <path d="M16.5 10.5l-6.3 6.3a4.24 4.24 0 01-6-6l7-7a2.83 2.83 0 014 4l-7.1 7.1a1.41 1.41 0 01-2-2l6.3-6.3"
-                stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
-      </button>
+      <div class="attach-wrap">
+        <button class="icon-btn attach-btn ripple-btn" title="Attach" id="attach-btn" aria-expanded="false">
+          <svg viewBox="0 0 20 20" fill="none" width="19" height="19">
+            <path d="M16.5 10.5l-6.3 6.3a4.24 4.24 0 01-6-6l7-7a2.83 2.83 0 014 4l-7.1 7.1a1.41 1.41 0 01-2-2l6.3-6.3"
+                  stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <div class="attach-tabs" id="attach-tabs">
+          <button class="attach-tab" id="attach-camera" title="Camera">
+            <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
+              <path d="M4 8a2 2 0 012-2h1.2l.9-1.5A1.5 1.5 0 019.4 4h5.2a1.5 1.5 0 011.3.75L16.8 6H18a2 2 0 012 2v9a2 2 0 01-2 2H6a2 2 0 01-2-2V8z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <circle cx="12" cy="13" r="3.4" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <span>Camera</span>
+          </button>
+          <button class="attach-tab" id="attach-photo" title="Photo">
+            <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
+              <rect x="3.5" y="4.5" width="17" height="15" rx="2.2" stroke="currentColor" stroke-width="1.5"/>
+              <circle cx="8.5" cy="9.5" r="1.6" stroke="currentColor" stroke-width="1.4"/>
+              <path d="M4 16.5l4.8-4.8a1.8 1.8 0 012.5 0l1.6 1.6m6.6 2.7l-4-4a1.8 1.8 0 00-2.5 0l-.6.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span>Photo</span>
+          </button>
+          <button class="attach-tab" id="attach-video" title="Video">
+            <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
+              <rect x="3.5" y="6" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M15.5 10.4l4.3-2.5a.7.7 0 011 .6v7l-4.3-2.5" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            </svg>
+            <span>Video</span>
+          </button>
+          <button class="attach-tab" id="attach-file" title="File">
+            <svg viewBox="0 0 24 24" fill="none" width="20" height="20">
+              <path d="M13 3.5H7.8A1.8 1.8 0 006 5.3v13.4A1.8 1.8 0 007.8 20.5h8.4a1.8 1.8 0 001.8-1.8V9.5L13 3.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M13 3.5V8a1.5 1.5 0 001.5 1.5H18" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            </svg>
+            <span>File</span>
+          </button>
+        </div>
+      </div>
       <div class="msg-input-wrap">
         <textarea id="msg-input" placeholder="Message (encrypted)…"
                   rows="1" maxlength="4000"></textarea>
@@ -602,6 +635,53 @@
 </div>
 
 <!-- ── Post-leave feedback modal ── shown after a user leaves a room ── -->
+<!-- ── Member detail panel — tap a name/avatar in the sidebar to open ── -->
+<div id="member-detail-modal" class="modal-overlay" style="display:none">
+  <div class="modal member-detail">
+    <div class="modal-header">
+      <h3>MEMBER</h3>
+      <button class="icon-btn" id="member-detail-close-btn">
+        <svg viewBox="0 0 20 20" fill="none" width="16" height="16">
+          <path d="M15 5L5 15M5 5l10 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="md-header">
+        <div class="avatar md-avatar" id="md-avatar"></div>
+        <div class="md-name-wrap">
+          <div class="md-name" id="md-name"></div>
+          <div class="md-role" id="md-role"></div>
+        </div>
+      </div>
+
+      <div class="md-rows">
+        <div class="md-row">
+          <span class="md-row-label">Status</span>
+          <span class="md-row-value" id="md-status">—</span>
+        </div>
+        <div class="md-row">
+          <span class="md-row-label">Approval</span>
+          <span class="md-row-value" id="md-approval">—</span>
+        </div>
+        <div class="md-row">
+          <span class="md-row-label">Joined</span>
+          <span class="md-row-value" id="md-joined">—</span>
+        </div>
+        <div class="md-row md-row-key">
+          <span class="md-row-label">Public key fingerprint</span>
+          <span class="md-row-value md-fingerprint" id="md-fingerprint">Loading…</span>
+        </div>
+      </div>
+      <div class="md-key-note">
+        This fingerprint is derived from their signing key for this room. If it changes mid-conversation for someone you were already talking to, treat new messages from them with suspicion.
+      </div>
+
+      <div class="md-actions" id="md-actions"><!-- populated per-member: promote/demote/block, or approve/decline --></div>
+    </div>
+  </div>
+</div>
+
 <div id="feedback-modal" class="modal-overlay" style="display:none">
   <div class="modal feedback-modal">
     <div class="modal-header">
@@ -677,8 +757,11 @@
 
 <div id="toast-container" class="toast-container"></div>
 
-<input type="file" id="file-input"
-       accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.zip"
+<input type="file" id="file-input-camera" accept="image/*" capture="environment" style="display:none" />
+<input type="file" id="file-input-photo"  accept="image/*" style="display:none" />
+<input type="file" id="file-input-video"  accept="video/*" style="display:none" />
+<input type="file" id="file-input-file"
+       accept="*/*"
        style="display:none" /><script src="screen-guard.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>

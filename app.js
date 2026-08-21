@@ -709,6 +709,18 @@ async function verifyAndBadge(data, docId) {
 }
 
 const $  = id  => document.getElementById(id);
+
+// Production builds run esbuild with --drop:console (see build.js) to strip
+// debug output shipped to end users. That's fine for routine logs, but it
+// also silently strips every console.warn we use to surface REAL failures
+// (a background write failing, epoch rotation being rejected, etc.) —
+// meaning those warnings never actually reached anyone testing the
+// deployed app, only local/dev builds. esbuild's drop only pattern-matches
+// direct `console.xxx(...)` call sites, so routing through this one level
+// of indirection lets diagnostically-important logs survive into
+// production while routine ones can still use console.* directly.
+const _sysConsole = window.console;
+function _log(level, ...args) { try { _sysConsole?.[level]?.(...args); } catch {} }
 const qs = sel => document.querySelector(sel);
 
 function esc(s) {
@@ -1383,10 +1395,26 @@ async function handleCreate() {
     // used and later becomes empty, startPresenceListener takes over and
     // reschedules autoDeleteAt based on inactivityTtlMs instead.
     const _autoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + 1800000);
+    // Every room document gets the FULL canonical field set at creation —
+    // no field is ever simply absent. Fields with no current value use an
+    // explicit null (or 0/[] as appropriate) rather than being left unset,
+    // so every room in the database has the identical shape and any field
+    // can be read without an `!== undefined` fallback. (null is safe here
+    // specifically for autoDeleteAt/emptyAt: Firestore's `<=` range queries,
+    // like the cleanup cron's, never match null or missing fields, so this
+    // doesn't risk the cron treating a null deadline as "already passed.")
     await db.collection('rooms').doc(code).set({
-      createdAt: ts_now(), creatorId: uid, epoch: 0, salt: roomSalt,
-      autoDeleteAt: _autoDeleteAt, inactivityTtlMs: 300000, // 5 min — the "after everyone leaves" default
-      lastActivity: ts_now(),
+      createdAt:        ts_now(),
+      creatorId:        uid,
+      epoch:            0,
+      salt:             roomSalt,
+      autoDeleteAt:     _autoDeleteAt,
+      inactivityTtlMs:  300000,   // 5 min — the "after everyone leaves" default
+      lastActivity:     ts_now(),
+      approvalRequired: true,     // set explicitly below too; kept here so the field always exists from creation
+      emptyAt:          null,
+      msgTtlMs:         0,        // per-message expiry — off by default
+      blockedUsers:     [],       // see blockMember() — ids blocked by the admin, denied re-entry
     }, { merge: true });
     _roomEpoch = 0;
     state.me = await buildMe(resolveName()); state.roomCode = code;
@@ -1448,12 +1476,21 @@ async function handleEnter() {
       return;
     }
     _saveWrongState({ wrongCount: 0, lockedUntil: 0 });
+    // A blocked user is permanently barred from this room (see blockMember) —
+    // check before anything else so there's no path that lets them back in.
+    if ((roomSnap.data()?.blockedUsers || []).includes(uid)) {
+      const errEl = $('join-error');
+      if (errEl) errEl.textContent = 'You have been blocked from this room by an admin.';
+      setLoading(btn, false);
+      return;
+    }
     // Check if room has expired before entering
     const _expired = await _checkRoomExpiry(code, db);
     if (_expired) { setLoading(btn, false); return; }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
+    _healRoomSchema(code, roomSnap.data()).catch(() => {});
 
     const memberSnap  = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData    = memberSnap.exists ? memberSnap.data() : null;
@@ -1614,6 +1651,7 @@ async function checkApprovalAndBoot() {
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
       { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
+      _healRoomSchema(state.roomCode, roomSnap.data()).catch(() => {});
     }
 
     const snap = await db.collection('rooms').doc(state.roomCode)
@@ -1624,6 +1662,17 @@ async function checkApprovalAndBoot() {
       showScreen('join-screen'); return;
     }
     const data = snap.data();
+    // Blocked while this session's saved credentials were still around —
+    // don't let a resumed session bypass the same check the fresh-join
+    // paths enforce.
+    if (data.blocked || (roomSnap.data()?.blockedUsers || []).includes(state.me.id)) {
+      localStorage.removeItem(CONFIG.SESSION_KEY);
+      localStorage.removeItem(CONFIG.ROOM_KEY);
+      const errEl = $('join-error');
+      if (errEl) errEl.textContent = 'You have been blocked from this room by an admin.';
+      showScreen('join-screen');
+      return;
+    }
     state.me.role     = data.role     || 'member';
     state.me.approved = data.approved || false;
 
@@ -1646,7 +1695,7 @@ async function checkApprovalAndBoot() {
       showWaitingScreen();
     }
   } catch(e) {
-    console.warn('[MIUT] checkApprovalAndBoot error — falling back to boot:', e?.message || e);
+    _log('warn', '[MIUT] checkApprovalAndBoot error — falling back to boot:', e?.message || e);
     // Mark online best-effort; if offline this fails silently
     if (state.roomCode && state.me?.id) {
       db.collection('rooms').doc(state.roomCode)
@@ -1735,6 +1784,41 @@ async function declineUser(uid, name) {
   } catch(e) { toast('Decline failed', e.message, 'err'); }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Required Firestore Security Rules for admin member-management actions
+// (promote, demote, approve, decline, block) — this repo doesn't commit a
+// firestore.rules file (rules are managed in the Firebase Console), so add
+// something like this there. The key requirement throughout: these are
+// role-based checks against the CURRENT admin(s) in the members
+// subcollection, never a fixed creatorId — since this app supports
+// multiple simultaneous admins and promotion/demotion at any time, a rule
+// hardcoded to the original creator would silently reject every one of
+// these actions once a different admin (or a second admin) tries them.
+//
+//   function isAdmin(roomCode) {
+//     return exists(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid))
+//       && get(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid)).data.role == 'admin';
+//   }
+//
+//   match /rooms/{roomCode} {
+//     // blockedUsers is admin-only to modify; anyone approved can read it
+//     // (the join flow needs to check it before letting someone in).
+//     allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['blockedUsers'])
+//       ? isAdmin(roomCode) : true; // (combine with your other room-doc rules, e.g. epoch — see _autoRotateEpoch)
+//
+//     match /members/{uid} {
+//       // A member can always update their own presence/heartbeat fields.
+//       allow update: if request.auth.uid == uid
+//           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['online', 'lastSeen', 'pubKey'])
+//         // Admin-only fields: role (promote/demote), approved (approve),
+//         // declined (decline), blocked (block) — for ANY member's doc.
+//         || (isAdmin(roomCode)
+//             && request.resource.data.diff(resource.data).affectedKeys()
+//                  .hasOnly(['role', 'approved', 'declined', 'blocked', 'online']));
+//     }
+//   }
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function promoteToAdmin(uid, name) {
   if (!_isAdmin || !state.roomCode) return;
   const ok = await showConfirm(
@@ -1750,6 +1834,167 @@ async function promoteToAdmin(uid, name) {
     await sendSys(`${name} was promoted to admin`);
     toast(`${name} is now Admin`, '', 'star');
   } catch(e) { toast('Promotion failed', e.message, 'err'); }
+}
+
+/**
+ * Admin-only: demotes another admin back to a regular member. Refuses if
+ * the target is the only admin left — demoting them would leave the room
+ * with no one able to approve members, rotate keys, or moderate at all.
+ */
+async function demoteMember(uid, name) {
+  if (!_isAdmin || !state.roomCode || !uid) return;
+  try {
+    const adminSnap = await db.collection('rooms').doc(state.roomCode)
+      .collection('members').where('role', '==', 'admin').get();
+    if (adminSnap.size <= 1 && adminSnap.docs.some(d => d.id === uid)) {
+      toast("Can't demote", `${name} is the only admin — promote someone else first.`, 'err');
+      return;
+    }
+  } catch { /* if the check itself fails, fall through and let the write attempt surface any real error */ }
+  const ok = await showConfirm(`Demote ${name}?`, 'They will no longer be able to approve members or moderate the room.', 'DEMOTE');
+  if (!ok) return;
+  try {
+    await db.collection('rooms').doc(state.roomCode)
+      .collection('members').doc(uid)
+      .update({ role: 'member' });
+    await sendSys(`${name} was demoted to member`);
+    toast(`${name} is now a member`, '', 'ok');
+  } catch (e) { toast('Demotion failed', e.message, 'err'); }
+}
+
+/**
+ * Admin-only: removes a member from the room and permanently bars them
+ * from rejoining with the same account (their uid is added to the room's
+ * blockedUsers list — checked at join time, see the join flow). Also
+ * force-rotates the encryption key immediately rather than waiting for the
+ * normal "member left" auto-rotation, so the blocked member can't read
+ * anything sent after this point even if they retained the room code and
+ * an old snapshot of the key.
+ */
+async function blockMember(uid, name) {
+  if (!_isAdmin || !state.roomCode || !uid) return;
+  if (uid === state.me?.id) { toast("Can't block yourself", '', 'err'); return; }
+  const ok = await showConfirm(
+    `Block ${name}?`,
+    'They will be removed immediately and permanently unable to rejoin this room. The encryption key rotates right away so they can\'t read anything sent afterward.',
+    'BLOCK'
+  );
+  if (!ok) return;
+  try {
+    const roomRef = db.collection('rooms').doc(state.roomCode);
+    await roomRef.update({
+      blockedUsers: firebase.firestore.FieldValue.arrayUnion(uid),
+    });
+    await roomRef.collection('members').doc(uid).update({
+      online: false, approved: false, blocked: true,
+    }).catch(() => {}); // best-effort — the block list above is what actually matters for re-entry
+    await sendSys(`${name} was blocked by an admin`);
+    // Force-rotate now rather than waiting for the reactive "member left"
+    // trigger — that path depends on a live presence listener noticing the
+    // departure, which (per a real bug already fixed once) doesn't
+    // reliably fire for every departure path. Blocking is a deliberate
+    // security action; it shouldn't be left to chance.
+    await _autoRotateEpoch('member blocked');
+    toast(`${name} blocked`, 'They can no longer rejoin this room.', 'trash');
+  } catch (e) { toast('Block failed', e.message, 'err'); }
+}
+
+/**
+ * Short "safety number"-style fingerprint of a member's signing public key
+ * — a SHA-256 hash of the raw key, formatted as grouped hex, rather than
+ * showing the full base64 public key (which is long and not meaningfully
+ * comparable at a glance). Two people can read this aloud/compare it to
+ * verify they're really talking to who they think they are.
+ */
+async function _pubKeyFingerprint(pubB64) {
+  if (!pubB64) return null;
+  try {
+    const raw = Uint8Array.from(atob(pubB64), c => c.charCodeAt(0));
+    const hash = await crypto.subtle.digest('SHA-256', raw);
+    const hex = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+    return hex.slice(0, 20).match(/.{1,4}/g).join(' ').toUpperCase();
+  } catch { return null; }
+}
+
+let _mdCurrentUid = null;
+
+/**
+ * Opens the member detail panel for a given member — shows role, approval
+ * status, a key fingerprint, and (admin viewers only) promote/demote/block
+ * or approve/decline actions depending on whether the member is approved
+ * or still pending.
+ */
+async function openMemberDetail(uid, m) {
+  if (!uid || !m) return;
+  _mdCurrentUid = uid;
+  const overlay = $('member-detail-modal');
+  if (!overlay) return;
+
+  const isMe = uid === state.me?.id;
+  const avatarEl = $('md-avatar');
+  if (avatarEl) {
+    avatarEl.style.background = m.color || avatarColor(m.name || '?');
+    avatarEl.textContent = initials(m.name || '?');
+  }
+  $('md-name').textContent = m.name + (isMe ? ' (you)' : '');
+  const roleEl = $('md-role');
+  roleEl.textContent = m.role === 'admin' ? '◆ Admin' : 'Member';
+  roleEl.classList.toggle('is-admin', m.role === 'admin');
+
+  const statusEl = $('md-status');
+  const online = m.online === true;
+  statusEl.textContent = online ? '● Online' : 'Offline';
+  statusEl.className = 'md-row-value ' + (online ? 'status-online' : 'status-offline');
+
+  const approvalEl = $('md-approval');
+  if (m.blocked) { approvalEl.textContent = 'Blocked'; approvalEl.className = 'md-row-value status-blocked'; }
+  else if (m.declined) { approvalEl.textContent = 'Declined'; approvalEl.className = 'md-row-value status-blocked'; }
+  else if (m.approved) { approvalEl.textContent = 'Approved'; approvalEl.className = 'md-row-value status-approved'; }
+  else { approvalEl.textContent = 'Pending approval'; approvalEl.className = 'md-row-value status-pending'; }
+
+  $('md-joined').textContent = m.joinedAt ? new Date(m.joinedAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Unknown';
+
+  const fpEl = $('md-fingerprint');
+  fpEl.textContent = 'Loading…';
+  (async () => {
+    const pub = m.pubKey || await getPubKey(uid);
+    const fp = await _pubKeyFingerprint(pub);
+    fpEl.textContent = fp || 'Not available yet — they may not have sent a signed message';
+  })();
+
+  // Actions — admin viewers only, never shown for your own row
+  const actions = $('md-actions');
+  actions.innerHTML = '';
+  if (_isAdmin && !isMe) {
+    if (!m.approved && !m.declined) {
+      actions.appendChild(_mdBtn('APPROVE', () => { approveUser(uid, m.name); closeMemberDetail(); }));
+      actions.appendChild(_mdBtn('DECLINE', () => { declineUser(uid, m.name); closeMemberDetail(); }, true));
+    } else {
+      actions.appendChild(_mdBtn(
+        m.role === 'admin' ? 'DEMOTE TO MEMBER' : 'PROMOTE TO ADMIN',
+        () => { (m.role === 'admin' ? demoteMember : promoteToAdmin)(uid, m.name); closeMemberDetail(); }
+      ));
+    }
+    if (!m.blocked) {
+      actions.appendChild(_mdBtn('BLOCK USER', () => { blockMember(uid, m.name); closeMemberDetail(); }, true));
+    }
+  }
+
+  overlay.style.display = 'flex';
+}
+
+function _mdBtn(label, onClick, danger) {
+  const btn = document.createElement('button');
+  btn.className = 'md-action-btn' + (danger ? ' danger' : '');
+  btn.textContent = label;
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
+function closeMemberDetail() {
+  const overlay = $('member-detail-modal');
+  if (overlay) overlay.style.display = 'none';
+  _mdCurrentUid = null;
 }
 
 function updateAdminBadge() {
@@ -1844,7 +2089,7 @@ async function _registerCanary(docId, enc) {
     new TextEncoder().encode(docId + enc)));
   if (_canaryMap.has(docId) && _canaryMap.get(docId) !== hash) {
     _integrityViolations++;
-    console.warn('[MIUT Security] Replay/injection detected on doc', docId);
+    _log('warn', '[MIUT Security] Replay/injection detected on doc', docId);
     if (_integrityViolations >= 3) _triggerSecurityLockdown('replay attack detected');
     return false;
   }
@@ -2039,7 +2284,7 @@ async function _autoRotateEpoch(reason) {
     // kick/block feature. A silent failure here means that protection can
     // quietly stop working with zero indication, which is a real security
     // gap, not just a missed feature. Surface it instead:
-    console.warn(`[MIUT] Epoch auto-rotation failed (${reason}):`, e);
+    _log('warn', `[MIUT] Epoch auto-rotation failed (${reason}):`, e);
     // Likely cause: Firestore security rules restricting the epoch field
     // update to the room's original creatorId rather than "whoever
     // currently holds the admin role" — a handed-off admin would get
@@ -2237,15 +2482,37 @@ function startPresenceListener() {
               toast(`${d.name || 'Someone'} wants to join`, 'Open the sidebar to approve them', 'user');
             }
           }
-          // Auto-rotate key when an approved member goes offline (forward secrecy)
-          if (ch.type === 'removed' && _presenceSettled && _isAdmin) {
-            const d = ch.doc.data();
-            if (d.approved && ch.doc.id !== state.me?.id) {
-              _autoRotateEpoch('member left').catch(() => {});
-            }
-          }
         });
       }
+
+      // Auto-rotate key when an approved member goes offline (forward secrecy).
+      // Deliberately NOT nested inside the `if (_isAdmin)` block above — that
+      // outer gate meant that when _isAdmin was false for any reason, this
+      // whole check (and its diagnostics) never even ran, making a real
+      // failure here indistinguishable from "admin status wasn't detected
+      // yet." Instrumented with console.debug at every branch — if this
+      // stops firing again, check devtools console for exactly which
+      // condition failed rather than guessing blind.
+      snap.docChanges().forEach(ch => {
+        if (ch.type !== 'removed') return;
+        const d = ch.doc.data();
+        _log('debug', '[MIUT epoch] member went offline:', ch.doc.id, {
+          approved: d.approved, isMine: ch.doc.id === state.me?.id,
+          _presenceSettled, _isAdmin, blocked: d.blocked,
+        });
+        if (!_presenceSettled) {
+          _log('debug', '[MIUT epoch] skip rotate: _presenceSettled is false (first snapshot after (re)subscribing — see startPresenceListener)');
+        } else if (!_isAdmin) {
+          _log('debug', '[MIUT epoch] skip rotate: this client is not currently admin');
+        } else if (ch.doc.id === state.me?.id) {
+          _log('debug', '[MIUT epoch] skip rotate: this is my own doc going offline, not someone else leaving');
+        } else if (!d.approved) {
+          _log('debug', '[MIUT epoch] skip rotate: departing member was not approved (or was just blocked, which force-rotates separately)');
+        } else {
+          _log('debug', '[MIUT epoch] rotating now — all conditions met');
+          _autoRotateEpoch('member left').catch(() => {});
+        }
+      });
 
       updateOnlineUI();   // updateOnlineUI also called inside renderMembers with correct approved count
       renderMembers(snap);
@@ -2273,9 +2540,13 @@ function startPresenceListener() {
         // the room by clearing the pending schedule, otherwise it could get
         // deleted out from under whoever just came back.
         _roomWasEmpty = false;
+        // Explicit null rather than FieldValue.delete() — keeps the field
+        // present for schema consistency across rooms. Firestore's `<=`
+        // range queries (like the cleanup cron's) never match null, so
+        // this is exactly as safe as deleting the field outright.
         db.collection('rooms').doc(code).update({
-          emptyAt: firebase.firestore.FieldValue.delete(),
-          autoDeleteAt: firebase.firestore.FieldValue.delete(),
+          emptyAt: null,
+          autoDeleteAt: null,
         }).catch(() => {});
       }
       _presenceSettled = true;
@@ -2607,12 +2878,29 @@ function renderMembers(snap) {
             <path d="M10 3l1.8 5.5H17l-4.7 3.4 1.8 5.5L10 14l-4.1 3.4 1.8-5.5L3 8.5h5.2z"
                   stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
           </svg>
+        </button>
+        <button class="member-block-btn" title="Block"
+                data-uid="${esc(m.uid)}" data-name="${esc(m.name)}">
+          <svg viewBox="0 0 20 20" fill="none" width="11" height="11">
+            <circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M5 5l10 10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
         </button>` : ''}`;
 
     div.querySelector('.member-promote-btn')?.addEventListener('click', e => {
+      e.stopPropagation();
       const b = e.currentTarget;
       promoteToAdmin(b.dataset.uid, b.dataset.name);
     });
+    div.querySelector('.member-block-btn')?.addEventListener('click', e => {
+      e.stopPropagation();
+      const b = e.currentTarget;
+      blockMember(b.dataset.uid, b.dataset.name).catch(() => {});
+    });
+    // Tap the avatar/name to open the full detail panel (role, approval
+    // status, key fingerprint, and — for admins — promote/demote/block).
+    div.querySelector('.avatar-wrap')?.addEventListener('click', () => openMemberDetail(m.uid, m));
+    div.querySelector('.member-info')?.addEventListener('click', () => openMemberDetail(m.uid, m));
     list.appendChild(div);
   });
 
@@ -2653,13 +2941,17 @@ function renderMembers(snap) {
         </div>`;
 
       div.querySelector('.pending-approve-btn')?.addEventListener('click', e => {
+        e.stopPropagation();
         const b = e.currentTarget;
         approveUser(b.dataset.uid, b.dataset.name).catch(()=>{});
       });
       div.querySelector('.pending-decline-btn')?.addEventListener('click', e => {
+        e.stopPropagation();
         const b = e.currentTarget;
         declineUser(b.dataset.uid, b.dataset.name).catch(()=>{});
       });
+      div.querySelector('.avatar-wrap')?.addEventListener('click', () => openMemberDetail(m.uid, m));
+      div.querySelector('.member-info')?.addEventListener('click', () => openMemberDetail(m.uid, m));
       list.appendChild(div);
     });
 
@@ -2761,9 +3053,38 @@ function _extendRoomTtl() {
   _extendTimer = setTimeout(() => {
     _extendTimer = null;
     db.collection('rooms').doc(state.roomCode)
-      .update({ autoDeleteAt: firebase.firestore.FieldValue.delete(), lastActivity: ts_now() })
+      .update({ autoDeleteAt: null, lastActivity: ts_now() })
       .catch(() => {});
   }, 2000);                          // debounce 2s so rapid typing = 1 write
+}
+
+/**
+ * _healRoomSchema — brings an older room document up to the full canonical
+ * field set (see room creation for the authoritative list) without
+ * clobbering anything it already has. Rooms created before a given field
+ * existed in the schema (e.g. msgTtlMs, blockedUsers) are simply missing
+ * it entirely rather than having a default value — this patches those in
+ * the first time anyone loads the room, so every room converges on the
+ * same shape over time instead of staying permanently inconsistent.
+ * Safe to call on every join; only writes if something's actually missing.
+ */
+async function _healRoomSchema(code, roomData) {
+  if (!code || !roomData || !db) return;
+  const CANONICAL_DEFAULTS = {
+    autoDeleteAt:     null,
+    inactivityTtlMs:  300000,
+    approvalRequired: false,
+    emptyAt:          null,
+    msgTtlMs:         0,
+    blockedUsers:     [],
+  };
+  const patch = {};
+  for (const [key, def] of Object.entries(CANONICAL_DEFAULTS)) {
+    if (roomData[key] === undefined) patch[key] = def;
+  }
+  if (Object.keys(patch).length === 0) return; // already complete
+  try { await db.collection('rooms').doc(code).update(patch); }
+  catch (e) { _log('warn', '[MIUT] Room schema heal failed (non-fatal):', e); }
 }
 
 /** Check if room has expired (autoDeleteAt < now) and show expired screen */
@@ -3832,7 +4153,19 @@ async function handleFileAttach(e) {
   }
 }
 
-function triggerAttach() { $('file-input')?.click(); }
+function triggerAttach() { toggleAttachTabs(); }
+
+function toggleAttachTabs() {
+  const tabs = $('attach-tabs'), btn = $('attach-btn');
+  if (!tabs) return;
+  const opening = !tabs.classList.contains('open');
+  tabs.classList.toggle('open', opening);
+  btn?.setAttribute('aria-expanded', opening ? 'true' : 'false');
+}
+function closeAttachTabs() {
+  $('attach-tabs')?.classList.remove('open');
+  $('attach-btn')?.setAttribute('aria-expanded', 'false');
+}
 
 let _replyTo = null;  // { senderName, text, docId }
 
@@ -4212,7 +4545,7 @@ async function _healIncompleteChunkGroups() {
         delete _chunkGroups[gid];
         await renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type }, g.docId);
       }
-    } catch (e) { console.warn('[MIUT] Could not heal chunk group', gid, e); }
+    } catch (e) { _log('warn', '[MIUT] Could not heal chunk group', gid, e); }
   }
 }
 
@@ -4311,7 +4644,7 @@ async function _softDeleteRemote(docId) {
       deletedAt: ts_now(),
       enc: null, encData: null, fileName: null, mime: null, groupId: null, reactions: null,
     });
-  } catch (e) { console.warn('[MIUT] Soft-delete failed:', e); }
+  } catch (e) { _log('warn', '[MIUT] Soft-delete failed:', e); }
   // Local IDB cache no longer needs the (now-stripped) content either
   try {
     const db2 = await openIDB();
@@ -5109,9 +5442,15 @@ async function joinFromInvite() {
       return;
     }
     _saveWrongState({ wrongCount: 0, lockedUntil: 0 });
+    if ((roomSnap.data()?.blockedUsers || []).includes(uid)) {
+      if (err) err.textContent = 'You have been blocked from this room by an admin.';
+      if (btn) { btn.disabled = false; const sp = btn.querySelector('span'); if (sp) sp.textContent = 'Join Room'; }
+      return;
+    }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
+    _healRoomSchema(code, roomSnap.data()).catch(() => {});
     const memberSnap = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData   = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
@@ -5262,7 +5601,7 @@ async function handleLogout() {
     const je = $('join-error'); if (je) je.textContent = '';
     switchJoinTab('create');
   } catch (e) {
-    console.warn('[MIUT] Logout teardown hit an error (continuing):', e);
+    _log('warn', '[MIUT] Logout teardown hit an error (continuing):', e);
   } finally {
     // Ask how the session went — anonymous, skippable, stored in /feedback
     // (a sibling of /rooms in Firestore). Runs even if a step above failed,
@@ -5277,16 +5616,16 @@ async function handleLogout() {
     (async () => {
       try {
         if (_wasAdmin) await _handoffAdminRole(_leavingRoomCode, _leavingMe);
-      } catch (e) { console.warn('[MIUT] Admin handoff failed:', e); }
+      } catch (e) { _log('warn', '[MIUT] Admin handoff failed:', e); }
 
       try {
         await sendSys(`${_leavingMe.name} left the room`, _leavingRoomCode, _leavingMe);
-      } catch (e) { console.warn('[MIUT] Leave system message failed:', e); }
+      } catch (e) { _log('warn', '[MIUT] Leave system message failed:', e); }
 
       try {
         await db.collection('rooms').doc(_leavingRoomCode).collection('members').doc(_leavingMe.id)
           .update({ online: false });
-      } catch (e) { console.warn('[MIUT] Marking offline failed:', e); }
+      } catch (e) { _log('warn', '[MIUT] Marking offline failed:', e); }
 
       // This is the critical piece that makes Room Expiry (Instant, 5 min,
       // etc.) actually take effect: startPresenceListener's empty-room
@@ -5301,7 +5640,7 @@ async function handleLogout() {
       // to be watching.
       if (_leavingEmptiesRoom) {
         try { await _handleRoomBecameEmpty(_leavingRoomCode); }
-        catch (e) { console.warn('[MIUT] Empty-room expiry check failed:', e); }
+        catch (e) { _log('warn', '[MIUT] Empty-room expiry check failed:', e); }
       }
     })();
   }
@@ -5509,7 +5848,7 @@ async function _fbSubmit() {
     _fbShowThanks();
     setTimeout(() => overlay._fbDone && overlay._fbDone(), 1400);
   } catch (e) {
-    console.warn('[MIUT] Feedback submit failed:', e);
+    _log('warn', '[MIUT] Feedback submit failed:', e);
     toast('Feedback', "Couldn't send feedback — thanks for trying!", 'alert');
     overlay._fbDone();
   }
@@ -5880,13 +6219,25 @@ function _wireAllHandlers() {
   on('msg-input', 'keydown', e => handleKey(e));
   on('msg-input', 'input',   e => handleTyping(e.target));
 
-  // ── Attach button ─────────────────────────────────────────────────────────────
-  document.querySelectorAll('.attach-btn').forEach(b => {
-    b.addEventListener('click', () => triggerAttach());
+  // ── Attach button → horizontal Camera/Photo/Video/File tab menu ────────────────
+  on('attach-btn', 'click', e => { e.stopPropagation(); toggleAttachTabs(); });
+  on('attach-camera', 'click', () => { closeAttachTabs(); $('file-input-camera')?.click(); });
+  on('attach-photo',  'click', () => { closeAttachTabs(); $('file-input-photo')?.click(); });
+  on('attach-video',  'click', () => { closeAttachTabs(); $('file-input-video')?.click(); });
+  on('attach-file',   'click', () => { closeAttachTabs(); $('file-input-file')?.click(); });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('.attach-wrap')) closeAttachTabs();
   });
 
-  // ── File input ────────────────────────────────────────────────────────────────
-  on('file-input', 'change', e => handleFileAttach(e));
+  // ── File inputs ───────────────────────────────────────────────────────────────
+  on('file-input-camera', 'change', e => handleFileAttach(e));
+  on('file-input-photo',  'change', e => handleFileAttach(e));
+  on('file-input-video',  'change', e => handleFileAttach(e));
+  on('file-input-file',   'change', e => handleFileAttach(e));
+
+  // ── Member detail panel ──────────────────────────────────────────────────────
+  on('member-detail-close-btn', 'click', () => closeMemberDetail());
+  on('member-detail-modal', 'click', e => { if (e.target.id === 'member-detail-modal') closeMemberDetail(); });
 
   // ── Settings modal ────────────────────────────────────────────────────────────
   on('settings-modal', 'click', e => closeModal(e));

@@ -225,6 +225,34 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .my-profile-mini:hover{background:var(--teal-dim)}
 .avatar-wrap{position:relative;flex-shrink:0}
 .avatar{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--fui);font-size:.72rem;font-weight:700;color:#fff}
+
+/* ── Member detail panel ─────────────────────────────────────────────── */
+.member-detail{max-width:380px}
+.md-header{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+.md-avatar{width:56px;height:56px;font-size:1.05rem;flex-shrink:0}
+.md-name-wrap{min-width:0}
+.md-name{font-family:var(--fui);font-size:1rem;font-weight:800;color:var(--text);letter-spacing:.2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.md-role{font-family:var(--fmono);font-size:.66rem;color:var(--text2);margin-top:2px;display:flex;align-items:center;gap:5px}
+.md-role.is-admin{color:var(--teal)}
+.md-rows{display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--r2);overflow:hidden;margin-bottom:14px}
+.md-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px;border-bottom:1px solid var(--border)}
+.md-row:last-child{border-bottom:none}
+.md-row-label{font-family:var(--fui);font-size:.6rem;font-weight:700;letter-spacing:1px;color:var(--text2);flex-shrink:0}
+.md-row-value{font-family:var(--fmono);font-size:.72rem;color:var(--text);text-align:right}
+.md-row-value.status-online{color:var(--online)}
+.md-row-value.status-offline{color:var(--text2)}
+.md-row-value.status-approved{color:var(--teal)}
+.md-row-value.status-pending{color:var(--typing)}
+.md-row-value.status-blocked{color:var(--danger)}
+.md-row-key{align-items:flex-start;flex-direction:column;gap:4px}
+.md-fingerprint{font-size:.68rem;letter-spacing:.5px;word-break:break-all;text-align:left;color:var(--teal)}
+.md-key-note{font-family:var(--fmono);font-size:.6rem;color:var(--text3);line-height:1.6;margin:0 0 18px}
+.md-actions{display:flex;flex-direction:column;gap:8px}
+.md-action-btn{width:100%;padding:12px 16px;border-radius:var(--r);background:transparent;border:1px solid var(--teal-b);color:var(--teal);font-family:var(--fui);font-size:.68rem;font-weight:700;letter-spacing:1.5px;cursor:pointer;transition:background var(--fast) ease,transform var(--fast) var(--spring)}
+.md-action-btn:hover{background:var(--teal-dim)}
+.md-action-btn:active{transform:scale(.97)}
+.md-action-btn.danger{border-color:rgba(255,95,95,.4);color:var(--danger)}
+.md-action-btn.danger:hover{background:rgba(255,95,95,.12)}
 .status-dot{position:absolute;bottom:0;right:0;width:10px;height:10px;border-radius:50%;border:2px solid var(--bg2);transition:background .3s ease,box-shadow .3s ease}
 .status-dot.online{background:var(--online);box-shadow:0 0 6px rgba(76,212,110,.62)}
 .status-dot.offline{background:var(--text3);box-shadow:none}
@@ -250,6 +278,9 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .member-promote-btn{width:28px;height:28px;flex-shrink:0;display:flex;align-items:center;justify-content:center;border-radius:50%;color:var(--text2);border:1px solid transparent;opacity:0;transition:all var(--fast) ease}
 .member-item:hover .member-promote-btn{opacity:1}
 .member-promote-btn:hover{color:var(--teal);border-color:var(--teal);background:var(--teal-dim)}
+.member-block-btn{width:28px;height:28px;flex-shrink:0;display:flex;align-items:center;justify-content:center;border-radius:50%;color:var(--text2);border:1px solid transparent;opacity:0;transition:all var(--fast) ease;margin-left:4px}
+.member-item:hover .member-block-btn{opacity:1}
+.member-block-btn:hover{color:var(--danger);border-color:var(--danger);background:rgba(255,95,95,.12)}
 .pending-section-label{color:var(--typing)!important;margin-top:8px}
 .pending-badge{background:var(--typing)!important;color:var(--bg)!important;animation:badge-p .3s var(--spring) both}
 .pending-item{border:1px solid rgba(247,196,48,.14);border-radius:var(--r);background:rgba(247,196,48,.04)}
@@ -516,6 +547,13 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 /* ── Input area ───────────────────────────────────── */
 .input-area{display:flex;align-items:flex-end;gap:8px;padding:10px 14px;padding-bottom:max(10px,calc(env(safe-area-inset-bottom) + 6px));background:var(--glass2);border-top:1px solid var(--border);flex-shrink:0;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
 .attach-btn{color:var(--text2);flex-shrink:0;margin-bottom:1px;transition:color var(--fast) ease,transform var(--fast) var(--spring)}
+.attach-wrap{position:relative;flex-shrink:0}
+.attach-btn[aria-expanded="true"]{color:var(--teal);transform:rotate(45deg)}
+.attach-tabs{position:absolute;bottom:calc(100% + 10px);left:0;display:flex;gap:6px;background:var(--glass2);border:1px solid var(--border);border-radius:18px;padding:8px;box-shadow:var(--sh-lg);opacity:0;transform:scale(.85) translateY(10px);transform-origin:bottom left;pointer-events:none;transition:opacity .16s ease,transform .18s var(--spring);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);z-index:60}
+.attach-tabs.open{opacity:1;transform:scale(1) translateY(0);pointer-events:auto}
+.attach-tab{display:flex;flex-direction:column;align-items:center;gap:5px;padding:10px 12px;border-radius:13px;background:transparent;border:none;color:var(--text2);font-family:var(--fui);font-size:.56rem;font-weight:700;letter-spacing:.8px;white-space:nowrap;transition:background var(--fast) ease,color var(--fast) ease,transform var(--fast) var(--spring)}
+.attach-tab:hover{background:var(--teal-dim);color:var(--teal)}
+.attach-tab:active{transform:scale(.92)}
 .attach-btn:hover{color:var(--teal);transform:scale(1.12) rotate(12deg)}
 .attach-btn:active{transform:scale(.88) rotate(-6deg)}
 .msg-input-wrap{flex:1}
@@ -702,6 +740,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
   .splash-title{font-size:2.2rem;letter-spacing:6px}
   .waiting-container{padding:32px 20px}
   .member-promote-btn{opacity:.65}
+  .member-block-btn{opacity:.65}
   .scroll-fab{bottom:78px;right:12px}
 }
 @media (max-width:360px){
