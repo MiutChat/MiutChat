@@ -1385,6 +1385,28 @@ async function handleCreate() {
     const uid = await getUID();
     if (typeof getDb !== 'function') throw new Error('Database module not loaded. Please refresh.');
     db = await getDb(code);
+
+    // Room codes are user-chosen (typed in, not randomly generated), so
+    // collisions are real: two different people can type the same
+    // memorable code, or the same person can reuse a code from a room
+    // that was supposed to have expired already. Since creation used to
+    // write with { merge: true } and never checked whether a room already
+    // existed at this path, "creating" a room whose code was already
+    // occupied silently merged into the EXISTING document instead of
+    // starting fresh — if that old room's messages/members subcollections
+    // hadn't actually been cleaned up yet (wipeRoom failing silently is a
+    // real possibility — see its own comment), the "new" room would
+    // immediately resurface someone else's old messages and members. This
+    // is very likely the cause of rooms reappearing after being "deleted."
+    // Fail closed instead: refuse to create over an existing room, rather
+    // than silently reusing whatever's there.
+    const existing = await db.collection('rooms').doc(code).get();
+    if (existing.exists) {
+      showError('That room code is already in use — pick a different one.');
+      setLoading(btn, false);
+      return;
+    }
+
     // Generate cryptographically random 16-byte salt for this room's PBKDF2
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const roomSalt  = _b64uEnc(saltBytes.buffer);
@@ -1403,6 +1425,9 @@ async function handleCreate() {
     // specifically for autoDeleteAt/emptyAt: Firestore's `<=` range queries,
     // like the cleanup cron's, never match null or missing fields, so this
     // doesn't risk the cron treating a null deadline as "already passed.")
+    // No longer { merge: true } — the existence check above already
+    // guarantees this path is empty, so a plain set() is both correct and
+    // makes it impossible to ever blend fields into pre-existing data.
     await db.collection('rooms').doc(code).set({
       createdAt:        ts_now(),
       creatorId:        uid,
@@ -1415,7 +1440,7 @@ async function handleCreate() {
       emptyAt:          null,
       msgTtlMs:         0,        // per-message expiry — off by default
       blockedUsers:     [],       // see blockMember() — ids blocked by the admin, denied re-entry
-    }, { merge: true });
+    });
     _roomEpoch = 0;
     state.me = await buildMe(resolveName()); state.roomCode = code;
     saveSession(); saveRoom(code);
@@ -1952,12 +1977,40 @@ async function openMemberDetail(uid, m) {
   else if (m.approved) { approvalEl.textContent = 'Approved'; approvalEl.className = 'md-row-value status-approved'; }
   else { approvalEl.textContent = 'Pending approval'; approvalEl.className = 'md-row-value status-pending'; }
 
-  $('md-joined').textContent = m.joinedAt ? new Date(m.joinedAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Unknown';
+  // joinedAt is written via ts_now() (a Firestore serverTimestamp sentinel),
+  // which reads back as a Timestamp object with .toDate()/.toMillis() — not
+  // a plain number. Passing that straight to `new Date()` produced
+  // "Invalid Date" for every member. Handle both the resolved Timestamp
+  // and the plain-number fallback (used by buildMe() for the local/optimistic copy).
+  const joinedMs = m.joinedAt?.toMillis?.() ?? (typeof m.joinedAt === 'number' ? m.joinedAt : null);
+  $('md-joined').textContent = joinedMs ? new Date(joinedMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'Unknown';
 
   const fpEl = $('md-fingerprint');
   fpEl.textContent = 'Loading…';
   (async () => {
-    const pub = m.pubKey || await getPubKey(uid);
+    let pub;
+    if (isMe) {
+      // Always use the local signing key directly for "you" — it's the
+      // authoritative source, whereas m.pubKey came from a snapshot that
+      // could be momentarily stale (e.g. opened right after joining,
+      // before registerPresence's own write has round-tripped back).
+      // If it's still unset for some reason, retry initialization once —
+      // idempotent, since it loads the existing IndexedDB-stored keypair
+      // rather than generating a new one if one already exists.
+      pub = _pubKeyB64;
+      if (!pub) { await initSigningKey(); pub = _pubKeyB64; }
+    } else {
+      pub = m.pubKey || await getPubKey(uid);
+      // Cached copy might be stale/empty if they hadn't sent a signed
+      // message yet when we first saw them — re-check Firestore directly
+      // rather than trusting a null cache result forever.
+      if (!pub && state.roomCode) {
+        try {
+          const fresh = await db.collection('rooms').doc(state.roomCode).collection('members').doc(uid).get();
+          pub = fresh.data()?.pubKey || null;
+        } catch {}
+      }
+    }
     const fp = await _pubKeyFingerprint(pub);
     fpEl.textContent = fp || 'Not available yet — they may not have sent a signed message';
   })();
@@ -2134,7 +2187,9 @@ function _startExpirySweep() {
 function _runExpirySweep() {
   if (!_roomTtlMs || !state.roomCode) return;
   const now = Date.now();
-  document.querySelectorAll('.msg-wrapper[data-ts]').forEach(w => {
+  // Includes .msg-system now too — see renderMsg's system-message branch
+  // for why (they used to have no data-ts at all and were invisible here).
+  document.querySelectorAll('.msg-wrapper[data-ts], .msg-system[data-ts]').forEach(w => {
     const ts    = parseInt(w.dataset.ts  || '0', 10);
     const docId = w.dataset.docId || '';
     if (!ts) return;
@@ -3722,8 +3777,17 @@ async function wipeRoom(code, fsInstance) {
     await batchDelete('typing');
     await batchDelete('members');
     // Firestore rules now require isRoomAdmin() for room doc deletion.
-    await fs.collection('rooms').doc(code).delete().catch(() => {});
-  } catch (e) {}
+    await fs.collection('rooms').doc(code).delete();
+  } catch (e) {
+    // This used to fail completely silently. A failed wipe here means the
+    // room's messages/members subcollections can be left behind even
+    // though the caller believes the room was deleted — and since room
+    // creation now refuses to reuse an occupied code (see handleCreate),
+    // a silently-failed wipe would otherwise be invisible until someone
+    // tries to reuse that exact code and gets a confusing "already in
+    // use" error for a room they thought was long gone. Surface it.
+    console.warn(`[MIUT] wipeRoom(${code}) failed — subcollections or the room doc itself may still exist:`, e);
+  }
 }
 
 function startHeartbeat() {
@@ -4252,6 +4316,13 @@ async function renderMsg(data, docId, insertBeforeEl) {
   if (data.type === 'system') {
     const div = document.createElement('div');
     div.className = 'msg-system';
+    // data-ts/data-doc-id so _runExpirySweep (message TTL) can find and
+    // delete this too — without these, system messages ("X joined",
+    // "Key rotated", etc.) were completely invisible to that selector and
+    // never got cleaned up even after every regular message had vanished
+    // under the same TTL, silently outliving the "vanish" promise.
+    div.dataset.docId = docId || '';
+    div.dataset.ts    = data.ts || '';
     // Always decrypt — never render the raw enc field as plaintext.
     // This blocks injected system messages via direct Firestore REST writes
     // (Attack 4): an injected message without the room code will fail
@@ -4963,18 +5034,38 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
 
   strip.appendChild(actRow);
 
-  if (isMine) {
+  // "Delete for me" is always available (local-only, no confirm needed —
+  // it never touches Firestore or affects anyone else's view). "Delete for
+  // everyone" needs your own message OR admin standing, since admins can
+  // moderate others' messages too (see _updateSelectBar for the same rule
+  // in the bulk-select toolbar).
+  const canDeleteForEveryone = isMine || _isAdmin;
+  if (isMine || _isAdmin) {
     const delRow = document.createElement('div');
     delRow.className = 'strip-delete-row';
-    const delBtn = document.createElement('button');
-    delBtn.className = 'strip-action danger';
-    delBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" width="16" height="16"><path d="M4 6h12M8 6V4h4v2M7 6v9a1 1 0 001 1h4a1 1 0 001-1V6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Delete Message</span>`;
-    delBtn.addEventListener('click', e => {
+
+    const delMeBtn = document.createElement('button');
+    delMeBtn.className = 'strip-action danger';
+    delMeBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" width="15" height="15"><path d="M4 6h12M8 6V4h4v2M7 6v9a1 1 0 001 1h4a1 1 0 001-1V6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Delete for Me</span>`;
+    delMeBtn.addEventListener('click', e => {
       e.stopPropagation();
       strip.remove();
-      confirmDeleteMsg(docId, wrap);
+      wrap.remove(); // local-only — doesn't touch Firestore, no confirm needed
     });
-    delRow.appendChild(delBtn);
+    delRow.appendChild(delMeBtn);
+
+    if (canDeleteForEveryone) {
+      const delAllBtn = document.createElement('button');
+      delAllBtn.className = 'strip-action danger';
+      delAllBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" width="15" height="15"><path d="M4 6h12M8 6V4h4v2M7 6v9a1 1 0 001 1h4a1 1 0 001-1V6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Delete for Everyone</span>`;
+      delAllBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        strip.remove();
+        confirmDeleteMsg(docId, wrap);
+      });
+      delRow.appendChild(delAllBtn);
+    }
+
     strip.appendChild(delRow);
   }
 
@@ -6172,7 +6263,9 @@ function _wireAllHandlers() {
   backBtns.forEach(b => b.addEventListener('click', () => cancelInvite()));
 
   // ── Sidebar ───────────────────────────────────────────────────────────────────
-  on('room-code-pill',   'click', () => copyRoomCode());
+  // (room-code-pill's click is wired once, below, via the dataset.wired guard —
+  // it used to ALSO be bound here unconditionally, so tapping it fired
+  // copyRoomCode() twice and showed two stacked "Code copied!" toasts.)
   // Use data-wired to prevent duplicate listeners from multiple _wireAllHandlers calls
   const wireOnce = (id, evt, fn) => {
     const e = el(id);
