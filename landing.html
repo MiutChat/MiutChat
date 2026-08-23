@@ -24,49 +24,94 @@
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
-  "@type": "WebApplication",
-  "name": "MiutChat",
-  "url": "https://miutchat.pages.dev/",
-  "applicationCategory": "CommunicationApplication",
-  "operatingSystem": "Web",
-  "browserRequirements": "Requires JavaScript. Works on all modern browsers.",
-  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-  "description": "MiutChat is a free anonymous encrypted chat application. No account, no phone number, no email, and no data storage. Messages are encrypted client-side with AES-256-GCM before transmission. Rooms auto-delete when all members disconnect.",
-  "featureList": ["End-to-end encryption with AES-256-GCM","No accounts or identity required","No data stored on servers","Automatic room deletion","Real-time anonymous messaging","Client-side encryption only"],
-  "screenshot": "https://miutchat.pages.dev/icons/icon-512.png",
-  "softwareVersion": "3.0",
-  "author": { "@type": "Organization", "name": "MiutChat" }
-}
-</script>
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "FAQPage",
-  "mainEntity": [
+  "@graph": [
     {
-      "@type": "Question",
-      "name": "Is MiutChat secure?",
-      "acceptedAnswer": { "@type": "Answer", "text": "Yes. MiutChat uses AES-256-GCM client-side encryption. Your messages are encrypted in your browser before they are sent. The server never sees the content of your messages." }
+      "@type": "SoftwareApplication",
+      "@id": "https://miutchat.pages.dev/#software",
+      "name": "MiutChat",
+      "url": "https://miutchat.pages.dev/",
+      "applicationCategory": "CommunicationApplication",
+      "applicationSubCategory": "Encrypted Messaging",
+      "operatingSystem": "Any (Web-based PWA)",
+      "browserRequirements": "Requires JavaScript. Works on all modern browsers.",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "description": "MiutChat is a free anonymous encrypted chat application. No account, no phone number, no email, and no data storage. Messages are encrypted client-side with AES-256-GCM before transmission. Rooms auto-delete once everyone leaves, on an admin-configurable timer (instant, 5 minutes by default, 1 hour, 24 hours, or never).",
+      "featureList": ["End-to-end encryption with AES-256-GCM","No accounts or identity required","No data stored on servers","Ephemeral self-destructing chat rooms","Admin-configurable room expiry (instant to never)","Per-message auto-vanish timers","Open-source and auditable"],
+      "screenshot": "https://miutchat.pages.dev/icons/icon-512.png",
+      "softwareVersion": "{{APP_VERSION}}",
+      "author": { "@type": "Organization", "name": "MiutChat", "url": "https://github.com/MiutChat/MiutChat" },
+      "sameAs": [
+        "https://github.com/MiutChat/MiutChat",
+        "https://www.wikidata.org/wiki/Q1340257",
+        "https://www.wikidata.org/wiki/Q107210714"
+      ]
     },
     {
-      "@type": "Question",
-      "name": "Does MiutChat store my data?",
-      "acceptedAnswer": { "@type": "Answer", "text": "No. MiutChat stores no personal data. Messages exist only while the chat room is active. When all members disconnect, the room and all its contents are permanently deleted." }
+      "@type": "FAQPage",
+      "@id": "https://miutchat.pages.dev/#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "Is MiutChat secure?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. MiutChat uses AES-256-GCM client-side encryption. Your messages are encrypted in your browser before they are sent. The server never sees the content of your messages." }
+        },
+        {
+          "@type": "Question",
+          "name": "Does MiutChat store my data?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. MiutChat stores no personal data. Messages exist only while the chat room is active. When all members disconnect, the room and all its contents are permanently deleted." }
+        },
+        {
+          "@type": "Question",
+          "name": "Do I need an account to use MiutChat?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No account is required. You do not need an email, phone number, or any identity. Simply create a room with a code and share that code with your contacts." }
+        },
+        {
+          "@type": "Question",
+          "name": "How does MiutChat encryption work?",
+          "acceptedAnswer": { "@type": "Answer", "text": "MiutChat uses the Web Crypto API to perform AES-256-GCM encryption directly in your browser. The room code is used to derive an encryption key via PBKDF2. Only users who know the room code can decrypt the messages." }
+        },
+        {
+          "@type": "Question",
+          "name": "Is MiutChat free?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes, MiutChat is completely free to use with no subscription, no premium tier, and no ads." }
+        },
+        {
+          "@type": "Question",
+          "name": "Can I chat anonymously without giving a phone number?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. MiutChat requires no phone number, email, or account. You create a room, share the room code, and start chatting — nothing links the session to your identity." }
+        }
+      ]
     },
     {
-      "@type": "Question",
-      "name": "Do I need an account to use MiutChat?",
-      "acceptedAnswer": { "@type": "Answer", "text": "No account is required. You do not need an email, phone number, or any identity. Simply create a room with a code and share that code with your contacts." }
-    },
-    {
-      "@type": "Question",
-      "name": "How does MiutChat encryption work?",
-      "acceptedAnswer": { "@type": "Answer", "text": "MiutChat uses the Web Crypto API to perform AES-256-GCM encryption directly in your browser. The room code is used to derive an encryption key via PBKDF2. Only users who know the room code can decrypt the messages." }
-    },
-    {
-      "@type": "Question",
-      "name": "Is MiutChat free?",
-      "acceptedAnswer": { "@type": "Answer", "text": "Yes, MiutChat is completely free to use with no subscription, no premium tier, and no ads." }
+      "@type": "HowTo",
+      "@id": "https://miutchat.pages.dev/#howto",
+      "name": "How to start an anonymous chat without a phone number",
+      "description": "Create an encrypted, anonymous chat room in MiutChat with no sign-up.",
+      "totalTime": "PT1M",
+      "estimatedCost": { "@type": "MonetaryAmount", "currency": "USD", "value": "0" },
+      "step": [
+        {
+          "@type": "HowToStep",
+          "name": "Open MiutChat",
+          "text": "Go to miutchat.pages.dev in any browser. No download or install required.",
+          "url": "https://miutchat.pages.dev/#create"
+        },
+        {
+          "@type": "HowToStep",
+          "name": "Create a room",
+          "text": "Tap Create Room. A short room code is generated instantly — no email, phone number, or account needed."
+        },
+        {
+          "@type": "HowToStep",
+          "name": "Share the room code",
+          "text": "Send the room code to whoever you want to chat with, through any channel you trust."
+        },
+        {
+          "@type": "HowToStep",
+          "name": "Start chatting",
+          "text": "Messages are encrypted client-side before sending. Set the room to auto-delete after everyone leaves."
+        }
+      ]
     }
   ]
 }
@@ -287,7 +332,7 @@ footer{padding:48px 6% 32px;background:var(--bg2);border-top:1px solid var(--bdr
     <div class="fcard">
       <div class="ficon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M12 2L2 7l10 5 10-5-10-5z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>
       <div class="ftit">Ephemeral Rooms</div>
-      <div class="fdesc">Rooms self-destruct when the last member leaves. No lingering history. Messages can also auto-vanish after 30 seconds, 5 minutes, or up to 7 days.</div>
+      <div class="fdesc">Rooms self-destruct once the last member leaves — instantly, 5 minutes later by default, or on whatever schedule the admin sets. Messages can also auto-vanish after 30 seconds, 5 minutes, or up to 7 days.</div>
     </div>
     <div class="fcard">
       <div class="ficon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>
@@ -325,7 +370,7 @@ footer{padding:48px 6% 32px;background:var(--bg2);border-top:1px solid var(--bdr
         </div>
         <div class="pitem">
           <div class="piico"><svg viewBox="0 0 20 20" fill="none" width="16" height="16"><path d="M4 6h12M6 6V4a2 2 0 012-2h4a2 2 0 012 2v2M8 11v4M12 11v4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M5 6l1 12h8l1-12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-          <div class="pitext"><strong>Auto-wipe on empty</strong><span>When the last person leaves, all messages, members, and room data are permanently deleted. No admin can recover them.</span></div>
+          <div class="pitext"><strong>Auto-wipe on empty</strong><span>When the last person leaves, the room admin's expiry setting decides what happens next — delete instantly, wait 5 minutes (the default), 1 hour, 24 hours, or never. Once it fires, all messages, members, and room data are permanently deleted. No admin can recover them.</span></div>
         </div>
       </div>
     </div>
@@ -364,7 +409,7 @@ footer{padding:48px 6% 32px;background:var(--bg2);border-top:1px solid var(--bdr
     <p style="font-size:.88rem;line-height:1.9;color:#4e7a77;margin-bottom:16px">
       <strong style="color:#cdeae7">MiutChat</strong> is a free, browser-based <strong style="color:#cdeae7">anonymous encrypted chat app</strong> that requires no account, no email, and no personal information.
       Every message is protected with <strong style="color:#cdeae7">AES-256-GCM client-side encryption</strong> before it leaves your device — the server never has access to your plaintext messages.
-      Rooms auto-delete when all participants disconnect, leaving no digital footprint.
+      Rooms auto-delete once everyone leaves — 5 minutes later by default, or instantly, or on a schedule the room admin chooses, leaving no digital footprint.
     </p>
     <ul style="list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-bottom:48px">
       <li style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:rgba(78,205,196,.06);border:1px solid rgba(78,205,196,.12);border-radius:12px;font-size:.76rem;color:#cdeae7">

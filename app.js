@@ -4538,9 +4538,13 @@ const _lazyIO = typeof IntersectionObserver !== 'undefined'
   : null;
 
 function _lazyDecrypt(uid, data) {
-  const _do = () => decryptAndShow(
-    data.encData, data.mime || 'application/octet-stream', data.type, data.fileName, uid
-  );
+  const _do = () => {
+    _log('debug', '[MIUT media] decrypting now (poll gave up or no IntersectionObserver):', uid, { type: data.type, hasEncData: !!data.encData });
+    decryptAndShow(data.encData, data.mime || 'application/octet-stream', data.type, data.fileName, uid);
+  };
+  if (!data.encData) {
+    _log('warn', '[MIUT media] _lazyDecrypt called with no encData at all — this message will show "Media unavailable":', uid, data);
+  }
   if (!_lazyIO) { setTimeout(_do, 60); return; }
   // Store in Map (NOT dataset) to avoid attribute size limits on large base64
   _lazyDataMap.set(uid, {
@@ -4557,8 +4561,22 @@ function _lazyDecrypt(uid, data) {
       clearInterval(poll);
       el.dataset.lazyUid = uid; // tiny marker only
       _lazyIO.observe(el);
+      _log('debug', '[MIUT media] placeholder found, now observing for scroll-into-view:', uid);
     }
-    if (++tries > 40) { clearInterval(poll); _lazyDataMap.delete(uid); setTimeout(_do, 60); }
+    if (++tries > 40) {
+      clearInterval(poll);
+      _lazyDataMap.delete(uid);
+      // This used to silently fall back with no trace of WHY the poll gave
+      // up — if the placeholder element genuinely never mounted (e.g. its
+      // wrap got removed/replaced by something else before this fired), the
+      // fallback _do() below still fires but writes into a domId that may
+      // no longer exist, meaning decryptAndShow's own `if (!el) return;`
+      // silently no-ops and the media never appears at all — exactly the
+      // "disappears, doesn't render" symptom with zero clue why. Logging
+      // here at least tells you whether THIS was the failure point.
+      _log('warn', '[MIUT media] placeholder element never appeared in the DOM after 2s of polling:', uid, '— falling back to immediate decrypt, but if the element truly never mounts this will still fail silently in decryptAndShow');
+      setTimeout(_do, 60);
+    }
   }, 50);
 }
 
@@ -4568,14 +4586,27 @@ function buildMediaPlaceholder(uid, data) {
 }
 
 function assembleChunk(data, docId) {
-  const gid = data.groupId; if (!gid) return;
+  const gid = data.groupId;
+  if (!gid) { _log('warn', '[MIUT media] chunk doc has no groupId, cannot assemble:', docId, data); return; }
   if (!_chunkGroups[gid]) _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId };
   _chunkGroups[gid].parts[data.chunkIdx] = data.encData;
   if (data.chunkIdx === 0) { _chunkGroups[gid].meta = data; _chunkGroups[gid].docId = docId; }
   const g = _chunkGroups[gid];
-  if (Object.keys(g.parts).length === g.total) {
+  const have = Object.keys(g.parts).length;
+  _log('debug', `[MIUT media] chunk ${data.chunkIdx}/${g.total - 1} received for group ${gid} (${have}/${g.total} so far)`);
+  if (have === g.total) {
+    // Sanity-check every part actually has content before assembling —
+    // an empty/undefined part here (e.g. a chunk write that partially
+    // failed) would silently produce a corrupted encData string that then
+    // fails decryption with no obvious reason.
+    const missing = [];
+    for (let i = 0; i < g.total; i++) if (!g.parts[i]) missing.push(i);
+    if (missing.length) {
+      _log('error', `[MIUT media] group ${gid} reports complete (${have}/${g.total}) but part(s) are empty:`, missing, '— assembling anyway, but decryption will likely fail');
+    }
     const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
     delete _chunkGroups[gid];
+    _log('debug', `[MIUT media] group ${gid} complete, assembled ${assembled.length} chars, rendering now`);
     renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type }, g.docId);
   }
 }
@@ -5289,17 +5320,24 @@ function clearSearch() {
   const c = $('search-count'); if (c) c.textContent = '';
 }
 async function decryptAndShow(encData, mime, type, fileName, domId) {
+  if (!encData) {
+    _log('warn', '[MIUT media] decryptAndShow called with empty/missing encData — nothing to decrypt:', domId, { type, fileName });
+    const el0 = $(domId);
+    if (el0) el0.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">Media unavailable</div>`;
+    return;
+  }
   const cacheKey = 'blob_' + btoa(encData.slice(0, 32).replace(/[^a-zA-Z0-9]/g,'').padEnd(8,'0')).slice(0,16);
 
   let url = null;
 
   // Check IDB for cached bytes first
-  const cachedBytes = await idbGetBlob(cacheKey).catch(() => null);
+  const cachedBytes = await idbGetBlob(cacheKey).catch(e => { _log('debug', '[MIUT media] IDB cache miss/error (not fatal, will re-decrypt):', domId, e); return null; });
   if (cachedBytes) {
     try {
       const blob = new Blob([cachedBytes], { type: mime });
       url = URL.createObjectURL(blob);
-    } catch { /* fall through to re-decrypt */ }
+      _log('debug', '[MIUT media] served from IDB cache:', domId);
+    } catch (e) { _log('debug', '[MIUT media] cached blob construction failed, falling through to re-decrypt:', domId, e); }
   }
 
   if (!url) {
@@ -5309,7 +5347,17 @@ async function decryptAndShow(encData, mime, type, fileName, domId) {
       // Store raw bytes (not the blob: URL) so cache survives page reloads
       const arrBuf = await blob.arrayBuffer();
       await idbSetBlob(cacheKey, new Uint8Array(arrBuf));
+      _log('debug', '[MIUT media] decrypted fresh and cached:', domId, { bytes: arrBuf.byteLength });
     } catch (e) {
+      // This is the single most likely place for "the file is in Firestore
+      // but never renders" to actually originate — decBytes throws for
+      // several distinct reasons (wrong/rotated epoch key, corrupted/
+      // truncated encData from an incompletely-healed chunk group, a
+      // malformed base64 payload) that all looked identical from the UI:
+      // just a quiet "This message could not be decrypted" with nothing in
+      // the console before now. Logging the real error here is the key
+      // diagnostic for tracking that bug down for real.
+      _log('error', '[MIUT media] decryption FAILED — this is why the media never rendered:', domId, { type, mime, encDataLength: encData?.length }, e);
       const el = $(domId);
       if (el) el.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">This message could not be decrypted</div>`;
       return;
@@ -5317,7 +5365,10 @@ async function decryptAndShow(encData, mime, type, fileName, domId) {
   }
 
   const el = $(domId);
-  if (!el) return;
+  if (!el) {
+    _log('warn', '[MIUT media] decryption succeeded but the placeholder element is gone from the DOM — media decrypted into nothing:', domId, '(the wrap was likely removed/replaced — e.g. re-rendered, deleted, or the room was left — between when decrypt started and finished)');
+    return;
+  }
 
   if (type === 'image') {
     // esc() escapes HTML entities, not JS string chars — fragile inside onclick="...".
