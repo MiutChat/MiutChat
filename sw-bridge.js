@@ -120,7 +120,11 @@ async function subscribeToPush(reg) {
    UPDATE BANNER
 ────────────────────────────────────────── */
 function showUpdateBanner(newWorker) {
-  if (typeof toast === 'function') toast('Update available', 'Tap to reload', '⬡');
+  // This used to ALSO call toast(...) here, showing a toast AND this custom
+  // banner for the same single update event — two stacked "Update
+  // available" notifications for one thing. This banner is the intended,
+  // persistent presentation (a reload prompt shouldn't auto-dismiss like a
+  // toast does), so that's the one that stays; the toast call is gone.
   document.getElementById('sw-update-banner')?.remove();
   const b = document.createElement('div');
   b.id = 'sw-update-banner';

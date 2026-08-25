@@ -2179,6 +2179,28 @@ function _initAntiCapture() {
 // Removes messages from the DOM (not Firestore) after their TTL expires.
 // TTL is set per-message by the sender; admin can set room-level default.
 let _roomTtlMs = 0; // 0 = no expiry
+// Required Firestore Security Rule for message TTL (auto-vanish) deletion —
+// this must allow ANY current room member to delete ANY message once it's
+// past its TTL, not just the message's own sender or an admin. Automatic
+// expiry is triggered by whichever client happens to notice it first
+// (the sweep below, or fetchHistoryOnce catching an already-expired
+// message at load time) — it is never necessarily the original sender's
+// own client, since that person may have left long before the TTL lapsed.
+// A rule scoped to sender-or-admin-only will silently reject these
+// deletes, which is exactly what makes an "expired" message reappear on
+// every future reload despite looking gone locally.
+//
+//   match /rooms/{roomCode}/messages/{messageId} {
+//     allow delete: if
+//       // the room has a msgTtlMs set, AND
+//       get(/databases/$(database)/documents/rooms/$(roomCode)).data.msgTtlMs > 0
+//       // the message is actually past that TTL (createdAt + msgTtlMs <= now), AND
+//       && request.time > timestamp.value(resource.data.createdAt.toMillis() + get(/databases/$(database)/documents/rooms/$(roomCode)).data.msgTtlMs)
+//       // the requester is a current member of the room (not an outsider)
+//       && exists(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid));
+//     // (combine with your existing sender/admin-based delete rule for
+//     // manual "Delete Message" — this is strictly additive, not a replacement)
+//   }
 function _startExpirySweep() {
   if (_expiryTimer) clearInterval(_expiryTimer);
   _expiryTimer = setInterval(_runExpirySweep, 5000); // check every 5s for accurate countdowns
@@ -2203,11 +2225,19 @@ function _runExpirySweep() {
       w.style.transform  = 'scale(.92)';
       setTimeout(() => w.remove(), 420);
 
-      // Delete from Firestore (fire-and-forget, no error handling needed)
+      // Delete from Firestore. Logged on failure now — this used to be a
+      // truly silent fire-and-forget, so a rejected delete (most likely a
+      // Firestore rule that only allows a message's own sender, or an
+      // admin, to delete it — which doesn't line up with "anyone's client
+      // can trigger automatic TTL expiry") left the message permanently
+      // undeletable with zero visible indication why, and it would keep
+      // reappearing on every future history load. See the rule note below.
       if (docId && db && state.roomCode) {
         db.collection('rooms').doc(state.roomCode)
           .collection('messages').doc(docId)
-          .delete().catch(() => {});
+          .delete()
+          .then(() => _log('debug', '[MIUT ttl] expired message deleted:', docId))
+          .catch(e => _log('warn', '[MIUT ttl] expired message delete REJECTED — it will reappear on reload until this succeeds. Check Firestore rules allow TTL-based deletion by any room member, not just the sender/admin:', docId, e));
       }
       return;
     }
@@ -2430,6 +2460,22 @@ async function fetchHistoryOnce(code) {
     for (const doc of docs) {
       if (_renderedIds.has(doc.id)) continue;
       const data = doc.data();
+      // Message TTL (per-message auto-vanish) can lapse while nobody's in
+      // the room to run the periodic sweep (_runExpirySweep only acts on
+      // messages already rendered in a live DOM). Without this check, an
+      // already-expired message would render anyway on next load — visible
+      // for a few seconds until the sweep caught up, or indefinitely if its
+      // sweep-triggered delete() ever silently failed (e.g. a Firestore
+      // rule rejecting it). Catch it here too: skip rendering AND delete it
+      // right away, so history load itself is a second, independent
+      // enforcement point, not just the interval sweep.
+      if (_roomTtlMs && data.ts && (Date.now() - data.ts) >= _roomTtlMs) {
+        _renderedIds.add(doc.id); // prevent any other path from rendering it either
+        db.collection('rooms').doc(code).collection('messages').doc(doc.id).delete()
+          .then(() => _log('debug', '[MIUT ttl] purged already-expired message found at history load:', doc.id))
+          .catch(e => _log('warn', '[MIUT ttl] failed to delete an already-expired message — it will keep reappearing until this succeeds:', doc.id, e));
+        continue;
+      }
       _renderedIds.add(doc.id);
       $('msg-skeleton') && ($('msg-skeleton').style.display = 'none'); $('room-welcome')?.style && ($('room-welcome').style.display = 'none');
       // Awaited deliberately — renderMsg is async (it awaits decryption
@@ -3813,13 +3859,15 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-// SW update notification
-window.addEventListener('message', ev => {
-  if (ev.data?.type === 'SW_UPDATED') {
-    const t = toast('Update available', 'Tap to reload and get the latest version.', 'net');
-    if (t) t.addEventListener('click', () => location.reload());
-  }
-});
+// SW update notification: intentionally NOT handled here. sw-bridge.js's
+// showUpdateBanner() (triggered via the registration's own updatefound/
+// statechange events, a more reliable signal than reacting to the SW's
+// own postMessage announcement) is the single owner of this UI. This used
+// to ALSO listen here — on window, not navigator.serviceWorker, which per
+// spec never actually receives a Client.postMessage() from the SW anyway
+// — but even dead/unreachable code duplicating another file's
+// responsibility for the same user-facing notification is worth removing
+// outright rather than leaving as a latent double-fire risk.
 
 window.addEventListener('beforeunload', () => {
   if (!state.me || !state.roomCode || !db) return;
