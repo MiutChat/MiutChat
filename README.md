@@ -3,10 +3,9 @@
 </p>
 
 <h1 align="center">MiutChat</h1>
+<p align="center"><strong>End-to-end encrypted, anonymous, self-destructing chat rooms. No accounts. No phone number. No trace.</strong></p>
 
-<p align="center">
-  <strong>End-to-end encrypted, anonymous, self-destructing chat rooms. No accounts. No phone number. No trace.</strong>
-</p>
+<p align="center"><strong><a href="https://miutchat.pages.dev">🚀 Launch the live app →</a></strong> — no install, no account, no phone number.</p>
 
 <p align="center">
   <a href="https://miutchat.pages.dev">Live app</a> ·
@@ -15,6 +14,7 @@
   <a href="https://miutchat.pages.dev/terms.html">Terms of Service</a> ·
   <a href="./CONTRIBUTING.md">Contributing</a>
 </p>
+
 ---
 
 ## What is MiutChat?
@@ -142,13 +142,7 @@ npx serve dist
 
 You'll need your own Firebase project (Firestore) to actually connect to a backend — this repo doesn't include Firebase credentials. Wire up your project's config in wherever `app.js` initializes Firebase, and set up Firestore Security Rules (see the comment block above the feedback-collection code in `app.js` for one example of the rule shape this app expects; other collections need similar rules — there's no `firestore.rules` file committed to this repo, rules are managed directly in the Firebase console).
 
-**Skip the version bump while testing locally:**
-
-```bash
-SKIP_VERSION_BUMP=1 node build.js
-```
-
-See [Versioning](#versioning) below for why this matters.
+Local builds never touch the version number — see [Versioning](#versioning) below.
 
 ## Deployment
 
@@ -166,7 +160,13 @@ The app version is a single source of truth: the `version` field in `package.jso
 1.0.24 → 1.0.25 → 1.1.0 → 1.1.1 → ...
 ```
 
-**When it bumps:** every time `node build.js` runs, unless explicitly skipped with `SKIP_VERSION_BUMP=1`. This is intentionally simple — "the version increases whenever the app is actually built for deployment" — rather than trying to detect which specific CI/deploy environment is running it.
+**When it bumps, and where:** automatically, on every push to `main`, via the GitHub Action at [`.github/workflows/bump-version.yml`](./.github/workflows/bump-version.yml). That workflow is the actual source of the bump — it runs `node version.js patch` and **commits the result back to the repository**.
+
+This lives in a GitHub Action rather than in `build.js` deliberately. An earlier version of this project tried bumping the version inside `build.js` during the Cloudflare Pages build itself — that doesn't work, because Cloudflare (like most CI) clones the repository fresh, and shallow, for every single build. Any change `build.js` made to `package.json` during that build only ever existed inside that one throwaway container; it never made it back into the actual GitHub repo, so the next push started from the exact same committed version and computed the exact same "next" value — the version looked permanently stuck one bump behind, no matter how many times you deployed. Bumping via a GitHub Action instead means the new version is genuinely committed to git history *before* anything ever clones the repo to build or deploy it, which is the only way this can actually persist across separate deploys.
+
+`build.js` itself never bumps anything — it only reads whatever's currently in `package.json` and stamps that value everywhere.
+
+**Setup required for this to work:** the workflow needs permission to push commits back to the repo. In your repository's settings: **Settings → Actions → General → Workflow permissions**, select **"Read and write permissions"**. Without this, the Action will fail to push and the version won't advance.
 
 **Manual bumps** (e.g. to deliberately jump to a new minor/major before a release):
 
@@ -175,6 +175,8 @@ node version.js patch   # explicit patch bump (same as an automatic one)
 node version.js minor   # 1.4.9  → 1.5.0
 node version.js major   # 1.5.0  → 2.0.0
 ```
+
+Commit and push the result like any other change — the next automatic bump picks up from wherever this left off.
 
 ## Security model
 
