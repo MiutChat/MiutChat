@@ -98,7 +98,6 @@ const JS_JOBS = [
   ['db-manager.js',          'db-manager.min.js',          'es2020'],
   ['crypto-engine.js',       'crypto-engine.min.js',       'es2020'],
   ['crypto-bridge.js',       'crypto-bridge.min.js',       'es2020'],
-  ['storage-engine.js',      'storage-engine.min.js',      'es2020'],
   ['placeholder-rotator.js', 'placeholder-rotator.min.js', 'es2017'],
   ['security.js',            'security.min.js',            'es2020'],
 ];
@@ -225,7 +224,8 @@ log('STATIC', 'copy assets');
 const STATIC = [
   'manifest.json','offline.html','.nojekyll','firestore.rules',
   '_headers','_redirects','_middleware.js','config.js','privacy.html','landing.html',
-  'terms.html','about.html','404.html','maintenance.html','vault.html',
+  'terms.html','about.html','404.html','maintenance.html',
+  'secure-chat-for-journalists.html','ephemeral-chat-for-support-groups.html',
   'robots.txt','ads.txt','sitemap.xml','wrangler.toml','CNAME',
 ];
 // Files that need the unified VERSION text-stamped in rather than a plain

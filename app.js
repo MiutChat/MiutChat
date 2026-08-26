@@ -2203,7 +2203,23 @@ let _roomTtlMs = 0; // 0 = no expiry
 //   }
 function _startExpirySweep() {
   if (_expiryTimer) clearInterval(_expiryTimer);
-  _expiryTimer = setInterval(_runExpirySweep, 5000); // check every 5s for accurate countdowns
+  _expiryTimer = setInterval(() => { _runExpirySweep(); _sweepStaleChunkGroups(); }, 5000); // check every 5s for accurate countdowns
+}
+
+const STALE_CHUNK_GROUP_MS = 10 * 60 * 1000; // 10 min — long enough for any real upload to finish, short enough to not leak memory
+function _sweepStaleChunkGroups() {
+  const cutoff = Date.now() - STALE_CHUNK_GROUP_MS;
+  for (const gid of Object.keys(_chunkGroups)) {
+    const g = _chunkGroups[gid];
+    if (g && g.firstSeenAt && g.firstSeenAt < cutoff) {
+      // Never completed after 10 minutes — an interrupted/failed upload.
+      // Evicted rather than kept forever: each entry can hold up to
+      // CONFIG.CHUNK_BYTES worth of base64 text per chunk already
+      // received, which otherwise accumulates for the lifetime of the tab.
+      _log('debug', `[MIUT media] evicting stale incomplete chunk group ${gid} (${Object.keys(g.parts).length}/${g.total} chunks, never completed)`);
+      delete _chunkGroups[gid];
+    }
+  }
 }
 
 function _runExpirySweep() {
@@ -4234,7 +4250,8 @@ async function handleFileAttach(e) {
       const parts   = [];
       for (let i = 0; i < totalSize; i += CONFIG.CHUNK_BYTES)
         parts.push(encrypted.slice(i, i + CONFIG.CHUNK_BYTES));
-      const groupId = 'grp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+      const groupId = 'grp_' + state.me.id.slice(0, 8) + '_' + Date.now() + '_' +
+        Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => b.toString(36)).join('').slice(0, 8);
       const now     = Date.now();
       const BATCH   = 4;
       for (let b = 0; b < parts.length; b += BATCH) {
@@ -4636,7 +4653,7 @@ function buildMediaPlaceholder(uid, data) {
 function assembleChunk(data, docId) {
   const gid = data.groupId;
   if (!gid) { _log('warn', '[MIUT media] chunk doc has no groupId, cannot assemble:', docId, data); return; }
-  if (!_chunkGroups[gid]) _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId };
+  if (!_chunkGroups[gid]) _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId, firstSeenAt: Date.now() };
   _chunkGroups[gid].parts[data.chunkIdx] = data.encData;
   if (data.chunkIdx === 0) { _chunkGroups[gid].meta = data; _chunkGroups[gid].docId = docId; }
   const g = _chunkGroups[gid];
