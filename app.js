@@ -88,9 +88,9 @@ const CONFIG = {
   SESSION_KEY:        'miut_session_v2',
   ROOM_KEY:           'miut_room_v1',
   PREFS_KEY:          'miut_prefs_v1',
-  TYPING_WRITE_MS:    2000,
-  TYPING_EXPIRE_MS:   5000,
-  TYPING_IDLE_MS:     3000,
+  TYPING_WRITE_MS:    4000,
+  TYPING_EXPIRE_MS:   9000,
+  TYPING_IDLE_MS:     3500,
   HEARTBEAT_MS:       20000,
   MAX_FILE_BYTES:     25 * 1024 * 1024,
 

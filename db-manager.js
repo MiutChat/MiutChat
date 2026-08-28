@@ -118,8 +118,53 @@ async function _loadConfig() {
 /* Cooldown durations indexed by consecutive failure count */
 const _COOLDOWNS = [30e3, 120e3, 480e3, 1800e3, 3600e3]; // 30s→2m→8m→30m→1h
 
-/* Per-room database resolution cache (session lifetime) */
+/* Per-room database resolution cache (session lifetime, in-memory) */
 const _roomDbCache = new Map();
+
+/* ── Persistent room → database binding ───────────────────────────
+ * Critical correctness fix: _hashRoom(code) % _ACTIVE_DBS.length means
+ * the moment a NEW shard is added, _ACTIVE_DBS.length changes, and the
+ * hash result shifts for the MAJORITY of already-existing room codes —
+ * confirmed directly: with 1 active DB every code hashes to index 0
+ * trivially, but adding a 2nd DB flips roughly half of all existing rooms
+ * to index 1 (an empty, brand-new database). Combined with getDb's probe
+ * treating "document doesn't exist" as a successful health check (it
+ * doesn't throw, so _onSuccess fires and that database gets cached), an
+ * active room could get silently rerouted to a database with none of its
+ * data the instant a new shard is introduced — indistinguishable from the
+ * room having been deleted.
+ *
+ * Fix: once a room is resolved to a database, that binding is persisted
+ * to localStorage and always takes priority over a fresh hash
+ * computation, for the life of the browser's storage (which comfortably
+ * outlives any room — rooms expire in hours at most, this persists across
+ * reloads indefinitely). New room codes (never seen before) still get
+ * distributed across all currently active databases via the hash, same
+ * as before — this only stabilizes ALREADY-BOUND rooms against future
+ * shard additions. */
+const _PERSIST_KEY   = 'miut_db_bindings';
+const _PERSIST_LIMIT = 500; // oldest evicted first — comfortably more than any real session will bind
+
+function _loadPersistedBindings() {
+  try { return JSON.parse(localStorage.getItem(_PERSIST_KEY)) || {}; }
+  catch { return {}; }
+}
+function _getPersistedBinding(code) {
+  return _loadPersistedBindings()[code] || null;
+}
+function _setPersistedBinding(code, dbName) {
+  try {
+    const map = _loadPersistedBindings();
+    map[code] = { db: dbName, at: Date.now() };
+    const keys = Object.keys(map);
+    if (keys.length > _PERSIST_LIMIT) {
+      keys.sort((a, b) => map[a].at - map[b].at)
+          .slice(0, keys.length - _PERSIST_LIMIT)
+          .forEach(k => delete map[k]);
+    }
+    localStorage.setItem(_PERSIST_KEY, JSON.stringify(map));
+  } catch { /* localStorage full/unavailable — falls back to hash-only routing, not fatal */ }
+}
 
 /* Initialised Firestore instances */
 const _instances = new Map();
@@ -192,7 +237,7 @@ async function getDb(roomCode) {
     throw new Error('getDb: roomCode must be a non-empty string.');
   }
 
-  /* Fast path — already resolved and still healthy */
+  /* Fast path — already resolved this session and still healthy */
   if (_roomDbCache.has(roomCode)) {
     const name = _roomDbCache.get(roomCode);
     const inst = _instances.get(name);
@@ -200,11 +245,28 @@ async function getDb(roomCode) {
     _roomDbCache.delete(roomCode);  // stale — re-probe
   }
 
+  /* Persisted binding from a previous session takes priority over any
+   * fresh hash computation — see _getPersistedBinding's comment for why.
+   * Only used if that database is still in the active pool (it could in
+   * principle have been retired) and currently healthy. */
+  const persisted = _getPersistedBinding(roomCode);
+  if (persisted && _ACTIVE_DBS.some(d => d.name === persisted.db)) {
+    const cfg = _ACTIVE_DBS.find(d => d.name === persisted.db);
+    if (_healthy(cfg.name)) {
+      try {
+        const fs = _initDb(cfg);
+        _roomDbCache.set(roomCode, cfg.name);
+        return fs;
+      } catch { /* fall through to normal resolution below */ }
+    }
+  }
+
   /* Single DB shortcut — no probing needed */
   if (_ACTIVE_DBS.length === 1) {
     const { name, config } = _ACTIVE_DBS[0];
     const fs = _initDb({ name, config });
     _roomDbCache.set(roomCode, name);
+    _setPersistedBinding(roomCode, name);
     return fs;
   }
 
@@ -227,6 +289,7 @@ async function getDb(roomCode) {
       ]);
       _onSuccess(cfg.name);
       _roomDbCache.set(roomCode, cfg.name);
+      _setPersistedBinding(roomCode, cfg.name);
       return fs;
     } catch (err) {
       _onFail(cfg.name, err);
