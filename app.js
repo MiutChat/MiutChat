@@ -2220,6 +2220,13 @@ function _sweepStaleChunkGroups() {
       delete _chunkGroups[gid];
     }
   }
+  // Same leak pattern, smaller payload each but same idea: a placeholder
+  // whose message was deleted or whose room was left before it ever
+  // scrolled into view never triggers the IntersectionObserver callback
+  // that would otherwise clean this up.
+  for (const uid of _lazyDataMap.keys()) {
+    if (!document.getElementById(uid)) _lazyDataMap.delete(uid);
+  }
 }
 
 function _runExpirySweep() {
@@ -2249,11 +2256,41 @@ function _runExpirySweep() {
       // undeletable with zero visible indication why, and it would keep
       // reappearing on every future history load. See the rule note below.
       if (docId && db && state.roomCode) {
-        db.collection('rooms').doc(state.roomCode)
-          .collection('messages').doc(docId)
-          .delete()
-          .then(() => _log('debug', '[MIUT ttl] expired message deleted:', docId))
-          .catch(e => _log('warn', '[MIUT ttl] expired message delete REJECTED — it will reappear on reload until this succeeds. Check Firestore rules allow TTL-based deletion by any room member, not just the sender/admin:', docId, e));
+        const groupId = w.dataset.groupId || '';
+        if (groupId) {
+          // Chunked file (image/video split across many small docs) — the
+          // visible bubble only knows chunk 0's docId, but ALL chunks share
+          // this groupId and must be deleted together, or every chunk
+          // after the first would be orphaned in Firestore forever every
+          // time a large file's message expired.
+          db.collection('rooms').doc(state.roomCode).collection('messages')
+            .where('groupId', '==', groupId).get()
+            .then(snap => {
+              if (snap.empty) return;
+              const batch = db.batch();
+              snap.forEach(d => batch.delete(d.ref));
+              return batch.commit();
+            })
+            .then(() => _log('debug', '[MIUT ttl] expired chunked file deleted (all chunks):', groupId))
+            .catch(e => _log('warn', '[MIUT ttl] expired chunk-group delete REJECTED — some/all chunks may remain in Firestore. Check rules allow TTL-based deletion by any room member:', groupId, e));
+        } else {
+          db.collection('rooms').doc(state.roomCode)
+            .collection('messages').doc(docId)
+            .delete()
+            .then(() => _log('debug', '[MIUT ttl] expired message deleted:', docId))
+            .catch(e => _log('warn', '[MIUT ttl] expired message delete REJECTED — it will reappear on reload until this succeeds. Check Firestore rules allow TTL-based deletion by any room member, not just the sender/admin:', docId, e));
+        }
+      }
+      // Also purge the local IDB cache (see loadCached/cacheMsg) — without
+      // this, an expired-and-server-deleted message could still surface
+      // briefly from the offline cache on the next reload, which defeats
+      // "vanish" for the one client that had it cached.
+      if (docId) {
+        openIDB().then(db2 => new Promise(res => {
+          const tx = db2.transaction('msgs', 'readwrite');
+          tx.objectStore('msgs').delete(docId);
+          tx.oncomplete = res;
+        })).catch(() => {});
       }
       return;
     }
@@ -4405,6 +4442,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
   wrap.dataset.ts       = data.ts || '';
   wrap.dataset.type     = data.type || 'text';
   wrap.dataset.fileName = data.fileName || '';
+  wrap.dataset.groupId  = data.groupId || ''; // needed so TTL expiry can clean up ALL chunks of a large file, not just this one doc — see _runExpirySweep
   // Long-press to select (runs once per element)
   if (docId && !wrap.dataset.lpWired) { wrap.dataset.lpWired='1'; _wireLongPress(wrap, docId); }
 
