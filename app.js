@@ -2271,13 +2271,13 @@ function _runExpirySweep() {
               snap.forEach(d => batch.delete(d.ref));
               return batch.commit();
             })
-            .then(() => _log('debug', '[MIUT ttl] expired chunked file deleted (all chunks):', groupId))
+            .then(() => { _log('debug', '[MIUT ttl] expired chunked file deleted (all chunks):', groupId); _sanitizeRepliesTo(docId); })
             .catch(e => _log('warn', '[MIUT ttl] expired chunk-group delete REJECTED — some/all chunks may remain in Firestore. Check rules allow TTL-based deletion by any room member:', groupId, e));
         } else {
           db.collection('rooms').doc(state.roomCode)
             .collection('messages').doc(docId)
             .delete()
-            .then(() => _log('debug', '[MIUT ttl] expired message deleted:', docId))
+            .then(() => { _log('debug', '[MIUT ttl] expired message deleted:', docId); _sanitizeRepliesTo(docId); })
             .catch(e => _log('warn', '[MIUT ttl] expired message delete REJECTED — it will reappear on reload until this succeeds. Check Firestore rules allow TTL-based deletion by any room member, not just the sender/admin:', docId, e));
         }
       }
@@ -4409,6 +4409,17 @@ function _readStatusBadge(data, docId) {
 async function renderMsg(data, docId, insertBeforeEl) {
   const area = $('messages-area'); if (!area) return;
 
+  // Hide the empty-room welcome/skeleton state as soon as ANY message
+  // renders. This used to live only in the live-listener's docChanges
+  // handler, which the optimistic-send path (sendMessage calling this
+  // directly) never went through — sending your own first message into an
+  // empty room left the welcome banner's space still reserved above it,
+  // which combined with the mobile keyboard shrinking the visible
+  // viewport could push that first message up behind the header, out of
+  // view. Centralizing it here means every caller gets it for free.
+  $('msg-skeleton')  && ($('msg-skeleton').style.display  = 'none');
+  $('room-welcome')  && ($('room-welcome').style.display  = 'none');
+
   if (data.type === 'chunk' || (data.groupId && data.chunkOf > 1)) {
     assembleChunk(data, docId); return;
   }
@@ -4470,6 +4481,9 @@ async function renderMsg(data, docId, insertBeforeEl) {
   // Render quoted reply if this message has one
   if (data.replyTo) {
     let rqContent = '';
+    if (data.replyTo.deleted) {
+      rqContent = `<div class="rq-text rq-deleted">This message was deleted</div>`;
+    } else {
     const mt = data.replyTo.mediaType;
     if (mt === 'image') {
       rqContent = `<div class="rq-media"><svg viewBox="0 0 20 20" fill="none" width="12" height="12"><path d="M2 7a2 2 0 012-2h.5l1-2h5l1 2H17a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.4"/><circle cx="10" cy="11" r="2.5" stroke="currentColor" stroke-width="1.4"/></svg> Photo</div>`;
@@ -4483,6 +4497,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
     } else {
       const qText = data.replyTo.enc ? await dec(data.replyTo.enc, state.roomCode) : '';
       rqContent = `<div class="rq-text">${esc(qText.length > 60 ? qText.slice(0, 60) + '…' : qText)}</div>`;
+    }
     }
     replyQuote = `
       <div class="reply-quote" data-goto="${esc(data.replyTo.docId || '')}">
@@ -4840,6 +4855,41 @@ function _softDeleteLocal(wrap) {
   wrap.querySelector('.msg-actions')?.remove();
 }
 
+/**
+ * Finds any messages that reply-quote the given (now-deleted) message and
+ * strips their embedded snapshot. Without this, a reply's quote preview
+ * embeds a full separately-encrypted COPY of the original text at reply
+ * time — deleting or letting the original expire never touched that copy,
+ * so "deleted" content stayed fully readable forever via any reply that
+ * quoted it. Called from every message-delete path (manual soft-delete,
+ * TTL expiry, chunked-media TTL expiry).
+ */
+async function _sanitizeRepliesTo(docId) {
+  if (!docId || !db || !state.roomCode) return;
+  try {
+    const snap = await db.collection('rooms').doc(state.roomCode)
+      .collection('messages').where('replyTo.docId', '==', docId).get();
+    if (snap.empty) return;
+    const batch = db.batch();
+    snap.forEach(d => batch.update(d.ref, {
+      'replyTo.enc': null, 'replyTo.deleted': true,
+    }));
+    await batch.commit();
+    // Any of these replies rendered on THIS client right now still show
+    // the stale embedded text until re-rendered — patch the DOM directly
+    // too, not just Firestore, so it disappears immediately rather than
+    // only on next reload.
+    snap.forEach(d => {
+      const quoteEl = document.querySelector(`.reply-quote[data-goto="${CSS.escape(docId)}"]`);
+      const container = quoteEl?.closest(`.msg-wrapper[data-doc-id="${CSS.escape(d.id)}"]`) ? quoteEl : null;
+      if (container) {
+        const textEl = container.querySelector('.rq-text, .rq-media');
+        if (textEl) textEl.outerHTML = '<div class="rq-text rq-deleted">This message was deleted</div>';
+      }
+    });
+  } catch (e) { _log('warn', '[MIUT] Reply-quote sanitization failed (quoted snapshots of a deleted message may still show stale content):', docId, e); }
+}
+
 async function _softDeleteRemote(docId) {
   if (!docId || !state.roomCode || !db) return;
   try {
@@ -4850,6 +4900,7 @@ async function _softDeleteRemote(docId) {
       enc: null, encData: null, fileName: null, mime: null, groupId: null, reactions: null,
     });
   } catch (e) { _log('warn', '[MIUT] Soft-delete failed:', e); }
+  _sanitizeRepliesTo(docId);
   // Local IDB cache no longer needs the (now-stripped) content either
   try {
     const db2 = await openIDB();
@@ -5215,11 +5266,25 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     const vpH       = window.innerHeight;
     const spaceAbove = wrapRect.top;
     const spaceBelow = vpH - wrapRect.bottom;
-    if (spaceAbove < stripH + 20 && spaceBelow > stripH + 20) {
-      // Not enough space above — show below the message
+    // Flip below whenever below is the better fit — not just when above
+    // fails AND below fully fits. The old check left the strip anchored
+    // above (its default) whenever below didn't have "enough" room too,
+    // even in cases below was still clearly the less-bad option (e.g. a
+    // short viewport, or the extended emoji grid open making the strip
+    // taller than either gap) — meaning it could still get clipped by
+    // #messages-area's own overflow boundary at the top, invisible and
+    // unclickable, for a message anywhere near the top of the scroll view.
+    if (spaceAbove < stripH + 20 && spaceBelow > spaceAbove) {
       strip.style.bottom = 'auto';
       strip.style.top    = 'calc(100% + 8px)';
       strip.style.transformOrigin = isMine ? 'top right' : 'top left';
+      // If even the better side can't fully fit it, cap the height and let
+      // it scroll internally rather than spill past the viewport edge.
+      const fits = Math.max(spaceAbove, spaceBelow);
+      if (fits < stripH + 20) {
+        strip.style.maxHeight = Math.max(160, fits - 24) + 'px';
+        strip.style.overflowY = 'auto';
+      }
     }
     // Horizontal: prevent strip from going off left edge
     const stripRect = strip.getBoundingClientRect();
@@ -5264,6 +5329,11 @@ function fmtEditSecs(s) {
 function startEdit(docId, currentText, wrapEl, msgTs) {
   // Clear any existing edit first
   if (_editingDocId) cancelEdit();
+  // Editing repurposes the same reply-bar UI a pending reply uses — can't
+  // show both, and entering edit mode is a deliberate action that should
+  // supersede a queued reply, not silently keep it around to reattach to
+  // whatever's sent next after the edit is cancelled/submitted.
+  _replyTo = null;
 
   _editingDocId = docId;
   _editingWrap  = wrapEl;
@@ -5312,7 +5382,7 @@ function startEdit(docId, currentText, wrapEl, msgTs) {
 function cancelEdit() {
   clearInterval(_editTimer); _editTimer = null;
   _editingWrap?.querySelector('.msg-bubble')?.classList.remove('editing-highlight');
-  _editingDocId = null; _editingWrap = null; _editingTs = 0; _replyTo = null;
+  _editingDocId = null; _editingWrap = null; _editingTs = 0;
   const bar = $('reply-bar'); if (!bar) return;
   bar.classList.remove('visible'); setTimeout(() => { bar.style.display = 'none'; }, 250);
   const input = $('msg-input'); if (input) { input.value = ''; input.style.height = 'auto'; }
@@ -5331,8 +5401,14 @@ async function submitEdit() {
     cancelEdit(); return;
   }
 
+  // Capture everything needed to restore the edit BEFORE tearing down the
+  // UI state — cancelEdit() used to run first, clearing the input and
+  // _editingDocId/_editingWrap/_editingTs immediately, so if the write
+  // below failed for ANY reason (network blip, permissions, wrong
+  // database — as happened here), the person's edited text was gone with
+  // no way back, on top of the failure itself.
+  const _wrap = _editingWrap, _ts = _editingTs;
   cancelEdit();
-  if (input) { input.value = ''; input.style.height = 'auto'; }
   try {
     const _ets   = Date.now();
     const _eenc  = await enc(text, state.roomCode);
@@ -5340,7 +5416,10 @@ async function submitEdit() {
     await db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).update({
       enc: _eenc, edited: true, editedAt: ts_now(), sig: _esig, ts: _ets,
     });
-  } catch(e) { toast('Edit failed', e.message, 'err'); }
+  } catch(e) {
+    toast('Edit failed — your text is restored, try again', e.message, 'err');
+    startEdit(docId, text, _wrap, _ts); // put the person right back where they were, text intact
+  }
 }
 
 function handleMentionInput(input) {
@@ -5556,6 +5635,23 @@ function scrollBottom() {
     hideScrollFab();
     _unreadCount = 0;
     document.title = 'MIUT';
+  });
+}
+
+// Re-scroll whenever the mobile on-screen keyboard opens/closes. The
+// keyboard shrinks the visual viewport without necessarily triggering a
+// normal 'resize' event the same way — without this, a message sent right
+// as the keyboard opens (e.g. the very first message in an empty room,
+// composed with the keyboard already up) could render at a scroll
+// position that was correct for the pre-keyboard viewport, leaving it
+// hidden above the now-smaller visible area, behind the header.
+if (window.visualViewport) {
+  let _vvResizeTimer = null;
+  window.visualViewport.addEventListener('resize', () => {
+    clearTimeout(_vvResizeTimer);
+    _vvResizeTimer = setTimeout(() => {
+      if ($('app')?.classList.contains('active')) scrollBottom();
+    }, 80); // small debounce — keyboard resize fires several times while animating open/closed
   });
 }
 

@@ -403,14 +403,15 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .msg-wrapper.send-failed .msg-bubble{border:1px solid var(--danger);cursor:pointer}
 .msg-wrapper.send-failed .msg-bubble:hover{opacity:.85}
 .msg-edited{font-family:var(--fmono);font-size:.57rem;letter-spacing:.3px;font-style:italic;opacity:.6;margin-left:2px}
-.reply-quote{background:rgba(0,0,0,.14);border-left:3px solid var(--teal);border-radius:8px 8px 0 0;padding:6px 10px;margin-bottom:5px;cursor:pointer;transition:opacity var(--fast) ease,transform var(--fast) var(--spring)}
+.reply-quote{background:rgba(0,0,0,.14);border-left:3px solid var(--teal);border-radius:8px 8px 0 0;padding:6px 10px;margin-bottom:5px;cursor:pointer;transition:opacity var(--fast) ease,transform var(--fast) var(--spring);max-width:100%;overflow:hidden;min-width:0}
 .msg-wrapper.sent .reply-quote{border-left-color:rgba(255,255,255,.55)}
 .reply-quote:hover{opacity:.8}
 .reply-quote:active{transform:scale(.98);opacity:.6}
-.rq-sender{font-family:var(--fui);font-size:.6rem;font-weight:700;color:var(--teal);letter-spacing:.5px;margin-bottom:2px}
+.rq-sender{font-family:var(--fui);font-size:.6rem;font-weight:700;color:var(--teal);letter-spacing:.5px;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .msg-wrapper.sent .rq-sender{color:rgba(255,255,255,.78)}
-.rq-text{font-family:var(--fmono);font-size:.73rem;color:var(--text2);line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.88}
+.rq-text{font-family:var(--fmono);font-size:.73rem;color:var(--text2);line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.88;max-width:100%}
 .msg-wrapper.sent .rq-text{color:rgba(255,255,255,.68)}
+.rq-text.rq-deleted{font-style:italic;opacity:.6}
 .rq-media,.rq-media-inline{display:flex;align-items:center;gap:5px;font-size:.72rem;color:var(--teal);opacity:.9}
 .msg-wrapper.sent .rq-media,.msg-wrapper.sent .rq-media-inline{color:rgba(255,255,255,.80)}
 .msg-reactions{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
