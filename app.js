@@ -5071,6 +5071,19 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
   document.querySelectorAll('.msg-action-strip').forEach(s => s.remove());
   if (navigator.vibrate) try { navigator.vibrate(18); } catch {}
 
+  // docId is a snapshot from the moment this strip opened. If the message
+  // was still using its temporary optimistic ID at that instant (sent only
+  // seconds ago, not yet reconciled to the real Firestore doc ID — see
+  // _reconcileSentMessage), every handler below that closed over `docId`
+  // directly kept using that now-stale temporary ID forever, even though
+  // wrap.dataset.docId gets updated to the real one as soon as the server
+  // acks. Editing (or replying to, or reacting to) a message edited/acted
+  // on shortly after sending it would then fail with "No document to
+  // update" — the temporary ID was never a real Firestore document at all.
+  // Reading it live here, at the moment each action actually fires, fixes
+  // all of them at once.
+  const currentId = () => wrap.dataset.docId || docId;
+
   const strip = document.createElement('div');
   strip.className = 'msg-action-strip';
 
@@ -5080,7 +5093,7 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
 
   // Unified reaction handler — works for both click and touch
   function _reactWith(emoji) {
-    toggleReaction(docId, emoji);
+    toggleReaction(currentId(), emoji);
     strip.remove();
     // Reacting is a single, complete action — leaving multi-select open
     // afterward (if it happened to be active) is confusing, so close it too.
@@ -5192,11 +5205,11 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     e.stopPropagation();
     strip.remove();
     const senderName = wrap.querySelector('.msg-sender')?.textContent?.trim() || 'Someone';
-    if (plainText !== null) setReply(senderName, plainText, docId);
+    if (plainText !== null) setReply(senderName, plainText, currentId());
     else {
       const mediaType = wrap.dataset.type || null;
       const fileName  = wrap.dataset.fileName || null;
-      setReply(senderName, '', docId, mediaType, fileName);
+      setReply(senderName, '', currentId(), mediaType, fileName);
     }
   });
   actRow.appendChild(replyBtn);
@@ -5211,7 +5224,7 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
       editBtn.addEventListener('click', e => {
         e.stopPropagation();
         strip.remove();
-        startEdit(docId, plainText, wrap, msgTs);
+        startEdit(currentId(), plainText, wrap, msgTs);
       });
       actRow.appendChild(editBtn);
     }
@@ -5246,7 +5259,7 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
       delAllBtn.addEventListener('click', e => {
         e.stopPropagation();
         strip.remove();
-        confirmDeleteMsg(docId, wrap);
+        confirmDeleteMsg(currentId(), wrap);
       });
       delRow.appendChild(delAllBtn);
     }
