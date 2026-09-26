@@ -209,8 +209,6 @@ let _isAdmin         = false;
 let _presenceSettled = false;
 let _roomWasEmpty    = false; // tracks whether the room-expiry countdown is currently pending (see startPresenceListener)
 
-// ── Vault auth token (set when passkey matched, cleared on exit) ──
-let _vaultToken = null;
 
 // ── Multi-select state ────────────────────────────────────────────
 let _selectMode    = false;
@@ -328,37 +326,6 @@ let _unsubRoom   = null;
 
 const _epochKeys       = _lruMap(50);   // (code:epoch) → CryptoKey
 const _importedPubKeys = _lruMap(200);  // b64 → CryptoKey
-const _substCache      = _lruMap(20);   // code → { fwd, rev } substitution tables
-
-// ─── Room-code-derived substitution cipher ───────────────────────────────────
-// Applied BEFORE compression and AES-GCM encryption.
-// Each room code produces a unique, deterministic byte-shuffling table via
-// SHA-256. Even if AES were somehow compromised, an attacker would only see
-// shuffled bytes — not recognisable text patterns.
-// Pipeline: text → substituteBytes → compress → AES-256-GCM → base64
-async function _getSubstTable(code) {
-  if (_substCache.has(code)) return _substCache.get(code);
-  const seed  = new TextEncoder().encode('MIUT_SUBST_V1|' + code);
-  const hash  = new Uint8Array(await crypto.subtle.digest('SHA-256', seed));
-  // Fisher-Yates shuffle seeded deterministically from hash
-  const fwd = new Uint8Array(256);
-  for (let i = 0; i < 256; i++) fwd[i] = i;
-  for (let i = 255; i > 0; i--) {
-    const j = (hash[i & 31] ^ hash[(i * 7) & 31] ^ (i * 13)) & 0xff;
-    const t = fwd[i]; fwd[i] = fwd[j % (i + 1)]; fwd[j % (i + 1)] = t;
-  }
-  const rev = new Uint8Array(256);
-  for (let i = 0; i < 256; i++) rev[fwd[i]] = i;
-  const tbl = { fwd, rev };
-  _substCache.set(code, tbl);
-  return tbl;
-}
-function _applySubst(bytes, table) {
-  const out = new Uint8Array(bytes.length);
-  for (let i = 0; i < bytes.length; i++) out[i] = table[bytes[i]];
-  return out;
-}
-// ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Auto epoch rotation counters ────────────────────────────────────────────
 const _AUTO_EPOCH_MSG_COUNT = 100; // rotate key every N messages (admin only)
@@ -374,7 +341,12 @@ async function _getEpochKey(code, epoch) {
 
   let salt;
   if (_roomSalt) {
-    salt = _b64uDec(_roomSalt);                          // random 16 bytes from room doc
+    const roomSaltBytes = _b64uDec(_roomSalt);            // random 16 bytes from room doc
+    const epochTag = new TextEncoder().encode(`|epoch:${epoch}`);
+    const combined = new Uint8Array(roomSaltBytes.length + epochTag.length);
+    combined.set(roomSaltBytes, 0);
+    combined.set(epochTag, roomSaltBytes.length);
+    salt = new Uint8Array(await crypto.subtle.digest('SHA-256', combined)).slice(0, 16);
   } else {
     const saltInput = new TextEncoder().encode(`NEXUS_EPOCH|${code}|${epoch}`);
     const saltHash  = await crypto.subtle.digest('SHA-256', saltInput);
@@ -401,9 +373,6 @@ function _b64uEnc(buf) {
 function _b64uDec(s) {
   return Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
 }
-const _COMPRESS_MARKER   = 0x43;
-const _NOCOMPRESS_MARKER = 0x4e;
-
 let _compressionSupported = null;
 async function _testCompression() {
   if (_compressionSupported !== null) return _compressionSupported;
@@ -437,57 +406,15 @@ async function _collectStream(readable) {
   return out;
 }
 
-async function _compress(str) {
-  const raw = new TextEncoder().encode(str);
-  if (!(await _testCompression())) {
-    const out = new Uint8Array(1 + raw.length);
-    out[0] = _NOCOMPRESS_MARKER;
-    out.set(raw, 1);
-    return out;
-  }
-  try {
-    const cs = new CompressionStream('deflate-raw');
-    const w  = cs.writable.getWriter();
-    w.write(raw); w.close();
-    const compressed = await _collectStream(cs.readable);
-    const out = new Uint8Array(1 + compressed.length);
-    out[0] = _COMPRESS_MARKER;
-    out.set(compressed, 1);
-    return out;
-  } catch {
-    const out = new Uint8Array(1 + raw.length);
-    out[0] = _NOCOMPRESS_MARKER;
-    out.set(raw, 1);
-    return out;
-  }
-}
-
-async function _decompress(buf) {
-  if (!(buf instanceof Uint8Array) || buf.length < 2) {
-    return new TextDecoder().decode(buf);
-  }
-  const marker  = buf[0];
-  const payload = buf.slice(1);
-  if (marker === _NOCOMPRESS_MARKER) {
-    return new TextDecoder().decode(payload);
-  }
-  if (marker === _COMPRESS_MARKER) {
-    if (typeof DecompressionStream === 'undefined') {
-      return '[message requires update to read]';
-    }
-    try {
-      const ds = new DecompressionStream('deflate-raw');
-      const w  = ds.writable.getWriter();
-      w.write(payload); w.close();
-      const decompressed = await _collectStream(ds.readable);
-      return new TextDecoder().decode(decompressed);
-    } catch {
-      return '[decryption error]';
-    }
-  }
-  return new TextDecoder().decode(buf);
-}
-async function enc(text, code) {
+// ─── Text message encryption — single production crypto implementation ──────
+// Delegates entirely to MiutCryptoBridge (crypto-engine.js / crypto-worker.js):
+// PBKDF2+HKDF per-epoch keys, AES-256-GCM with AAD binding roomId/senderId/
+// epoch/timestamp, and its own internal compression. No pre-cipher byte
+// shuffle — AES-GCM's authentication tag already makes any tampering
+// detectable, so that added complexity without adding security.
+// New messages are tagged "x1:"; anything else is a pre-unification message
+// this build can no longer read.
+async function enc(text, code, senderId) {
   try {
     // PART 5: beforeEncrypt hook
     const _hookPayload = (typeof runHooks === 'function')
@@ -495,40 +422,25 @@ async function enc(text, code) {
       : { text, code };
     const _text = (_hookPayload && _hookPayload.text !== undefined) ? _hookPayload.text : text;
 
-    const compressed = await _compress(_text);
-    const tbl        = await _getSubstTable(code);
-    const substituted = _applySubst(compressed, tbl.fwd);
-    const epoch      = _roomEpoch;
-    const key        = await _getEpochKey(code, epoch);
-
-    // PART 8: guaranteed unique IV via security.js (falls back to native)
-    const iv = (typeof generateIV === 'function') ? generateIV() : crypto.getRandomValues(new Uint8Array(12));
-
-    const ct  = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, substituted);
-    const out = new Uint8Array(12 + ct.byteLength);
-    out.set(iv, 0);
-    out.set(new Uint8Array(ct), 12);
-    const result = `e${epoch}:${_b64uEnc(out)}`;
+    await MiutCryptoBridge.init();
+    const sid    = senderId || state.me?.id || '';
+    const epoch  = _roomEpoch;
+    const result = await MiutCryptoBridge.encryptText(_text, code, sid, epoch, _roomSalt || undefined);
+    const out    = `x1:${_b64uEnc(result.data)}`;
 
     // PART 5: afterEncrypt hook
-    if (typeof runHooks === 'function') await runHooks('afterEncrypt', { result, epoch });
+    if (typeof runHooks === 'function') await runHooks('afterEncrypt', { result: out, epoch });
 
-    return result;
+    return out;
   } catch { return ''; }
 }
-async function dec(payload, code) {
+async function dec(payload, code, senderId) {
   if (!payload) return '';
   try {
-    if (payload.startsWith('e') && /^e\d+:/.test(payload)) {
-      const colon = payload.indexOf(':');
-      const epoch = parseInt(payload.slice(1, colon), 10);
-      const raw   = _b64uDec(payload.slice(colon + 1));
-      const key   = await _getEpochKey(code, epoch);
-      const pt    = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12) }, key, raw.slice(12));
-      // Reverse substitution cipher, then decompress
-      const tbl   = await _getSubstTable(code);
-      const unsubstituted = _applySubst(new Uint8Array(pt), tbl.rev);
-      return await _decompress(unsubstituted);
+    if (payload.startsWith('x1:')) {
+      await MiutCryptoBridge.init();
+      const raw = _b64uDec(payload.slice(3));
+      return await MiutCryptoBridge.decryptText(raw, code, senderId || '', _roomEpoch, _roomSalt || undefined);
     }
     return '[legacy encrypted — rejoin room to continue]';
   } catch { return '[encrypted]'; }
@@ -633,12 +545,22 @@ async function initSigningKey() {
       req.onsuccess = res; req.onerror = rej;
     });
   } catch (e) {
-
-    _sigPrivKey = null; _pubKeyB64 = null;
+    // A transient failure here (IDB blocked by another tab, quota hit,
+    // private-browsing restrictions, etc.) used to unconditionally null
+    // out _sigPrivKey/_pubKeyB64 — including when this function was being
+    // re-run on a reconnect and a working key from earlier in the session
+    // already existed. That silently turned off signing (and stopped
+    // publishing a pubKey) for the rest of the session even though nothing
+    // was actually wrong with the key itself. Only clear if we don't
+    // already have a usable key.
+    if (!_sigPrivKey || !_pubKeyB64) {
+      _sigPrivKey = null; _pubKeyB64 = null;
+    }
   }
 }
 
 async function signMsg(senderId, ts, encText) {
+  if (!_sigPrivKey) await initSigningKey(); // lazy retry — idempotent, loads the existing keypair rather than generating a new one
   if (!_sigPrivKey) return null;
   try {
     const buf = new TextEncoder().encode(`${senderId}|${ts}|${encText}`);
@@ -942,12 +864,16 @@ async function checkRateLimit(type) {
     }
 
     if (!res.ok) {
-      // Non-429 error from edge (500, etc.) — log and allow locally so a
-      // temporary edge outage does not block all users
+      // Non-429 error from edge (500, rate_limiter_unavailable, etc.) —
+      // explicit decision: allow locally so a temporary edge outage does
+      // not block all users. The local token bucket above is still in
+      // effect, it's just no longer backed by the edge for this attempt.
+      console.warn('[MiutRL] edge rate limiter unavailable (HTTP ' + res.status + ') — falling back to local-only limiting');
     }
   } catch (err) {
-    // Network error or timeout — fall through to local-only mode
+    // Network error or timeout — same explicit fallback as above
     if (err.name !== 'AbortError') {
+      console.warn('[MiutRL] edge rate limiter unreachable — falling back to local-only limiting:', err.message);
     }
   }
 
@@ -1466,28 +1392,6 @@ async function handleEnter() {
   const code = ($('input-room-code')?.value || '').trim();
   if (!validateRoomCode(code)) return;
 
-  // ── Vault passkey check (before any Firebase call) ──────────────
-  try {
-    const vr = await fetch('/api/vault-check', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: code }),
-      signal: AbortSignal.timeout ? AbortSignal.timeout(3000) : undefined,
-    });
-    if (vr.ok) {
-      const vd = await vr.json();
-      if (vd.vault === true) {
-        // Open vault as in-app screen — never redirects to a URL
-        _vaultToken = vd.token || '1';
-        $('input-room-code') && ($('input-room-code').value = '');
-        showScreen('vault-screen');
-        _vaultInit();
-        return;
-      }
-    }
-  } catch { /* vault check timed out or failed — treat as normal room code */ }
-  // ─────────────────────────────────────────────────────────────────
-
   const btn = $('btn-enter');
   setLoading(btn, true, 'Connecting…');
   try {
@@ -1934,7 +1838,7 @@ async function blockMember(uid, name) {
 async function _pubKeyFingerprint(pubB64) {
   if (!pubB64) return null;
   try {
-    const raw = Uint8Array.from(atob(pubB64), c => c.charCodeAt(0));
+    const raw = _b64uDec(pubB64);
     const hash = await crypto.subtle.digest('SHA-256', raw);
     const hex = [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
     return hex.slice(0, 20).match(/.{1,4}/g).join(' ').toUpperCase();
@@ -3276,407 +3180,6 @@ function _ping(event) {
 }
 
 
-// ════════════════════════════════════════════════════════════════════════════
-// VAULT ENGINE — client-side encrypted file/note storage
-// Embedded in index.html as vault-screen, only reachable via VAULT_PASSKEY.
-// Storage: IndexedDB (persistent across sessions — files stored as encrypted blobs)
-// Crypto: PBKDF2(250k) → AES-256-GCM per folder
-// ════════════════════════════════════════════════════════════════════════════
-
-let _vaultCurrentFolder = null; // { id, name, password }
-
-// ── Vault Firestore helpers (root /vault collection) ───────────────────────
-// Uses the primary Firestore db for the vault owner's UID.
-// Each folder doc: /vault/{folderId}
-// Each file doc:   /vault/{folderId}/files/{fileId}
-// Security: Firestore rules must allow: if request.auth.uid == resource.data.uid
-
-async function _vaultDb() {
-  // Use first active DB for vault storage
-  const dbs = (window.__MIUT_DB_CONFIGS__ || []).filter(d => d.active);
-  if (!dbs.length) throw new Error('No Firestore database available');
-  return firebase.firestore(firebase.app(dbs[0].name));
-}
-
-async function _vaultGetUID() {
-  return getUID(); // reuse app.js getUID
-}
-
-async function _vaultDbGetAll(collection) {
-  const fs  = await _vaultDb();
-  const uid = await _vaultGetUID();
-  const snap = await fs.collection('vault').where('uid','==',uid).get();
-  if (collection === 'folders') {
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  }
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-async function _vaultGetFolders() {
-  const fs  = await _vaultDb();
-  const uid = await _vaultGetUID();
-  const snap = await fs.collection('vault').where('uid','==',uid).orderBy('ts','asc').get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-async function _vaultGetFiles(folderId) {
-  const fs  = await _vaultDb();
-  const snap = await fs.collection('vault').doc(folderId).collection('files').orderBy('ts','asc').get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-async function _vaultSaveFolder(obj) {
-  const fs  = await _vaultDb();
-  const uid = await _vaultGetUID();
-  const ref = obj.id
-    ? fs.collection('vault').doc(obj.id)
-    : fs.collection('vault').doc();
-  await ref.set({ ...obj, uid, id: ref.id }, { merge: true });
-  return ref.id;
-}
-
-async function _vaultSaveFile(folderId, obj) {
-  const fs  = await _vaultDb();
-  const ref = obj.id
-    ? fs.collection('vault').doc(folderId).collection('files').doc(obj.id)
-    : fs.collection('vault').doc(folderId).collection('files').doc();
-  await ref.set({ ...obj, id: ref.id }, { merge: true });
-  return ref.id;
-}
-
-async function _vaultDeleteFolder(folderId) {
-  const fs  = await _vaultDb();
-  // Delete all files first
-  const filesSnap = await fs.collection('vault').doc(folderId).collection('files').get();
-  const batch = fs.batch();
-  filesSnap.docs.forEach(d => batch.delete(d.ref));
-  batch.delete(fs.collection('vault').doc(folderId));
-  await batch.commit();
-}
-
-async function _vaultDeleteFileFs(folderId, fileId) {
-  const fs = await _vaultDb();
-  await fs.collection('vault').doc(folderId).collection('files').doc(fileId).delete();
-}
-
-// ── Crypto ─────────────────────────────────────────────────────────────────
-// Hash password for folder auth check (SHA-256 of salt+pw as hex string)
-async function _vaultHashPw(pw, salt) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + pw));
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
-}
-
-async function _vaultDeriveKey(password, salt) {
-  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name:'PBKDF2', salt, iterations:250000, hash:'SHA-256' },
-    base, { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']
-  );
-}
-
-async function _vaultEncryptBuf(buf, password) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv   = crypto.getRandomValues(new Uint8Array(12));
-  const key  = await _vaultDeriveKey(password, salt);
-  const ct   = new Uint8Array(await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, buf));
-  // pack: salt(16) + iv(12) + ct
-  const out  = new Uint8Array(16 + 12 + ct.length);
-  out.set(salt, 0); out.set(iv, 16); out.set(ct, 28);
-  return out;
-}
-
-async function _vaultDecryptBuf(packed, password) {
-  const salt = packed.slice(0, 16), iv = packed.slice(16, 28), ct = packed.slice(28);
-  const key  = await _vaultDeriveKey(password, salt);
-  return new Uint8Array(await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, ct));
-}
-
-function _vaultU8toB64(u8) {
-  let s = ''; for (const b of u8) s += String.fromCharCode(b);
-  return btoa(s);
-}
-function _vaultB64toU8(s) { return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
-
-// ── Render ─────────────────────────────────────────────────────────────────
-async function _vaultInit() {
-  _vaultCurrentFolder = null;
-  await _vaultRenderFolders();
-}
-
-async function _vaultRenderFolders() {
-  _vaultCurrentFolder = null;
-  const content = $('vault-content');
-  if (!content) return;
-  content.innerHTML = '<div class="vault-loading">Loading…</div>';
-  const folders = await _vaultGetFolders().catch(() => []);
-  if (!folders.length) {
-    content.innerHTML = `<div class="vault-empty">
-      <svg viewBox="0 0 48 48" fill="none" width="52" height="52" style="opacity:.25;margin-bottom:14px">
-        <rect x="4" y="14" width="40" height="28" rx="4" stroke="currentColor" stroke-width="2"/>
-        <circle cx="24" cy="28" r="6" stroke="currentColor" stroke-width="2"/>
-        <path d="M16 14v-3a8 8 0 0116 0v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-        <circle cx="24" cy="28" r="2" fill="currentColor"/>
-      </svg>
-      <div style="font-family:var(--fui);font-size:.72rem;letter-spacing:2px;color:var(--text2)">No folders yet</div>
-      <div style="font-size:.64rem;color:var(--text2);margin-top:6px">Tap + to create one</div>
-    </div>`;
-    return;
-  }
-  content.innerHTML = `<div class="vault-folder-grid">${folders.map(f => `
-    <div class="vault-folder-card" data-id="${esc(f.id)}">
-      <div class="vault-folder-icon">
-        <svg viewBox="0 0 24 24" fill="none" width="22" height="22">
-          <path d="M3 7a2 2 0 012-2h4.5l2 2H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.5"/>
-        </svg>
-      </div>
-      <div class="vault-folder-info">
-        <div class="vault-folder-name">${esc(f.name)}</div>
-        <div class="vault-folder-meta">${f.fileCount||0} file${(f.fileCount||0)!==1?'s':''}</div>
-      </div>
-      <button class="vault-folder-del" data-del="${esc(f.id)}" title="Delete folder">
-        <svg viewBox="0 0 16 16" fill="none" width="13" height="13"><path d="M3 5h10M6 5V3h4v2M5 5l.7 8h4.6L11 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-      </button>
-    </div>`).join('')}</div>`;
-  content.querySelectorAll('.vault-folder-card').forEach(c => {
-    c.addEventListener('click', e => {
-      if (e.target.closest('[data-del]')) return;
-      const id = c.dataset.id;
-      const folder = folders.find(f => f.id === id);
-      if (folder) _vaultOpenFolderPrompt(folder);
-    });
-  });
-  content.querySelectorAll('[data-del]').forEach(b => {
-    b.addEventListener('click', e => { e.stopPropagation(); _vaultDeleteFolderUI(b.dataset.del); });
-  });
-}
-
-function _vaultFabClick() {
-  // This function is called SYNCHRONOUSLY from a click event — no async allowed
-  // before .click() on mobile browsers.
-  if (_vaultCurrentFolder) {
-    const fi = document.getElementById('vault-file-input');
-    if (fi) fi.click();  // synchronous — triggers file picker immediately
-  } else {
-    _vaultNewFolderPrompt();
-  }
-}
-
-function _vaultNewFolderPrompt() {
-  _vaultShowModal('NEW FOLDER', `
-    <div class="vault-field"><label>FOLDER NAME</label>
-      <div class="vault-input-wrap"><input type="text" id="vf-name" placeholder="e.g. Private Notes" maxlength="60" autocomplete="off" autocapitalize="off"/></div>
-    </div>
-    <div class="vault-field"><label>PASSWORD <span class="vault-lbl-opt">— encrypts all files in this folder</span></label>
-      <div class="vault-input-wrap"><input type="password" id="vf-pw" placeholder="Strong passphrase" maxlength="128"/></div>
-    </div>
-    <div class="vault-field"><label>CONFIRM PASSWORD</label>
-      <div class="vault-input-wrap"><input type="password" id="vf-pw2" placeholder="Repeat passphrase" maxlength="128"/></div>
-    </div>
-    <div class="vault-err" id="vf-err"></div>
-    <button class="vault-btn-primary" id="vf-submit">Create Encrypted Folder</button>`, async () => {
-    const name = $('vf-name')?.value?.trim() || '';
-    const pw   = $('vf-pw')?.value  || '';
-    const pw2  = $('vf-pw2')?.value || '';
-    const err  = $('vf-err');
-    if (!name) { err.textContent = 'Folder name required'; return false; }
-    if (pw.length < 6) { err.textContent = 'Password must be ≥6 characters'; return false; }
-    if (pw !== pw2) { err.textContent = 'Passwords do not match'; return false; }
-    const salt   = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    const pwHash = await _vaultHashPw(pw, salt);
-    await _vaultSaveFolder({ name, pwHash, pwSalt: salt, fileCount:0, ts: Date.now() });
-    toast('Folder created', name, 'lock');
-    await _vaultRenderFolders();
-    return true;
-  });
-  setTimeout(() => $('vf-name')?.focus(), 80);
-}
-
-async function _vaultDeleteFolderUI(folderId) {
-  await _vaultDeleteFolder(folderId);
-  toast('Folder deleted', '', 'trash');
-  await _vaultRenderFolders();
-}
-
-async function _vaultOpenFolderPrompt(folder) {
-  _vaultShowModal('UNLOCK FOLDER', `
-    <div style="font-family:var(--fui);font-size:.84rem;font-weight:700;color:var(--text);margin-bottom:16px;letter-spacing:1px">${esc(folder.name)}</div>
-    <div class="vault-field"><label>FOLDER PASSWORD</label>
-      <div class="vault-input-wrap"><input type="password" id="vu-pw" placeholder="Enter password" maxlength="128" autocomplete="off"/></div>
-    </div>
-    <div class="vault-err" id="vu-err"></div>
-    <button class="vault-btn-primary" id="vu-submit">Unlock</button>`, async () => {
-    const pw  = $('vu-pw')?.value || '';
-    const err = $('vu-err');
-    if (!pw) { err.textContent = 'Enter password'; return false; }
-    // Verify password matches stored (attempt decrypt of a test payload)
-    // Verify password: check hash stored on folder
-    const hash = await _vaultHashPw(pw, folder.pwSalt || folder.id);
-    if (hash !== folder.pwHash) { err.textContent = 'Wrong password'; return false; }
-    _vaultCurrentFolder = { ...folder, password: pw };
-    _vaultCloseModal();
-    await _vaultRenderFiles();
-    return true;
-  });
-  setTimeout(() => $('vu-pw')?.focus(), 80);
-}
-
-async function _vaultRenderFiles() {
-  const content = $('vault-content');
-  if (!content || !_vaultCurrentFolder) return;
-  const files = await _vaultGetFiles(_vaultCurrentFolder.id).catch(() => []);
-
-  content.innerHTML = `
-    <div class="vault-folder-header">
-      <button class="vault-back-btn" id="vault-back-btn">← Folders</button>
-      <span class="vault-folder-title">${esc(_vaultCurrentFolder.name)}</span>
-    </div>
-    <div class="vault-drop-zone" id="vault-drop-zone">
-      <svg viewBox="0 0 24 24" fill="none" width="28" height="28" style="opacity:.4;margin-bottom:8px">
-        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-      </svg>
-      <span style="font-size:.72rem;color:var(--text2)">Drop files or <strong style="color:var(--teal)">tap to upload</strong></span>
-    </div>
-    <div class="vault-file-list" id="vault-file-list">${files.length ? files.map(f => _vaultFileItemHtml(f)).join('') : '<div style="text-align:center;padding:24px;font-size:.68rem;color:var(--text2)">No files yet</div>'}</div>`;
-
-  $('vault-back-btn').addEventListener('click', () => { _vaultCurrentFolder = null; _vaultRenderFolders(); });
-
-  // Drop zone
-  const dz = $('vault-drop-zone');
-  const fi = document.getElementById('vault-file-input'); // permanent element
-  if (dz) {
-    dz.addEventListener('click', () => fi?.click());
-    dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('drag-over'); });
-    dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
-    dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); _vaultUploadFiles(Array.from(e.dataTransfer.files)); });
-  }
-
-  // File actions
-  content.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', () => _vaultDownloadFile(b.dataset.dl)));
-  content.querySelectorAll('[data-fdel]').forEach(b => b.addEventListener('click', () => _vaultDeleteFile(b.dataset.fdel)));
-}
-
-function _vaultFileItemHtml(f) {
-  return `<div class="vault-file-item" id="vfi-${esc(f.id)}">
-    <div class="vault-file-icon">${_vaultFileIconSvg(f.mime)}</div>
-    <div class="vault-file-info">
-      <div class="vault-file-name">${esc(f.name)}</div>
-      <div class="vault-file-meta">${_fmtBytes(f.size)}</div>
-    </div>
-    <button class="vault-file-act" data-dl="${esc(f.id)}" title="Download">
-      <svg viewBox="0 0 16 16" fill="none" width="14" height="14"><path d="M8 2v8M5 8l3 3 3-3M3 13h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-    </button>
-    <button class="vault-file-act danger" data-fdel="${esc(f.id)}" title="Delete">
-      <svg viewBox="0 0 16 16" fill="none" width="14" height="14"><path d="M3 5h10M6 5V3h4v2M5 5l.7 8h4.6L11 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-    </button>
-  </div>`;
-}
-
-function _vaultFileIconSvg(mime) {
-  if (!mime) return '<svg viewBox="0 0 16 16" fill="none" width="14" height="14"><path d="M4 2h6l4 4v9a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" stroke-width="1.3"/></svg>';
-  if (mime.startsWith('image/')) return '<svg viewBox="0 0 16 16" fill="none" width="14" height="14"><rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.3"/><circle cx="6" cy="6" r="1.5" fill="currentColor"/><path d="M2 11l4-4 3 3 2-2 3 2" stroke="currentColor" stroke-width="1.2"/></svg>';
-  if (mime.startsWith('video/')) return '<svg viewBox="0 0 16 16" fill="none" width="14" height="14"><rect x="1" y="4" width="10" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3"/><path d="M11 7l4-2v6l-4-2V7z" stroke="currentColor" stroke-width="1.3"/></svg>';
-  if (mime.includes('pdf'))    return '<svg viewBox="0 0 16 16" fill="none" width="14" height="14"><path d="M4 2h5l4 4v9H4V2z" stroke="currentColor" stroke-width="1.3"/><path d="M9 2v4h4" stroke="currentColor" stroke-width="1.3"/></svg>';
-  return '<svg viewBox="0 0 16 16" fill="none" width="14" height="14"><path d="M4 2h6l4 4v9a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" stroke-width="1.3"/><path d="M9 2v4h4" stroke="currentColor" stroke-width="1.3"/></svg>';
-}
-
-function _fmtBytes(n) {
-  if (!n) return ''; if (n<1024) return n+'B'; if (n<1048576) return (n/1024).toFixed(1)+'KB'; return (n/1048576).toFixed(1)+'MB';
-}
-
-async function _vaultUploadFiles(files) {
-  if (!_vaultCurrentFolder) return;
-  for (const file of files) {
-    try {
-      toast('Encrypting…', file.name, 'dot');
-      const buf = await file.arrayBuffer();
-      const enc = await _vaultEncryptBuf(new Uint8Array(buf), _vaultCurrentFolder.password);
-      await _vaultSaveFile(_vaultCurrentFolder.id, {
-        name: file.name, mime: file.type,
-        size: file.size, enc: _vaultU8toB64(enc), ts: Date.now(),
-      });
-      // Update folder file count
-      await _vaultSaveFolder({
-        id: _vaultCurrentFolder.id,
-        fileCount: (_vaultCurrentFolder.fileCount||0)+1,
-      });
-      _vaultCurrentFolder.fileCount = (_vaultCurrentFolder.fileCount||0)+1;
-      toast('Saved', file.name, 'ok');
-    } catch(e) { toast('Failed', file.name, 'err'); }
-  }
-  await _vaultRenderFiles();
-}
-
-async function _vaultDownloadFile(fileId) {
-  const allFiles = await _vaultDbGetAll('files');
-  const f = allFiles.find(x => x.id === fileId);
-  if (!f || !_vaultCurrentFolder) return;
-  try {
-    const plain = await _vaultDecryptBuf(_vaultB64toU8(f.enc), _vaultCurrentFolder.password);
-    const blob  = new Blob([plain], { type: f.mime || 'application/octet-stream' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = f.name;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  } catch { toast('Decrypt failed', 'Wrong password or corrupted file', 'err'); }
-}
-
-async function _vaultDeleteFile(fileId) {
-  if (!_vaultCurrentFolder) return;
-  await _vaultDeleteFileFs(_vaultCurrentFolder.id, fileId);
-  if (_vaultCurrentFolder.fileCount > 0) {
-    _vaultCurrentFolder.fileCount--;
-    await _vaultSaveFolder({ id: _vaultCurrentFolder.id, fileCount: _vaultCurrentFolder.fileCount });
-  }
-  document.getElementById('vfi-' + fileId)?.remove();
-  toast('File deleted', '', 'trash');
-}
-
-// ── Vault modal helper ─────────────────────────────────────────────────────
-let _vaultModalSubmitFn = null;
-
-function _vaultShowModal(title, bodyHtml, onSubmit) {
-  // The overlay is a static HTML element INSIDE vault-screen (same stacking context).
-  // This is critical — dynamically appending to body puts it in a DIFFERENT stacking
-  // context than .screen.active (which has will-change:transform), making it invisible.
-  const overlay = document.getElementById('vault-modal-overlay');
-  const titleEl = document.getElementById('vault-modal-title');
-  const bodyEl  = document.getElementById('vault-modal-body');
-  if (!overlay || !titleEl || !bodyEl) {
-    console.error('[Vault] Modal elements missing from DOM');
-    return;
-  }
-  titleEl.textContent = title;
-  bodyEl.innerHTML    = bodyHtml;
-  overlay.style.display = 'flex';
-  _vaultModalSubmitFn   = onSubmit;
-
-  // Wire submit — fresh listener each time since innerHTML replaces nodes
-  const sub = bodyEl.querySelector('[id$="-submit"]');
-  if (sub) {
-    sub.addEventListener('click', async () => {
-      if (sub.disabled) return;
-      sub.disabled = true;
-      const errEl = bodyEl.querySelector('.vault-err');
-      try {
-        const ok = await (_vaultModalSubmitFn?.() ?? false);
-        if (ok) _vaultCloseModal();
-      } catch(e) {
-        if (errEl) errEl.textContent = e.message || 'Error';
-      } finally { sub.disabled = false; }
-    });
-  }
-
-  // Focus first text input
-  requestAnimationFrame(() => bodyEl.querySelector('input:not([type=hidden])')?.focus());
-}
-
-function _vaultCloseModal() {
-  const ov = document.getElementById('vault-modal-overlay');
-  if (ov) ov.style.display = 'none';
-  _vaultModalSubmitFn = null;
-}
-
 // ── Multi-select action bar ─────────────────────────────────────────────────
 function _enterSelectMode() {
   if (_selectMode) return;
@@ -4013,11 +3516,29 @@ async function sendMessage() {
       // Message-count-based epoch rotation is tracked in the live listener
       // (startChatListeners) instead of here — see the comment there for why.
     })
-    .catch(e => {
-      _markMessageFailed(_localId);
-      toast('Send failed', e.message, 'err');
-    });
+    .catch(e => _handleSendFailure(_localId, state.roomCode, e));
   playSound('send');
+}
+
+/** Common failure path for both the first send attempt and tap-to-retry.
+ * If the error is quota-shaped, waits for db-manager's migration to land
+ * on a healthy shard, then rebinds the LIVE session — the global `db` and
+ * the active listeners — onto it before giving up, so the room actually
+ * keeps working instead of failing forever until a page reload. */
+async function _handleSendFailure(localId, roomCode, e) {
+  _markMessageFailed(localId);
+  const _dbName = window.getCurrentDbName?.(roomCode);
+  if (_dbName) {
+    const newDb = await window.reportDbError?.(roomCode, _dbName, e);
+    if (newDb && state.roomCode === roomCode) {
+      db = newDb;
+      stopListeners();
+      startListeners();
+      toast('Switched servers', 'This room hit its daily limit and moved to another server — tap the failed message to resend.', 'warn');
+      return;
+    }
+  }
+  toast('Send failed', e.message, 'err');
 }
 
 const _pendingMsgPayloads = new Map(); // localId → full msgData, kept only until reconciled (for tap-to-retry)
@@ -4077,7 +3598,7 @@ function _retrySendFailed(localId) {
       _pendingByTs.delete(msgData.ts);
       _reconcileSentMessage(localId, ref.id, msgData);
     })
-    .catch(e => { _markMessageFailed(localId); toast('Send failed', e.message, 'err'); });
+    .catch(e => _handleSendFailure(localId, state.roomCode, e));
 }
 async function sendSys(text, roomCodeOverride, meOverride) {
   // Optional overrides let callers running after global `state` has been
@@ -4087,7 +3608,7 @@ async function sendSys(text, roomCodeOverride, meOverride) {
   const _me       = meOverride || state.me;
   if (!_roomCode || !_me?.id) return;
   const _sts  = Date.now();
-  const _senc = await enc(text, _roomCode);
+  const _senc = await enc(text, _roomCode, _me.id);
   // senderId required by Firestore rules (hasAll check on messages create)
   await db.collection('rooms').doc(_roomCode).collection('messages').add({
     type:      'system',
@@ -4440,7 +3961,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
     // This blocks injected system messages via direct Firestore REST writes
     // (Attack 4): an injected message without the room code will fail
     // AES-GCM auth tag verification and render as '[encrypted]'.
-    const text = await dec(data.enc, state.roomCode);
+    const text = await dec(data.enc, state.roomCode, data.senderId);
     div.innerHTML = `<span>${esc(text)}</span>`;
     (insertBeforeEl && insertBeforeEl.parentNode === area) ? area.insertBefore(div, insertBeforeEl) : area.appendChild(div);
     return;
@@ -4473,7 +3994,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
   }
 
   // Decoded text (used for reply preview)
-  const plainText = data.type === 'text' ? await dec(data.enc, state.roomCode) : null;
+  const plainText = data.type === 'text' ? await dec(data.enc, state.roomCode, data.senderId) : null;
 
   let bubble = '';
   let replyQuote = '';
@@ -4495,7 +4016,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
       const fname = data.replyTo.fileName ? ': ' + esc(data.replyTo.fileName.length > 20 ? data.replyTo.fileName.slice(0, 20) + '…' : data.replyTo.fileName) : '';
       rqContent = `<div class="rq-media"><svg viewBox="0 0 20 20" fill="none" width="12" height="12"><path d="M4 4a2 2 0 012-2h5l5 5v9a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" stroke="currentColor" stroke-width="1.4"/><path d="M11 2v5h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg> ${label}${fname}</div>`;
     } else {
-      const qText = data.replyTo.enc ? await dec(data.replyTo.enc, state.roomCode) : '';
+      const qText = data.replyTo.enc ? await dec(data.replyTo.enc, state.roomCode, data.senderId) : '';
       rqContent = `<div class="rq-text">${esc(qText.length > 60 ? qText.slice(0, 60) + '…' : qText)}</div>`;
     }
     }
@@ -4939,7 +4460,7 @@ async function patchMsg(id, data) {
   if (data.readBy) _renderReadBadge(wrapEl, data.readBy);
   if (data.edited && data.type === 'text') {
     const bubble = wrapEl.querySelector('.msg-bubble');
-    if (bubble) bubble.innerHTML = renderTextContent(await dec(data.enc, state.roomCode)) + '<span class="msg-edited"> ✎</span>';
+    if (bubble) bubble.innerHTML = renderTextContent(await dec(data.enc, state.roomCode, data.senderId)) + '<span class="msg-edited"> ✎</span>';
     if (data.sig) requestAnimationFrame(() => verifyAndBadge(data, id));
   }
 }
@@ -6608,12 +6129,6 @@ function _wireAllHandlers() {
     });
   });
 
-  // Vault
-  on('vault-exit-btn',    'click', () => { _vaultToken = null; showScreen('join-screen'); });
-  on('vault-fab',         'click', _vaultFabClick);          // sync, no arrow fn wrapper
-  on('vault-modal-close', 'click', _vaultCloseModal);
-  on('vault-modal-overlay','click', e => { if (e.target.id === 'vault-modal-overlay') _vaultCloseModal(); });
-  on('vault-file-input',  'change', e => { _vaultUploadFiles(Array.from(e.target.files)); e.target.value = ''; });
 
   on('sound-toggle',    'change', () => toggleSoundAlerts());
   on('anim-toggle',     'change', () => toggleAnimations());
