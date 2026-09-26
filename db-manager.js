@@ -3,19 +3,30 @@
 /**
  * Miut — db-manager.js
  * ═══════════════════════════════════════════════════════════════
- * Multi-database manager. Currently one database is active.
- * Add DB1 and DB2 configs when ready — the manager will
- * automatically distribute rooms across all active databases
- * and fall back if one is unavailable.
+ * Multi-database (shard) manager, sized to N shards with zero code
+ * changes: adding FIREBASE_DBn_* env vars in the Cloudflare Pages
+ * dashboard (see config.js) makes shard N appear here automatically.
  *
- * How distribution works:
- *   roomIndex = hash(roomCode) % activeDbCount
- *   Same room code → same database, always, deterministically.
+ * Room → shard resolution, in priority order:
+ *   1. In-memory cache for this tab (instant, no network).
+ *   2. Server-side authoritative registry (shard-registry.js, backed by
+ *      Cloudflare KV) — the source of truth every member's browser and
+ *      every device agrees on. New rooms are placed on whichever active
+ *      shard has the least load and isn't flagged degraded.
+ *   3. This browser's own localStorage binding — used only if the
+ *      registry is unreachable, so a KV outage degrades to "this browser
+ *      remembers where it left off" rather than breaking room access.
+ *   4. Deterministic hash across active shards — last resort for a room
+ *      neither the registry nor localStorage has ever seen.
  *
- * How fallback works:
- *   If the primary database for a room fails, the next one in
- *   the list is tried. The working database is cached per-room
- *   for the session lifetime.
+ * Quota handling: if a shard returns a Firestore quota-exhaustion error
+ * (resource-exhausted), the affected room is migrated to a healthy shard
+ * via migrate-room.js (server-side, Firestore REST API) and every
+ * subsequent lookup — from any device — resolves to the new shard. See
+ * migrate-room.js's file header for exactly what this can and can't
+ * recover (short version: it needs the source shard's READS to still
+ * work; if those are also exhausted, nothing server-side or client-side
+ * can read that data until Firestore's own daily quota reset).
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -223,6 +234,149 @@ function _onFail(name, err) {
   h.cooldownUntil = Date.now() + (_COOLDOWNS[Math.min(h.fails - 1, _COOLDOWNS.length - 1)]);
 }
 
+/* ── Server-side authoritative shard registry (shard-registry.js) ─────────
+ * Everything above (hash + localStorage) stabilizes a room against shard
+ * additions/removals FOR ONE BROWSER. It can't tell a second member's
+ * browser, or the same person on a different device, that a room moved —
+ * only a server-side record can do that. This is that record.
+ *
+ * getDb() tries the registry FIRST (small network round trip, cheap KV
+ * read) and only falls back to localStorage/hash if the registry is
+ * unreachable — correctness across devices/members matters more here than
+ * shaving off a network round trip, especially right after a migration.
+ * ────────────────────────────────────────────────────────────────────── */
+async function _registryCall(body, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs || 2500);
+  try {
+    const res = await fetch('/api/shard-registry', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error('shard-registry HTTP ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function _resolveViaRegistry(roomCode) {
+  const data = await _registryCall({ action: 'resolve', roomCode });
+  if (!data || !data.db) throw new Error('shard-registry returned no db');
+  return data; // { db, isNew }
+}
+
+function _bindRegistry(roomCode, dbName) {
+  // Fire-and-forget — a failed write here just means the NEXT resolve()
+  // falls through to hash/localStorage for this room, not a hard failure.
+  _registryCall({ action: 'bind', roomCode, db: dbName }, 4000).catch(() => {});
+}
+
+const _reportedDegraded = new Set(); // per-tab de-dupe, avoids hammering the registry
+function _reportShardDegraded(dbName) {
+  if (_reportedDegraded.has(dbName)) return;
+  _reportedDegraded.add(dbName);
+  setTimeout(() => _reportedDegraded.delete(dbName), 10 * 60 * 1000); // re-report after 10 min if still broken
+  _registryCall({ action: 'report-error', db: dbName }, 4000).catch(() => {});
+}
+
+/* ── Quota-error detection ──────────────────────────────────────────────
+ * Firestore's client SDK surfaces a hard daily-quota rejection as
+ * err.code === 'resource-exhausted' (sometimes 'permission-denied' if App
+ * Check/rules reject first, but that's not quota-specific so it's
+ * deliberately excluded here to avoid false-triggering migrations on
+ * unrelated permission problems). */
+function _isQuotaError(err) {
+  return !!err && (err.code === 'resource-exhausted' || /RESOURCE_EXHAUSTED/i.test(err.message || ''));
+}
+
+/* ── Server-side migration (migrate-room.js) ──────────────────────────────
+ * Copies a room's data to a healthy shard via the Firestore REST API at
+ * the edge — works even if every browser tab for that room has since
+ * closed. See migrate-room.js's file header for exactly what this can and
+ * cannot guarantee (short version: if the SOURCE shard's READS are also
+ * exhausted, not just writes, the data genuinely can't be read by anyone
+ * until Firestore's own daily reset — no client trick changes that). */
+async function _migrateRoom(roomCode, fromName, toName) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25000); // REST copy of a room can take a few seconds
+  try {
+    const res = await fetch('/api/migrate-room', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomCode, from: fromName, to: toName }),
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || ('migrate-room HTTP ' + res.status));
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Best alternate shard to migrate a room TO — healthy, and not the one it's leaving. */
+function _bestAlternateShard(excludeName) {
+  const candidates = _ACTIVE_DBS.filter(d => d.name !== excludeName && _healthy(d.name));
+  if (!candidates.length) return null;
+  // Prefer whichever has failed least recently / least often — same signal
+  // getDb's own fallback ordering already uses.
+  candidates.sort((a, b) => _health.get(a.name).cooldownUntil - _health.get(b.name).cooldownUntil);
+  return candidates[0];
+}
+
+/**
+ * Called the moment ANY Firestore operation for a room fails with a
+ * quota-shaped error — from getDb's own probe below, or from app.js's
+ * real read/write call sites via window.reportDbError(). This is what
+ * makes migration "instant" rather than waiting for the next room-open:
+ * it fires from the very first real failure, using whatever read budget
+ * the source shard has left RIGHT NOW to get the data out before it's
+ * gone for the rest of the day.
+ */
+const _migrationInFlight = new Map(); // roomCode → Promise, de-dupes concurrent triggers
+async function _handleQuotaError(roomCode, dbName, err) {
+  if (!_isQuotaError(err)) return null;
+  _onFail(dbName, err);
+  _reportShardDegraded(dbName);
+
+  if (!roomCode) return null; // e.g. a probe with no specific room in play
+  if (_migrationInFlight.has(roomCode)) return _migrationInFlight.get(roomCode);
+
+  const dest = _bestAlternateShard(dbName);
+  if (!dest) {
+    console.warn('[MiutDB] Shard', dbName, 'hit quota but no healthy alternate exists — room', roomCode, 'stays put.');
+    return null;
+  }
+
+  const job = (async () => {
+    try {
+      console.warn('[MiutDB] Migrating room', roomCode, 'off', dbName, '(quota) →', dest.name);
+      await _migrateRoom(roomCode, dbName, dest.name);
+      const fs = _initDb(dest);
+      _roomDbCache.set(roomCode, dest.name);
+      _setPersistedBinding(roomCode, dest.name);
+      _bindRegistry(roomCode, dest.name);
+      _onSuccess(dest.name);
+      console.warn('[MiutDB] Migration of', roomCode, 'to', dest.name, 'complete.');
+      return fs;
+    } catch (migErr) {
+      // Per migrate-room.js's own honesty note: if source READS are also
+      // exhausted, this is expected to fail until Firestore's daily reset.
+      console.warn('[MiutDB] Migration of', roomCode, 'failed (will retry on next quota error):', migErr.message);
+      return null;
+    } finally {
+      _migrationInFlight.delete(roomCode);
+    }
+  })();
+  _migrationInFlight.set(roomCode, job);
+  return job;
+}
+
 /* ── Core: resolve the best database for a room code ────────── */
 async function getDb(roomCode) {
   /* Load remote config first (no-op if already loaded) */
@@ -244,6 +398,24 @@ async function getDb(roomCode) {
     if (inst && _healthy(name)) return inst;
     _roomDbCache.delete(roomCode);  // stale — re-probe
   }
+
+  /* Authoritative source of truth: the server-side shard registry. This is
+   * what lets adding shard N+1 in the Cloudflare dashboard start taking
+   * NEW rooms immediately (load-aware placement lives server-side), and
+   * what lets every member's browser — not just whoever triggered it —
+   * learn about a migration. Falls through to localStorage/hash below if
+   * the registry is unreachable (KV outage, offline, etc.) rather than
+   * blocking room access on it. */
+  try {
+    const { db: regName } = await _resolveViaRegistry(roomCode);
+    if (regName && _ACTIVE_DBS.some(d => d.name === regName) && _healthy(regName)) {
+      const cfg = _ACTIVE_DBS.find(d => d.name === regName);
+      const fs = _initDb(cfg);
+      _roomDbCache.set(roomCode, cfg.name);
+      _setPersistedBinding(roomCode, cfg.name);
+      return fs;
+    }
+  } catch { /* registry unreachable — fall through */ }
 
   /* Persisted binding from a previous session takes priority over any
    * fresh hash computation — see _getPersistedBinding's comment for why.
@@ -267,6 +439,7 @@ async function getDb(roomCode) {
     const fs = _initDb({ name, config });
     _roomDbCache.set(roomCode, name);
     _setPersistedBinding(roomCode, name);
+    _bindRegistry(roomCode, name);
     return fs;
   }
 
@@ -290,9 +463,14 @@ async function getDb(roomCode) {
       _onSuccess(cfg.name);
       _roomDbCache.set(roomCode, cfg.name);
       _setPersistedBinding(roomCode, cfg.name);
+      _bindRegistry(roomCode, cfg.name);
       return fs;
     } catch (err) {
       _onFail(cfg.name, err);
+      if (_isQuotaError(err)) {
+        const migrated = await _handleQuotaError(roomCode, cfg.name, err);
+        if (migrated) return migrated;
+      }
     }
   }
 
@@ -402,6 +580,23 @@ window._dbFirebaseReady = new Promise((resolve, reject) => {
 window.getDb         = getDb;
 window.getDbStatus   = getDbStatus;
 window.resetDbHealth = resetDbHealth;
+/**
+ * Call this from any Firestore write/read catch handler in app.js when an
+ * operation fails, e.g.:
+ *   .catch(err => window.reportDbError(state.roomCode, <shard name>, err))
+ * If `err` is quota-shaped, this kicks off migration immediately — often
+ * before the next getDb() call would even happen — and resolves to the
+ * new Firestore instance on success, or null if it wasn't a quota error /
+ * migration wasn't possible right now. Safe to call speculatively on every
+ * Firestore error; non-quota errors are a no-op.
+ */
+window.reportDbError = function (roomCode, dbName, err) {
+  return _handleQuotaError(roomCode, dbName, err);
+};
+/** Which shard is roomCode currently resolved to, for error-reporting call sites. */
+window.getCurrentDbName = function (roomCode) {
+  return _roomDbCache.get(roomCode) || null;
+};
 
 window._dbFirebaseReady.catch(err => {
   // Surface a visible banner so developers immediately see the issue
