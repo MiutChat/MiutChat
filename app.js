@@ -100,17 +100,31 @@ const CONFIG = {
   IDB_VER:            2,
   EDIT_WINDOW_MS:     2 * 60 * 1000,
 };
-let _authReady = null;
+let _authReady = null;               // legacy — kept only for the pre-warm call below
+const _authReadyByDb = new Map();    // dbName → Promise<uid> — auth is PER FIREBASE PROJECT
 
 // Anonymous Auth uses the Firebase compat SDK (script-tag loaded).
 // Compat syntax: firebase.auth(app).signInAnonymously()
 // NOT the ES module syntax (import { getAuth } from "firebase/auth") — that needs a bundler.
-async function ensureAuth() {
-  if (_authReady) return _authReady;
-  _authReady = (async () => {
+//
+// CRITICAL: each shard is a SEPARATE Firebase project, so an anonymous
+// sign-in on one project grants NO identity on another — Firebase Auth
+// UIDs and sessions are per-project, they don't carry over. Signing in
+// once against a single "default" shard and reusing that uid everywhere
+// (the original bug here) means every write to any OTHER shard has
+// request.auth == null there, and every rule requiring isSignedIn()
+// denies it — indistinguishable from "the rules are wrong" until you
+// check that project's Authentication tab and find zero users. So this
+// caches and resolves a separate sign-in PER dbName, and callers must
+// resolve getDb(roomCode) FIRST, then authenticate against that same
+// shard, not the other way around.
+async function ensureAuth(dbName) {
+  const key = dbName || (window.__MIUT_DB_CONFIGS__ || []).find(d => d.active)?.name || 'miut-db0';
+  if (_authReadyByDb.has(key)) return _authReadyByDb.get(key);
+  const p = (async () => {
     if (window._dbFirebaseReady) {
       try { await window._dbFirebaseReady; }
-      catch (e) { _authReady = null; throw e; }
+      catch (e) { _authReadyByDb.delete(key); throw e; }
     } else {
       await Promise.resolve();
       if (typeof firebase === 'undefined') {
@@ -124,10 +138,8 @@ async function ensureAuth() {
       try {
         const uid = await new Promise((resolve, reject) => {
           try {
-            // Use the first active DB's app — supports dynamic config from /api/config
-        const _firstDbName = (window.__MIUT_DB_CONFIGS__ || []).find(d => d.active)?.name || 'miut-db0';
-        const authApp  = firebase.app(_firstDbName);
-        const authInst = firebase.auth(authApp);
+            const authApp  = firebase.app(key);
+            const authInst = firebase.auth(authApp);
             const unsub = authInst.onAuthStateChanged(user => {
               unsub();
               if (user) { resolve(user.uid); return; }
@@ -145,10 +157,11 @@ async function ensureAuth() {
         if (code.startsWith('auth/') && !code.includes('network') && !code.includes('too-many-requests')) break;
       }
     }
-    _authReady = null;
+    _authReadyByDb.delete(key);
     throw lastErr;
-  })().catch(err => { _authReady = null; throw err; });
-  return _authReady;
+  })().catch(err => { _authReadyByDb.delete(key); throw err; });
+  _authReadyByDb.set(key, p);
+  return p;
 }
 
 let state = {
@@ -1021,11 +1034,13 @@ function initials(n)     { return n.trim().split(/\s+/).map(w=>w[0]?.toUpperCase
 const _A=['DARK','FAST','COLD','BOLD','VOID','NEON','GREY','IRON','WILD','FLUX'];
 const _N=['FOX','OWL','RAY','ACE','SKY','KAI','ZEN','MAX','REX','DOT'];
 function genCallsign() { return `${_A[Math.random()*_A.length|0]} ${_N[Math.random()*_N.length|0]}${(Math.random()*90+10)|0}`; }
-// getUID() — always returns the Firebase Anonymous Auth UID.
+// getUID(dbName) — always returns the Firebase Anonymous Auth UID FOR THAT
+// SPECIFIC SHARD. Auth is per-Firebase-project — always resolve getDb(code)
+// first to know which shard a room is on, THEN call getUID(thatDbName).
 // If auth fails (network down, quota exceeded), throws — callers must handle.
 // A localStorage fallback UID has no JWT and fails all Firestore rules.
-async function getUID() {
-  const uid = await ensureAuth(); // throws on auth failure — handled by callers
+async function getUID(dbName) {
+  const uid = await ensureAuth(dbName); // throws on auth failure — handled by callers
   return uid;
 }
 
@@ -1307,10 +1322,13 @@ async function handleCreate() {
   const btn = $('btn-create');
   setLoading(btn, true, 'Creating…');
   try {
-    // getUID() throws if Anonymous Auth is unavailable (network down, not enabled in console)
-    const uid = await getUID();
+    // Resolve the room's SHARD first, then authenticate against THAT
+    // project — getUID() must never be called before getDb() (see
+    // ensureAuth's comment: auth is per-Firebase-project, not global).
     if (typeof getDb !== 'function') throw new Error('Database module not loaded. Please refresh.');
     db = await getDb(code);
+    const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
+    const uid = await getUID(_dbName);
 
     // Room codes are user-chosen (typed in, not randomly generated), so
     // collisions are real: two different people can type the same
@@ -1368,7 +1386,7 @@ async function handleCreate() {
       blockedUsers:     [],       // see blockMember() — ids blocked by the admin, denied re-entry
     });
     _roomEpoch = 0;
-    state.me = await buildMe(resolveName()); state.roomCode = code;
+    state.me = await buildMe(resolveName(), _dbName); state.roomCode = code;
     saveSession(); saveRoom(code);
     await registerPresence('admin', true);
     // Approval gate is always on — no choice presented
@@ -1395,10 +1413,11 @@ async function handleEnter() {
   const btn = $('btn-enter');
   setLoading(btn, true, 'Connecting…');
   try {
-    // Authenticate FIRST — Firestore rules require request.auth != null.
-    // Without this, every read returns permission-denied regardless of room existence.
-    const uid = await getUID();
+    // Resolve the room's SHARD first, then authenticate against THAT
+    // project — see ensureAuth's comment for why order matters here.
     db = await getDb(code);
+    const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
+    const uid = await getUID(_dbName);
     const roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
       _recordWrongCode();
@@ -1425,7 +1444,7 @@ async function handleEnter() {
     const prevData    = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
 
-    state.me = await buildMe(resolveName()); state.roomCode = code;
+    state.me = await buildMe(resolveName(), _dbName); state.roomCode = code;
     saveSession(); saveRoom(code);
 
     if (wasApproved) {
@@ -1460,8 +1479,8 @@ async function handleEnter() {
   finally { setLoading(btn, false); }
 }
 
-async function buildMe(name) {
-  const id = await getUID(); // async Firebase Auth UID
+async function buildMe(name, dbName) {
+  const id = await getUID(dbName); // async Firebase Auth UID, scoped to this room's shard
   return { id, name, color: avatarColor(name), joinedAt: Date.now() };
 }
 
@@ -3532,6 +3551,27 @@ async function _handleSendFailure(localId, roomCode, e) {
     const newDb = await window.reportDbError?.(roomCode, _dbName, e);
     if (newDb && state.roomCode === roomCode) {
       db = newDb;
+      // Migrated to a different Firebase PROJECT — the old uid was never
+      // authenticated there (see ensureAuth's comment), so re-auth against
+      // the new shard before anything else touches it.
+      try {
+        const newDbName = window.getCurrentDbName?.(roomCode) || _dbName;
+        state.me.id = await getUID(newDbName);
+        saveSession();
+        // The migrated member doc is still keyed by the OLD uid (a
+        // different project's identity) — register presence under the
+        // NEW one so isRoomMember() passes going forward. Rules enforce
+        // role='member'/approved=false on first create for a given uid,
+        // so anyone who wasn't already a member on THIS uid re-enters the
+        // approval queue on the new shard — an unavoidable consequence of
+        // Firebase Auth identities being per-project, not a bug in this
+        // patch. Worth a proper fix (a stable app-level id independent of
+        // Firebase Auth) if migrations end up happening often.
+        await registerPresence('member', false).catch(() => {});
+      } catch (authErr) {
+        toast('Switched servers, but re-auth failed', authErr.message, 'err');
+        return;
+      }
       stopListeners();
       startListeners();
       toast('Switched servers', 'This room hit its daily limit and moved to another server — tap the failed message to resend.', 'warn');
@@ -5306,9 +5346,11 @@ async function joinFromInvite() {
   if (btn) { btn.disabled = true; const sp = btn.querySelector('span'); if (sp) sp.textContent = 'Joining…'; }
 
   try {
-    // Auth before read — required by Firestore security rules
-    const uid = await getUID();
+    // Resolve the room's SHARD first, then authenticate against THAT
+    // project — see ensureAuth's comment for why order matters here.
     db = await getDb(code);
+    const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
+    const uid = await getUID(_dbName);
     const roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
       _recordWrongCode();
@@ -5330,7 +5372,7 @@ async function joinFromInvite() {
     const prevData   = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
 
-    state.me = await buildMe(resolveName()); state.roomCode = code;
+    state.me = await buildMe(resolveName(), _dbName); state.roomCode = code;
     saveSession(); saveRoom(code);
 
     window.history.replaceState({}, '', window.location.pathname);
