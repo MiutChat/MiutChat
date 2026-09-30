@@ -119,12 +119,24 @@ service cloud.firestore {
         // never be dereferenced (resource.data.role) in that branch —
         // that's a known Firestore rules footgun that silently denies
         // instead of erroring loudly.
+        //
+        // registerPresence() in app.js does NOT set role='admin' on the
+        // initial create — it always creates as role='member', then sends
+        // a SEPARATE update() escalating to 'admin' right after, for the
+        // room creator specifically. So the update branch below needs its
+        // own creator carve-out too, not just the create branch — the
+        // creator isn't isRoomAdmin(roomCode) yet at the exact moment of
+        // that escalating update (their own role is still 'member' in the
+        // currently-committed doc this rule evaluates against), so
+        // without this they can never actually become admin.
         allow write: if isSignedIn()
           && (
             (request.auth.uid == uid && (
-              resource == null
-                ? (!('role' in request.resource.data) || request.resource.data.role != 'admin' || isRoomCreator(roomCode))
-                : (!('role' in request.resource.data) || request.resource.data.role == resource.data.role)
+              !('role' in request.resource.data)
+              || (resource == null
+                    ? (request.resource.data.role != 'admin' || isRoomCreator(roomCode))
+                    : (request.resource.data.role == resource.data.role
+                        || (isRoomCreator(roomCode) && request.resource.data.role == 'admin')))
             ))
             || isRoomAdmin(roomCode)
           );
