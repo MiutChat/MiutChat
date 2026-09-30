@@ -16,9 +16,9 @@
  * this file does, at zero cost, same as everything else in this app.
  *
  * Access is via the Firestore REST API with anonymous sign-in — the same
- * pattern already proven in production by cleanup.js and migrate-room.js.
- * No Firebase client SDK needed here; this is a server-side-only edge
- * function, so raw REST calls keep it simple and dependency-free.
+ * pattern already proven in production by cleanup.js. No Firebase client
+ * SDK needed here; this is a server-side-only edge function, so raw REST
+ * calls keep it simple and dependency-free.
  *
  * REQUIRED ENV VARS (separate from the FIREBASE_DBn_* chat shards —
  * this is its OWN Firebase project, used for nothing else):
@@ -201,9 +201,9 @@ export async function onRequest(ctx) {
     return json({ db: chosen.name, isNew: true });
   }
 
-  // ── bind: explicitly (re)point a room at a shard — used after a
-  //    successful migration, or to make a hash-fallback resolution
-  //    authoritative for next time ──
+  // ── bind: explicitly (re)point a room at a shard — used by
+  //    db-manager.js to make a hash/localStorage fallback resolution
+  //    authoritative in the registry for next time ──
   if (action === 'bind') {
     const roomCode = body?.roomCode, db = body?.db;
     if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
