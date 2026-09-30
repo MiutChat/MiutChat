@@ -1,6 +1,6 @@
 {
   "name": "miutchat",
-  "version": "1.0.23",
+  "version": "1.0.24",
   "private": true,
   "scripts": {
     "build": "node build.js"
