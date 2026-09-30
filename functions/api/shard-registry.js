@@ -193,12 +193,39 @@ export async function onRequest(ctx) {
 
     try {
       await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
-      const newCount = (chosen.prevLoad && chosen.prevLoad.day === today) ? (chosen.prevLoad.count || 0) + 1 : 1;
-      const degradedUntil = (chosen.prevLoad && chosen.prevLoad.degradedUntil > Date.now()) ? chosen.prevLoad.degradedUntil : 0;
-      await restSetDoc(projectId, token, `shardLoad/${chosen.name}`, { day: today, count: newCount, degradedUntil });
+      // NOTE: shardLoad.count is deliberately NOT incremented here. This
+      // is a PICK, not a confirmed creation — the client still has to
+      // actually write the room doc, which can fail (rules, network,
+      // the user abandoning the create flow). Counting every pick as
+      // load meant a burst of failed attempts permanently inflated a
+      // shard's apparent load with nothing to ever correct it, biasing
+      // placement away from a shard that was never actually used. The
+      // 'confirm' action below increments the real count, once, only
+      // after the room doc actually exists.
     } catch { /* best-effort — room creation must not block on registry writes */ }
 
     return json({ db: chosen.name, isNew: true });
+  }
+
+  // ── confirm: the client actually finished writing the room doc on the
+  //    shard it was assigned — THIS is what counts toward that shard's
+  //    daily load, not the pick in 'resolve' above. Idempotent-ish: a
+  //    missed or duplicate confirm just under/over-counts by one, which
+  //    self-corrects at the next daily reset and never blocks anything. ──
+  if (action === 'confirm') {
+    const roomCode = body?.roomCode, db = body?.db;
+    if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
+      return json({ error: 'roomCode required' }, 400);
+    }
+    if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
+    try {
+      const today = todayKey();
+      const load = await restGetDoc(projectId, token, `shardLoad/${db}`);
+      const newCount = (load && load.day === today) ? (load.count || 0) + 1 : 1;
+      const degradedUntil = (load && load.degradedUntil > Date.now()) ? load.degradedUntil : 0;
+      await restSetDoc(projectId, token, `shardLoad/${db}`, { day: today, count: newCount, degradedUntil });
+    } catch { /* best-effort — a missed confirm just slightly under-counts that shard, harmless */ }
+    return json({ ok: true });
   }
 
   // ── bind: explicitly (re)point a room at a shard — used by
