@@ -1,0 +1,139 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isRoomMember(roomCode) {
+      return exists(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid));
+    }
+
+    function memberRole(roomCode) {
+      return get(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid)).data.role;
+    }
+
+    function isRoomAdmin(roomCode) {
+      return isRoomMember(roomCode) && memberRole(roomCode) == 'admin';
+    }
+
+    function isRoomCreator(roomCode) {
+      return get(/databases/$(database)/documents/rooms/$(roomCode)).data.creatorId == request.auth.uid;
+    }
+
+    // ── Feedback ─────────────────────────────────────────────────────────────
+    match /feedback/{feedbackId} {
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['roomCode','rating','tags','comment','appVersion','createdAt'])
+        && request.resource.data.roomCode is string
+        && request.resource.data.roomCode.size() > 0 && request.resource.data.roomCode.size() <= 64
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && request.resource.data.comment is string
+        && request.resource.data.comment.size() <= 500
+        && request.resource.data.tags is list
+        && request.resource.data.tags.size() <= 6
+        && request.resource.data.appVersion is string
+        && request.resource.data.appVersion.size() <= 32
+        && request.resource.data.createdAt == request.time;
+      // Feedback is write-once and never readable back through client rules.
+      allow read, update, delete: if false;
+    }
+
+    // ── Rooms ────────────────────────────────────────────────────────────────
+    match /rooms/{roomCode} {
+      // A non-member must be able to check whether a room code is already
+      // taken (createRoom()'s own collision check) BEFORE they're a member
+      // of anything — there's no member doc until the room is created. So
+      // reading a room that doesn't exist yet is allowed for anyone signed
+      // in (it reveals nothing — there's no data there); reading one that
+      // DOES exist still requires membership.
+      allow read: if isSignedIn() && (resource == null || isRoomMember(roomCode));
+
+      allow create: if isSignedIn()
+        && request.resource.data.creatorId == request.auth.uid
+        && request.resource.data.keys().hasAll(['creatorId','createdAt'])
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if isSignedIn()
+        && (isRoomCreator(roomCode) || isRoomAdmin(roomCode))
+        // creatorId can never be reassigned via an update
+        && request.resource.data.creatorId == resource.data.creatorId;
+
+      allow delete: if isSignedIn() && isRoomCreator(roomCode);
+
+      match /messages/{msgId} {
+        allow read: if isSignedIn() && isRoomMember(roomCode);
+
+        // Two shapes of message hit this rule: plain text (`enc`, small —
+        // capped generously below plaintext expansion) and image/file/chunk
+        // uploads (`encData`, up to ~800KB base64 per CONFIG.CHUNK_BYTES —
+        // capped just under Firestore's own 1MiB/doc hard limit). A message
+        // has exactly one of the two, never both.
+        allow create: if isSignedIn()
+          && isRoomMember(roomCode)
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.keys().hasAll(['senderId','createdAt'])
+          && request.resource.data.createdAt == request.time
+          && (
+            (request.resource.data.keys().hasAll(['enc'])
+              && request.resource.data.enc is string
+              && request.resource.data.enc.size() <= 8000)
+            ||
+            (request.resource.data.keys().hasAll(['encData'])
+              && request.resource.data.encData is string
+              && request.resource.data.encData.size() <= 900000)
+          );
+
+        // Only the original fields that are meant to be mutable can change
+        // (e.g. an "edited"/"deleted" flag) — senderId and createdAt are frozen.
+        // Admins may also update (soft-delete-for-everyone) any member's
+        // message — matches the "delete for everyone" moderation feature,
+        // which performs an .update(), not a .delete().
+        allow update: if isSignedIn()
+          && isRoomMember(roomCode)
+          && (resource.data.senderId == request.auth.uid || isRoomAdmin(roomCode))
+          && request.resource.data.senderId == resource.data.senderId
+          && request.resource.data.createdAt == resource.data.createdAt;
+
+        allow delete: if isSignedIn()
+          && (resource.data.senderId == request.auth.uid || isRoomAdmin(roomCode));
+      }
+
+      match /members/{uid} {
+        // Same chicken-and-egg as the room doc above, one level deeper:
+        // the enter-room flow's very first step reads its OWN member doc
+        // to check prior approval status — before that doc exists, so
+        // before isRoomMember(roomCode) can ever be true. Reading your OWN
+        // doc must not require already being a proven member; reading
+        // anyone else's still does (room member list, admin views).
+        allow read: if isSignedIn() && (request.auth.uid == uid || isRoomMember(roomCode));
+
+        // A user may only ever write their own membership doc, and may never
+        // grant themselves the admin role. Admins can write any member doc,
+        // including role changes for others, but cannot demote themselves
+        // as the sole admin check happens at the app layer if needed.
+        // `resource` is null on a brand-new doc's first write, so it must
+        // never be dereferenced (resource.data.role) in that branch —
+        // that's a known Firestore rules footgun that silently denies
+        // instead of erroring loudly.
+        allow write: if isSignedIn()
+          && (
+            (request.auth.uid == uid && (
+              resource == null
+                ? (!('role' in request.resource.data) || request.resource.data.role != 'admin' || isRoomCreator(roomCode))
+                : (!('role' in request.resource.data) || request.resource.data.role == resource.data.role)
+            ))
+            || isRoomAdmin(roomCode)
+          );
+      }
+
+      match /typing/{uid} {
+        allow read: if isSignedIn() && isRoomMember(roomCode);
+        allow write: if isSignedIn() && request.auth.uid == uid;
+      }
+    }
+  }
+}

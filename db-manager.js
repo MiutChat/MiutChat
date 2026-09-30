@@ -9,24 +9,27 @@
  *
  * Room → shard resolution, in priority order:
  *   1. In-memory cache for this tab (instant, no network).
- *   2. Server-side authoritative registry (shard-registry.js, backed by
- *      Cloudflare KV) — the source of truth every member's browser and
- *      every device agrees on. New rooms are placed on whichever active
- *      shard has the least load and isn't flagged degraded.
+ *   2. Server-side authoritative registry (shard-registry.js, backed by a
+ *      dedicated Firestore project) — the source of truth every member's
+ *      browser and every device agrees on. New rooms are placed on
+ *      whichever active shard has the least load and isn't flagged
+ *      degraded.
  *   3. This browser's own localStorage binding — used only if the
- *      registry is unreachable, so a KV outage degrades to "this browser
- *      remembers where it left off" rather than breaking room access.
+ *      registry is unreachable, so a registry outage degrades to "this
+ *      browser remembers where it left off" rather than breaking access.
  *   4. Deterministic hash across active shards — last resort for a room
  *      neither the registry nor localStorage has ever seen.
  *
  * Quota handling: if a shard returns a Firestore quota-exhaustion error
- * (resource-exhausted), the affected room is migrated to a healthy shard
- * via migrate-room.js (server-side, Firestore REST API) and every
- * subsequent lookup — from any device — resolves to the new shard. See
- * migrate-room.js's file header for exactly what this can and can't
- * recover (short version: it needs the source shard's READS to still
- * work; if those are also exhausted, nothing server-side or client-side
- * can read that data until Firestore's own daily quota reset).
+ * (resource-exhausted), that shard is reported to the registry as
+ * degraded so it stops being handed NEW rooms. There is deliberately NO
+ * migration of already-placed rooms in this build — an earlier version
+ * tried that via a server-side copy (migrate-room.js) but it needed a
+ * service account per shard and was more moving parts than this app
+ * wants to maintain. A room that lands on a shard which later runs out
+ * of quota stays there until Firestore's own daily reset; the sharding
+ * this file does is purely about spreading NEW rooms across shards so
+ * any one of them is less likely to hit that limit in the first place.
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -287,94 +290,33 @@ function _reportShardDegraded(dbName) {
  * Firestore's client SDK surfaces a hard daily-quota rejection as
  * err.code === 'resource-exhausted' (sometimes 'permission-denied' if App
  * Check/rules reject first, but that's not quota-specific so it's
- * deliberately excluded here to avoid false-triggering migrations on
- * unrelated permission problems). */
+ * deliberately excluded here). */
 function _isQuotaError(err) {
   return !!err && (err.code === 'resource-exhausted' || /RESOURCE_EXHAUSTED/i.test(err.message || ''));
-}
-
-/* ── Server-side migration (migrate-room.js) ──────────────────────────────
- * Copies a room's data to a healthy shard via the Firestore REST API at
- * the edge — works even if every browser tab for that room has since
- * closed. See migrate-room.js's file header for exactly what this can and
- * cannot guarantee (short version: if the SOURCE shard's READS are also
- * exhausted, not just writes, the data genuinely can't be read by anyone
- * until Firestore's own daily reset — no client trick changes that). */
-async function _migrateRoom(roomCode, fromName, toName) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25000); // REST copy of a room can take a few seconds
-  try {
-    const res = await fetch('/api/migrate-room', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomCode, from: fromName, to: toName }),
-      signal: controller.signal,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(data.error || ('migrate-room HTTP ' + res.status));
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Best alternate shard to migrate a room TO — healthy, and not the one it's leaving. */
-function _bestAlternateShard(excludeName) {
-  const candidates = _ACTIVE_DBS.filter(d => d.name !== excludeName && _healthy(d.name));
-  if (!candidates.length) return null;
-  // Prefer whichever has failed least recently / least often — same signal
-  // getDb's own fallback ordering already uses.
-  candidates.sort((a, b) => _health.get(a.name).cooldownUntil - _health.get(b.name).cooldownUntil);
-  return candidates[0];
 }
 
 /**
  * Called the moment ANY Firestore operation for a room fails with a
  * quota-shaped error — from getDb's own probe below, or from app.js's
- * real read/write call sites via window.reportDbError(). This is what
- * makes migration "instant" rather than waiting for the next room-open:
- * it fires from the very first real failure, using whatever read budget
- * the source shard has left RIGHT NOW to get the data out before it's
- * gone for the rest of the day.
+ * real read/write call sites via window.reportDbError().
+ *
+ * NOTE: this used to also trigger a server-side migration of the room's
+ * data to a healthy shard (migrate-room.js). That's been removed —
+ * migration required a service account per project and turned out to be
+ * more moving parts than this app wants to maintain. What's left is pure
+ * load-based SHARDING: new rooms are placed across shards by
+ * shard-registry.js's own load/degraded-aware picker, so any one shard
+ * is less likely to hit its quota in the first place. But once a room IS
+ * placed, it stays on that shard for its lifetime — if that shard's
+ * quota runs out, the room is stuck until Firestore's own daily reset;
+ * nothing here moves it. All this function does now is mark the shard
+ * degraded in the registry so it stops being handed NEW rooms — it never
+ * reroutes the room that just failed.
  */
-const _migrationInFlight = new Map(); // roomCode → Promise, de-dupes concurrent triggers
-async function _handleQuotaError(roomCode, dbName, err) {
-  if (!_isQuotaError(err)) return null;
+function _handleQuotaError(roomCode, dbName, err) {
+  if (!_isQuotaError(err)) return;
   _onFail(dbName, err);
   _reportShardDegraded(dbName);
-
-  if (!roomCode) return null; // e.g. a probe with no specific room in play
-  if (_migrationInFlight.has(roomCode)) return _migrationInFlight.get(roomCode);
-
-  const dest = _bestAlternateShard(dbName);
-  if (!dest) {
-    console.warn('[MiutDB] Shard', dbName, 'hit quota but no healthy alternate exists — room', roomCode, 'stays put.');
-    return null;
-  }
-
-  const job = (async () => {
-    try {
-      console.warn('[MiutDB] Migrating room', roomCode, 'off', dbName, '(quota) →', dest.name);
-      await _migrateRoom(roomCode, dbName, dest.name);
-      const fs = _initDb(dest);
-      _roomDbCache.set(roomCode, dest.name);
-      _setPersistedBinding(roomCode, dest.name);
-      _bindRegistry(roomCode, dest.name);
-      _onSuccess(dest.name);
-      console.warn('[MiutDB] Migration of', roomCode, 'to', dest.name, 'complete.');
-      return fs;
-    } catch (migErr) {
-      // Per migrate-room.js's own honesty note: if source READS are also
-      // exhausted, this is expected to fail until Firestore's daily reset.
-      console.warn('[MiutDB] Migration of', roomCode, 'failed (will retry on next quota error):', migErr.message);
-      return null;
-    } finally {
-      _migrationInFlight.delete(roomCode);
-    }
-  })();
-  _migrationInFlight.set(roomCode, job);
-  return job;
 }
 
 /* ── Core: resolve the best database for a room code ────────── */
@@ -467,10 +409,7 @@ async function getDb(roomCode) {
       return fs;
     } catch (err) {
       _onFail(cfg.name, err);
-      if (_isQuotaError(err)) {
-        const migrated = await _handleQuotaError(roomCode, cfg.name, err);
-        if (migrated) return migrated;
-      }
+      if (_isQuotaError(err)) _handleQuotaError(roomCode, cfg.name, err);
     }
   }
 
@@ -584,14 +523,14 @@ window.resetDbHealth = resetDbHealth;
  * Call this from any Firestore write/read catch handler in app.js when an
  * operation fails, e.g.:
  *   .catch(err => window.reportDbError(state.roomCode, <shard name>, err))
- * If `err` is quota-shaped, this kicks off migration immediately — often
- * before the next getDb() call would even happen — and resolves to the
- * new Firestore instance on success, or null if it wasn't a quota error /
- * migration wasn't possible right now. Safe to call speculatively on every
- * Firestore error; non-quota errors are a no-op.
+ * If `err` is quota-shaped, this marks the shard degraded in the registry
+ * so it stops being handed NEW rooms — it does NOT move the room that
+ * just failed (no migration in this build; see _handleQuotaError's
+ * comment). Non-quota errors are a no-op. Always returns undefined —
+ * callers should not expect a rerouted Firestore instance back.
  */
 window.reportDbError = function (roomCode, dbName, err) {
-  return _handleQuotaError(roomCode, dbName, err);
+  _handleQuotaError(roomCode, dbName, err);
 };
 /** Which shard is roomCode currently resolved to, for error-reporting call sites. */
 window.getCurrentDbName = function (roomCode) {

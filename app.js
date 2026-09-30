@@ -3540,45 +3540,21 @@ async function sendMessage() {
 }
 
 /** Common failure path for both the first send attempt and tap-to-retry.
- * If the error is quota-shaped, waits for db-manager's migration to land
- * on a healthy shard, then rebinds the LIVE session — the global `db` and
- * the active listeners — onto it before giving up, so the room actually
- * keeps working instead of failing forever until a page reload. */
-async function _handleSendFailure(localId, roomCode, e) {
+ * There is no cross-shard migration in this build (see db-manager.js's
+ * header) — a quota-exhausted shard just gets reported as degraded so
+ * it's avoided for NEW rooms going forward. The room the person is
+ * already in stays on its shard and simply can't send until that
+ * project's Firestore quota resets, so the message here is honest about
+ * that instead of implying a retry will magically start working. */
+function _handleSendFailure(localId, roomCode, e) {
   _markMessageFailed(localId);
   const _dbName = window.getCurrentDbName?.(roomCode);
-  if (_dbName) {
-    const newDb = await window.reportDbError?.(roomCode, _dbName, e);
-    if (newDb && state.roomCode === roomCode) {
-      db = newDb;
-      // Migrated to a different Firebase PROJECT — the old uid was never
-      // authenticated there (see ensureAuth's comment), so re-auth against
-      // the new shard before anything else touches it.
-      try {
-        const newDbName = window.getCurrentDbName?.(roomCode) || _dbName;
-        state.me.id = await getUID(newDbName);
-        saveSession();
-        // The migrated member doc is still keyed by the OLD uid (a
-        // different project's identity) — register presence under the
-        // NEW one so isRoomMember() passes going forward. Rules enforce
-        // role='member'/approved=false on first create for a given uid,
-        // so anyone who wasn't already a member on THIS uid re-enters the
-        // approval queue on the new shard — an unavoidable consequence of
-        // Firebase Auth identities being per-project, not a bug in this
-        // patch. Worth a proper fix (a stable app-level id independent of
-        // Firebase Auth) if migrations end up happening often.
-        await registerPresence('member', false).catch(() => {});
-      } catch (authErr) {
-        toast('Switched servers, but re-auth failed', authErr.message, 'err');
-        return;
-      }
-      stopListeners();
-      startListeners();
-      toast('Switched servers', 'This room hit its daily limit and moved to another server — tap the failed message to resend.', 'warn');
-      return;
-    }
+  if (_dbName) window.reportDbError?.(roomCode, _dbName, e); // no-op unless e is quota-shaped
+  if (window.isQuotaError?.(e) || e?.code === 'resource-exhausted') {
+    toast('This room hit today\'s limit', 'Its server is out of quota for today — sending will work again after the daily reset.', 'warn');
+  } else {
+    toast('Send failed', e.message, 'err');
   }
-  toast('Send failed', e.message, 'err');
 }
 
 const _pendingMsgPayloads = new Map(); // localId → full msgData, kept only until reconciled (for tap-to-retry)
