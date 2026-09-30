@@ -188,8 +188,19 @@ export async function onRequest(ctx) {
     }));
     const healthy = scored.filter(s => !s.degraded && s.count < SOFT_CAP_ROOMS_PER_DAY);
     const pool = healthy.length ? healthy : scored; // every shard full/degraded → still answer with the least-bad option
-    pool.sort((a, b) => a.count - b.count);
-    const chosen = pool[0];
+    // Array.sort is stable, so a naive pool[0] after sorting always breaks
+    // ties toward whichever shard appears first in `shards` — which is
+    // always miut-db0. Since `confirm` (below) is fire-and-forget and not
+    // awaited before the next room can be created, back-to-back creates
+    // routinely see a tie (the previous room's confirm hasn't landed yet),
+    // so that deterministic tie-break meant db0 could win every single
+    // time under normal rapid use, not just occasionally. Pick uniformly
+    // at random among whichever shards are tied for the lowest count
+    // instead, so ties actually spread load rather than piling onto one
+    // shard.
+    const minCount = Math.min(...pool.map(s => s.count));
+    const tied = pool.filter(s => s.count === minCount);
+    const chosen = tied[Math.floor(Math.random() * tied.length)];
 
     try {
       await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
