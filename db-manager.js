@@ -278,6 +278,19 @@ function _bindRegistry(roomCode, dbName) {
   _registryCall({ action: 'bind', roomCode, db: dbName }, 4000).catch(() => {});
 }
 
+/** Call this ONCE, right after a room's document has actually been
+ * successfully written to Firestore — NOT at getDb()/resolve time, which
+ * only picks a shard and does not know whether creation will succeed.
+ * This is what the registry's placement actually counts as load; a room
+ * that was assigned a shard but never actually got created there (rules
+ * denial, network drop, user backing out) must not count against it, or
+ * a burst of failed attempts permanently — not just for the day —
+ * biases placement away from a shard nothing was ever created on. */
+function _confirmRoomCreated(roomCode, dbName) {
+  _registryCall({ action: 'confirm', roomCode, db: dbName }, 4000).catch(() => {});
+}
+window.confirmRoomCreated = _confirmRoomCreated;
+
 const _reportedDegraded = new Set(); // per-tab de-dupe, avoids hammering the registry
 function _reportShardDegraded(dbName) {
   if (_reportedDegraded.has(dbName)) return;

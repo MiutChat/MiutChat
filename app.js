@@ -1385,6 +1385,11 @@ async function handleCreate() {
       msgTtlMs:         0,        // per-message expiry — off by default
       blockedUsers:     [],       // see blockMember() — ids blocked by the admin, denied re-entry
     });
+    // Tell the registry this shard actually got a room — placement's
+    // load counter only counts confirmed creations, not picks (see
+    // db-manager.js's comment on _confirmRoomCreated for why that split
+    // matters). Fire-and-forget; a missed confirm is harmless.
+    window.confirmRoomCreated?.(code, _dbName);
     _roomEpoch = 0;
     state.me = await buildMe(resolveName(), _dbName); state.roomCode = code;
     saveSession(); saveRoom(code);
