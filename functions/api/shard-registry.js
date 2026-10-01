@@ -30,7 +30,17 @@
  *
  * DATA MODEL (two tiny collections, nothing else):
  *   bindings/{roomCode}     → { db: "miut-db1" }
- *   shardLoad/{shardName}   → { day: "2026-09-26", count: 12, degradedUntil: 0|epochMs }
+ *   shardLoad/{shardName}   → { count: 12, degradedUntil: 0|epochMs }
+ *
+ * `count` is a LIFETIME cumulative total, not a daily one — it never
+ * resets. Least-count-wins placement only actually equalizes totals
+ * across shards if the counter itself never resets; a daily reset makes
+ * each day fair in isolation but lets shards drift apart over time (a
+ * shard that had a heavy Monday and a quiet Tuesday still ends up with
+ * more total rooms than one that had two quiet days). Room churn (rooms
+ * expiring/being deleted) isn't reflected here — this counts placements
+ * made, not rooms currently alive — which is fine for its one purpose:
+ * deciding where the NEXT room goes.
  *
  * Storage footprint is trivial (well under a kilobyte per room) and this
  * app's own free 1 GiB Firestore storage allowance comfortably holds
@@ -139,12 +149,10 @@ async function restSetDoc(projectId, token, path, obj) {
 }
 
 // ── Placement policy ────────────────────────────────────────────────────
-const DEGRADED_MS            = 8 * 3600 * 1000; // auto-recovers after 8h even if never explicitly cleared
-const SOFT_CAP_ROOMS_PER_DAY = 150;              // see file header — conservative proxy for load, not exact quota tracking
-
-function todayKey() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
-}
+// Degraded status auto-recovers after 8h even if never explicitly cleared —
+// unrelated to the (now non-resetting) room count, just a safety valve so a
+// shard doesn't stay excluded forever if nothing ever re-checks it.
+const DEGRADED_MS = 8 * 3600 * 1000;
 
 export async function onRequest(ctx) {
   const { request, env } = ctx;
@@ -178,16 +186,15 @@ export async function onRequest(ctx) {
       return json({ db: existing.db, isNew: false });
     }
 
-    const today = todayKey();
     const scored = await Promise.all(shards.map(async s => {
       let load = null;
       try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
-      const count = (load && load.day === today) ? (load.count || 0) : 0;
+      const count = load?.count || 0;
       const degraded = !!(load && load.degradedUntil && load.degradedUntil > Date.now());
       return { name: s.name, count, degraded, prevLoad: load };
     }));
-    const healthy = scored.filter(s => !s.degraded && s.count < SOFT_CAP_ROOMS_PER_DAY);
-    const pool = healthy.length ? healthy : scored; // every shard full/degraded → still answer with the least-bad option
+    const healthy = scored.filter(s => !s.degraded);
+    const pool = healthy.length ? healthy : scored; // every shard degraded → still answer with the least-bad option
     // Array.sort is stable, so a naive pool[0] after sorting always breaks
     // ties toward whichever shard appears first in `shards` — which is
     // always miut-db0. Since `confirm` (below) is fire-and-forget and not
@@ -204,25 +211,40 @@ export async function onRequest(ctx) {
 
     try {
       await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
-      // NOTE: shardLoad.count is deliberately NOT incremented here. This
-      // is a PICK, not a confirmed creation — the client still has to
-      // actually write the room doc, which can fail (rules, network,
-      // the user abandoning the create flow). Counting every pick as
-      // load meant a burst of failed attempts permanently inflated a
-      // shard's apparent load with nothing to ever correct it, biasing
-      // placement away from a shard that was never actually used. The
-      // 'confirm' action below increments the real count, once, only
-      // after the room doc actually exists.
-    } catch { /* best-effort — room creation must not block on registry writes */ }
+    } catch (e) {
+      // Do NOT return { db: chosen.name } here — that would tell the client
+      // "this room is on shard X" while the registry's own record of that
+      // fact doesn't exist. A later resolve() for this same room (this
+      // device after a registry hiccup, or any other device) would then
+      // find nothing and reassign to a possibly-different shard, while the
+      // room's actual data stays on the original one — permanently
+      // orphaning it. Failing loudly here instead makes db-manager.js's
+      // _resolveViaRegistry() throw, which falls through to ITS hash-based
+      // fallback — slightly less optimal placement for this one room, but
+      // self-consistent, which correctness-wise is what matters here.
+      return json({ error: 'registry binding write failed: ' + e.message }, 502);
+    }
+    // NOTE: shardLoad.count is deliberately NOT incremented here. This
+    // is a PICK, not a confirmed creation — the client still has to
+    // actually write the room doc, which can fail (rules, network,
+    // the user abandoning the create flow). Counting every pick as
+    // load meant a burst of failed attempts permanently inflated a
+    // shard's apparent load with nothing to ever correct it, biasing
+    // placement away from a shard that was never actually used. The
+    // 'confirm' action below increments the real count, once, only
+    // after the room doc actually exists.
 
     return json({ db: chosen.name, isNew: true });
   }
 
   // ── confirm: the client actually finished writing the room doc on the
   //    shard it was assigned — THIS is what counts toward that shard's
-  //    daily load, not the pick in 'resolve' above. Idempotent-ish: a
-  //    missed or duplicate confirm just under/over-counts by one, which
-  //    self-corrects at the next daily reset and never blocks anything. ──
+  //    lifetime total, not the pick in 'resolve' above. A missed or
+  //    duplicate confirm just under/over-counts that shard by one — since
+  //    the count never resets, this is a permanent (but harmless) off-by-
+  //    one, not something that corrects itself. It only ever affects which
+  //    shard looks marginally least-loaded for the next placement, never
+  //    correctness of an already-bound room. ──
   if (action === 'confirm') {
     const roomCode = body?.roomCode, db = body?.db;
     if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
@@ -230,11 +252,10 @@ export async function onRequest(ctx) {
     }
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
     try {
-      const today = todayKey();
       const load = await restGetDoc(projectId, token, `shardLoad/${db}`);
-      const newCount = (load && load.day === today) ? (load.count || 0) + 1 : 1;
+      const newCount = (load?.count || 0) + 1;
       const degradedUntil = (load && load.degradedUntil > Date.now()) ? load.degradedUntil : 0;
-      await restSetDoc(projectId, token, `shardLoad/${db}`, { day: today, count: newCount, degradedUntil });
+      await restSetDoc(projectId, token, `shardLoad/${db}`, { count: newCount, degradedUntil });
     } catch { /* best-effort — a missed confirm just slightly under-counts that shard, harmless */ }
     return json({ ok: true });
   }
@@ -262,13 +283,11 @@ export async function onRequest(ctx) {
     const db = body?.db;
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
     try {
-      const today = todayKey();
       const load = await restGetDoc(projectId, token, `shardLoad/${db}`);
       const alreadyDegraded = !!(load && load.degradedUntil && load.degradedUntil > Date.now());
       if (!alreadyDegraded) {
         await restSetDoc(projectId, token, `shardLoad/${db}`, {
-          day: today,
-          count: (load && load.day === today) ? (load.count || 0) : 0,
+          count: load?.count || 0,
           degradedUntil: Date.now() + DEGRADED_MS,
         });
       }
@@ -278,13 +297,12 @@ export async function onRequest(ctx) {
 
   // ── status: current per-shard health, for the admin/debug console ──
   if (action === 'status') {
-    const today = todayKey();
     const status = await Promise.all(shards.map(async s => {
       let load = null;
       try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
       return {
         name: s.name,
-        roomsToday: (load && load.day === today) ? (load.count || 0) : 0,
+        roomsTotal: load?.count || 0,
         degraded: !!(load && load.degradedUntil && load.degradedUntil > Date.now()),
         degradedUntil: (load && load.degradedUntil > Date.now()) ? load.degradedUntil : null,
       };

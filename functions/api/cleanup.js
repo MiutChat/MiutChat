@@ -61,7 +61,7 @@ function discoverShards(env) {
   for (const n of [...nums].sort((a, b) => a - b)) {
     shards.push({
       name:   `miut-db${n}`,
-      active: !!env[`FIREBASE_DB${n}_API_KEY`],
+      active: !!(env[`FIREBASE_DB${n}_API_KEY`] && env[`FIREBASE_DB${n}_PROJECT_ID`]),
       apiKey: env[`FIREBASE_DB${n}_API_KEY`] || '',
       projectId: env[`FIREBASE_DB${n}_PROJECT_ID`] || '',
     });
