@@ -1738,38 +1738,17 @@ async function declineUser(uid, name) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Required Firestore Security Rules for admin member-management actions
-// (promote, demote, approve, decline, block) — this repo doesn't commit a
-// firestore.rules file (rules are managed in the Firebase Console), so add
-// something like this there. The key requirement throughout: these are
-// role-based checks against the CURRENT admin(s) in the members
-// subcollection, never a fixed creatorId — since this app supports
-// multiple simultaneous admins and promotion/demotion at any time, a rule
-// hardcoded to the original creator would silently reject every one of
-// these actions once a different admin (or a second admin) tries them.
-//
-//   function isAdmin(roomCode) {
-//     return exists(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid))
-//       && get(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid)).data.role == 'admin';
-//   }
-//
-//   match /rooms/{roomCode} {
-//     // blockedUsers is admin-only to modify; anyone approved can read it
-//     // (the join flow needs to check it before letting someone in).
-//     allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['blockedUsers'])
-//       ? isAdmin(roomCode) : true; // (combine with your other room-doc rules, e.g. epoch — see _autoRotateEpoch)
-//
-//     match /members/{uid} {
-//       // A member can always update their own presence/heartbeat fields.
-//       allow update: if request.auth.uid == uid
-//           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['online', 'lastSeen', 'pubKey'])
-//         // Admin-only fields: role (promote/demote), approved (approve),
-//         // declined (decline), blocked (block) — for ANY member's doc.
-//         || (isAdmin(roomCode)
-//             && request.resource.data.diff(resource.data).affectedKeys()
-//                  .hasOnly(['role', 'approved', 'declined', 'blocked', 'online']));
-//     }
-//   }
+// Admin member-management actions (promote, demote, approve, decline,
+// block) are authorized by firestore.rules in this repo's root — see the
+// /rooms/{roomCode}/members/{uid} `allow write` rule there. It's role-based
+// against the CURRENT admin(s) in the members subcollection (isRoomAdmin()),
+// not a fixed creatorId, specifically so promotion/demotion and multiple
+// simultaneous admins keep working after the original creator hands off or
+// stops being the only admin. That rule doesn't restrict which fields an
+// admin may change on another member's doc (broader than a role/approved/
+// declined/blocked-only allowlist would be) — any verified admin of this
+// specific room can write any field, which is the deployed, intentional
+// shape, not a narrower one.
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function promoteToAdmin(uid, name) {
@@ -2320,20 +2299,12 @@ async function setRoomExpiry(ms) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Required Firestore Security Rule for epoch rotation — this repo doesn't
-// commit a firestore.rules file (see the /feedback rule comment elsewhere
-// in this file for why), so add this in the Firebase Console. It MUST key
-// off the room's members subcollection role, not a fixed creatorId,
-// because admin can be handed off (see _handoffAdminRole) — a rule that
-// only allows request.auth.uid == resource.data.creatorId to write `epoch`
-// will silently reject a handed-off admin's rotation attempts:
-//
-//   match /rooms/{roomCode} {
-//     allow update: if request.resource.data.diff(resource.data)
-//         .affectedKeys().hasOnly(['epoch'])
-//       ? exists(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid))
-//         && get(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid)).data.role == 'admin'
-//       : true; // other room-doc updates keep whatever rule they already have
+// Epoch rotation is authorized by the same /rooms/{roomCode} `allow update`
+// rule in this repo's firestore.rules as every other room-doc write — it
+// already keys off isRoomAdmin(roomCode) (current members-subcollection
+// role) rather than a fixed creatorId, so a handed-off admin (see
+// _handoffAdminRole) can still rotate the epoch after no longer being the
+// original creator.
 //   }
 async function _autoRotateEpoch(reason) {
   if (!_isAdmin || !state.roomCode || !db) return;
