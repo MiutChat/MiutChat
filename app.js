@@ -728,7 +728,7 @@ const _ERROR_MAP = {
   'unavailable':              { title: 'Server unreachable',     detail: 'Check your connection and try again.',           icon: 'net', type: 'network'     },
   'network-request-failed':   { title: 'No internet connection', detail: 'You appear to be offline.',                     icon: '📶', type: 'network'     },
   'deadline-exceeded':        { title: 'Request timed out',      detail: 'Server took too long — try again.',             icon: 'clock',  type: 'network'     },
-  'resource-exhausted':       { title: 'Server busy',            detail: 'Quota exceeded. Try again in a few minutes.',   icon: 'warn',  type: 'quota'       },
+  'resource-exhausted':       { title: 'Server out of capacity', detail: 'This server ran out of capacity for today. Try again — you may get a different one — or wait for tomorrow\'s reset.',   icon: 'warn',  type: 'quota'       },
   'permission-denied':        { title: 'Access denied',          detail: 'Room not found or you are not signed in. Try refreshing the page.',   icon: 'lock', type: 'permission'  },
   'unauthenticated':          { title: 'Not signed in',          detail: 'Reload the page and try again.',                icon: 'key', type: 'auth'        },
   'not-found':                { title: 'Room not found',         detail: 'The room may have been closed.',                icon: '🔍', type: 'notfound'    },
@@ -778,7 +778,7 @@ function _classifyError(e) {
   if (raw.includes('timeout') || raw.includes('deadline'))
     return { title: 'Request timed out', detail: 'Try again.', icon: 'clock', type: 'network' };
   if (raw.includes('quota') || raw.includes('resource'))
-    return { title: 'Server busy', detail: 'Try again in a few minutes.', icon: 'warn', type: 'quota' };
+    return { title: 'Server out of capacity', detail: 'This server ran out of capacity for today. Try again — you may get a different one — or wait for tomorrow\'s reset.', icon: 'warn', type: 'quota' };
   if (raw.includes('permission') || raw.includes('forbidden') || raw.includes('unauthorized'))
     return { title: 'Access denied', detail: "You don't have permission.", icon: 'lock', type: 'permission' };
 
@@ -3556,7 +3556,11 @@ function _handleSendFailure(localId, roomCode, e) {
   const _dbName = window.getCurrentDbName?.(roomCode);
   if (_dbName) window.reportDbError?.(roomCode, _dbName, e); // no-op unless e is quota-shaped
   if (window.isQuotaError?.(e) || e?.code === 'resource-exhausted') {
-    toast('This room hit today\'s limit', 'Its server is out of quota for today — sending will work again after the daily reset.', 'warn');
+    toast(
+      'This room hit today\'s limit',
+      'Its server is out of messages for today — it\'ll work again after the daily reset. If you need to keep chatting now, start a new room; new rooms are placed on a different, unaffected server automatically.',
+      'warn'
+    );
   } else {
     toast('Send failed', e.message, 'err');
   }
@@ -5640,9 +5644,16 @@ function showConfirm(title, msg, confirmLabel = 'CONFIRM') {
 // roomCode it refers to, never a member id/name, matching Miut's
 // "no digital footprint" privacy model.
 //
-// Required Firestore Security Rule (add in Firebase Console → Firestore →
-// Rules — there's no firestore.rules file in this repo, rules are managed
-// server-side only):
+// NOT centralized: this writes to `db` — whichever shard the room the
+// person was just in happens to live on. With multiple shards (see
+// db-manager.js), that means feedback is scattered across each shard
+// project's own /feedback collection, not collected in one place. Checking
+// feedback means checking every active shard project's console.
+//
+// Required Firestore Security Rule — see firestore.rules in this repo
+// (apply the SAME rule to every shard project's console individually;
+// Firestore rules are per-project, there's no way to apply one rule file
+// to multiple projects automatically):
 //
 //   match /feedback/{feedbackId} {
 //     allow create: if request.auth != null

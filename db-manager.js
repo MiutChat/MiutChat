@@ -272,10 +272,20 @@ async function _resolveViaRegistry(roomCode) {
   return data; // { db, isNew }
 }
 
-function _bindRegistry(roomCode, dbName) {
-  // Fire-and-forget — a failed write here just means the NEXT resolve()
-  // falls through to hash/localStorage for this room, not a hard failure.
-  _registryCall({ action: 'bind', roomCode, db: dbName }, 4000).catch(() => {});
+async function _bindRegistry(roomCode, dbName, attempt) {
+  // Fire-and-forget from the caller's perspective, but retried internally —
+  // this write is what keeps the room findable by every OTHER device, so
+  // it's worth a modest retry budget rather than giving up on the first
+  // transient failure. A room that only this browser's localStorage knows
+  // about is a room a second member can't join.
+  attempt = attempt || 0;
+  try {
+    await _registryCall({ action: 'bind', roomCode, db: dbName }, 4000);
+  } catch {
+    if (attempt < 2) {
+      setTimeout(() => _bindRegistry(roomCode, dbName, attempt + 1), 1000 * (attempt + 1));
+    }
+  }
 }
 
 /** Call this ONCE, right after a room's document has actually been
@@ -548,6 +558,16 @@ window.reportDbError = function (roomCode, dbName, err) {
 /** Which shard is roomCode currently resolved to, for error-reporting call sites. */
 window.getCurrentDbName = function (roomCode) {
   return _roomDbCache.get(roomCode) || null;
+};
+/**
+ * True if `err` is Firestore's daily-quota-exhaustion error specifically
+ * (not a permissions error, not a network error). Use this to show the
+ * user an accurate "this room is temporarily overloaded" message instead
+ * of a generic/raw error string — see app.js's use of this alongside
+ * reportDbError.
+ */
+window.isQuotaError = function (err) {
+  return _isQuotaError(err);
 };
 
 window._dbFirebaseReady.catch(err => {
