@@ -148,6 +148,25 @@ async function restSetDoc(projectId, token, path, obj) {
   if (!res.ok) throw new Error(`REST PATCH ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
 }
 
+async function restIncrement(projectId, token, path, field) {
+  const base = `projects/${projectId}/databases/(default)/documents`;
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/${base}:commit`,
+    {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        writes: [{
+          update: { name: `${base}/${path}`, fields: {} },
+          updateMask: { fieldPaths: [] },
+          updateTransforms: [{ fieldPath: field, increment: { integerValue: '1' } }],
+        }],
+      }),
+    }
+  );
+  if (!res.ok) throw new Error(`REST COMMIT ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
+}
+
 // ── Placement policy ────────────────────────────────────────────────────
 // Degraded status auto-recovers after 8h even if never explicitly cleared —
 // unrelated to the (now non-resetting) room count, just a safety valve so a
@@ -172,6 +191,20 @@ export async function onRequest(ctx) {
   let token;
   try { token = await getFirebaseToken(apiKey); }
   catch (e) { return json({ error: 'registry auth failed: ' + e.message }, 502); }
+
+  // ── lookup: read-only "which shard is this room on" — never creates a
+  //    binding, so joins and typos can't pollute the registry ──
+  if (action === 'lookup') {
+    const roomCode = body?.roomCode;
+    if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
+      return json({ error: 'roomCode required' }, 400);
+    }
+    let existing = null;
+    try { existing = await restGetDoc(projectId, token, `bindings/${roomCode}`); }
+    catch (e) { return json({ error: 'registry read failed: ' + e.message }, 502); }
+    if (existing?.db && names.has(existing.db)) return json({ db: existing.db, found: true });
+    return json({ found: false });
+  }
 
   // ── resolve: "which shard is this room on, or should a new one go to?" ──
   if (action === 'resolve') {
@@ -239,12 +272,13 @@ export async function onRequest(ctx) {
 
   // ── confirm: the client actually finished writing the room doc on the
   //    shard it was assigned — THIS is what counts toward that shard's
-  //    lifetime total, not the pick in 'resolve' above. A missed or
-  //    duplicate confirm just under/over-counts that shard by one — since
-  //    the count never resets, this is a permanent (but harmless) off-by-
-  //    one, not something that corrects itself. It only ever affects which
-  //    shard looks marginally least-loaded for the next placement, never
-  //    correctness of an already-bound room. ──
+  //    lifetime total, not the pick in 'resolve' above. The increment is
+  //    an atomic server-side transform, so concurrent confirms can never
+  //    overwrite each other's count. A missed or duplicate confirm just
+  //    under/over-counts that shard by one — since the count never
+  //    resets, this is a permanent (but harmless) off-by-one. It only
+  //    ever affects which shard looks marginally least-loaded for the
+  //    next placement, never correctness of an already-bound room. ──
   if (action === 'confirm') {
     const roomCode = body?.roomCode, db = body?.db;
     if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
@@ -252,10 +286,7 @@ export async function onRequest(ctx) {
     }
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
     try {
-      const load = await restGetDoc(projectId, token, `shardLoad/${db}`);
-      const newCount = (load?.count || 0) + 1;
-      const degradedUntil = (load && load.degradedUntil > Date.now()) ? load.degradedUntil : 0;
-      await restSetDoc(projectId, token, `shardLoad/${db}`, { count: newCount, degradedUntil });
+      await restIncrement(projectId, token, `shardLoad/${db}`, 'count');
     } catch { /* best-effort — a missed confirm just slightly under-counts that shard, harmless */ }
     return json({ ok: true });
   }
