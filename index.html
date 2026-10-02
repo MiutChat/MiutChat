@@ -337,6 +337,14 @@
 
     <div class="sidebar-footer">
 
+      <button class="btn-skip ripple-btn" id="btn-report-problem" style="margin-bottom:8px">
+        <svg viewBox="0 0 20 20" fill="none" width="14" height="14" style="flex-shrink:0">
+          <path d="M10 6v5M10 14h.01" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          <path d="M8.6 2.9L1.5 15a1.5 1.5 0 001.3 2.2h14.4a1.5 1.5 0 001.3-2.2L11.4 2.9a1.5 1.5 0 00-2.8 0z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+        </svg>
+        Report a problem
+      </button>
+
       <button class="btn-logout ripple-btn" id="btn-logout">
         <svg viewBox="0 0 20 20" fill="none" width="14" height="14" style="flex-shrink:0">
           <path d="M13 10H3M5 7l-3 3 3 3" stroke="currentColor" stroke-width="1.5"
@@ -685,7 +693,7 @@
 <div id="feedback-modal" class="modal-overlay" style="display:none">
   <div class="modal feedback-modal">
     <div class="modal-header">
-      <h3>QUICK FEEDBACK</h3>
+      <h3 id="feedback-title">QUICK FEEDBACK</h3>
       <button class="icon-btn" id="feedback-close-btn" title="Skip">
         <svg viewBox="0 0 20 20" fill="none" width="16" height="16">
           <path d="M15 5L5 15M5 5l10 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -693,7 +701,7 @@
       </button>
     </div>
     <div class="modal-body">
-      <p class="feedback-lead">
+      <p class="feedback-lead" id="feedback-lead">
         You've left <strong id="feedback-room-code">the room</strong>. Mind rating your session?
         It's completely anonymous and helps us improve MiutChat.
       </p>
@@ -734,10 +742,29 @@
 
       <div class="feedback-actions">
         <button class="btn-skip ripple-btn" id="feedback-skip-btn">SKIP</button>
-        <button class="btn-join ripple-btn small" id="feedback-submit-btn" disabled>SEND FEEDBACK</button>
+        <button class="btn-join ripple-btn small" id="feedback-submit-btn" disabled><span id="feedback-submit-label">SEND FEEDBACK</span></button>
       </div>
       <div class="feedback-privacy-note">
         Feedback is anonymous — it isn't linked to your name or messages.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="announcement-modal" class="modal-overlay" style="display:none">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>ANNOUNCEMENT</h3>
+      <button class="icon-btn" id="announcement-close-btn" title="Close">
+        <svg viewBox="0 0 20 20" fill="none" width="16" height="16">
+          <path d="M15 5L5 15M5 5l10 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <p class="feedback-lead" id="announcement-body" style="white-space:pre-wrap"></p>
+      <div class="feedback-actions">
+        <button class="btn-join ripple-btn small" id="announcement-ok-btn" style="margin-left:auto">GOT IT</button>
       </div>
     </div>
   </div>

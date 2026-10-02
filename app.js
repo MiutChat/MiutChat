@@ -1114,9 +1114,55 @@ window.addEventListener('DOMContentLoaded', () => {
       db = firebase.firestore(firebase.app(_bootDbName));
     } catch (e) {
     }
+    _checkAnnouncement();
   }).catch(err => {
     console.error('[App] Firebase unavailable at startup:', err.message);
   });
+
+/**
+ * Announcement popup — content lives entirely in Firestore, at
+ * config/announcement on the PRIMARY (miut-db0) project, edited directly
+ * in the Firebase console (no app deploy needed to change it):
+ *   config/announcement = { message: "Your text here" }
+ * Empty or missing `message` → nothing shown, ever. Once shown, a given
+ * exact message text is remembered (localStorage) so the SAME announcement
+ * doesn't nag on every visit — editing the message to new text makes it
+ * show again to everyone, since it's compared by content, not a flag.
+ * Entirely best-effort: any failure here (offline, rules not yet applied,
+ * doc doesn't exist) just means no popup — never blocks anything else.
+ */
+async function _checkAnnouncement() {
+  try {
+    const snap = await firebase.firestore(firebase.app('miut-db0'))
+      .collection('config').doc('announcement').get();
+    const msg = (snap.exists ? (snap.data()?.message || '') : '').trim();
+    if (!msg) return;
+
+    let seen = '';
+    try { seen = localStorage.getItem('miut_announcement_seen') || ''; } catch {}
+    if (seen === msg) return;
+
+    _showAnnouncementPopup(msg);
+  } catch (e) {
+    console.warn('[MIUT] Announcement check skipped:', e.message);
+  }
+}
+
+function _showAnnouncementPopup(msg) {
+  const overlay = $('announcement-modal');
+  const body    = $('announcement-body');
+  if (!overlay || !body) return;
+  body.textContent = msg;
+  overlay.style.display = 'flex';
+
+  const close = () => {
+    overlay.style.display = 'none';
+    try { localStorage.setItem('miut_announcement_seen', msg); } catch {}
+  };
+  $('announcement-close-btn')?.addEventListener('click', close, { once: true });
+  $('announcement-ok-btn')?.addEventListener('click', close, { once: true });
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); }, { once: true });
+}
 
 
 
@@ -5643,18 +5689,41 @@ const _fbTags = new Set();
 
 function _fbResolveEls() {
   return {
-    overlay:  $('feedback-modal'),
-    roomLbl:  $('feedback-room-code'),
-    stars:    $('feedback-stars'),
-    ratingLbl:$('feedback-rating-label'),
-    tagsWrap: $('feedback-tags'),
-    comment:  $('feedback-comment'),
-    charCount:$('feedback-charcount'),
-    submitBtn:$('feedback-submit-btn'),
-    skipBtn:  $('feedback-skip-btn'),
-    closeBtn: $('feedback-close-btn'),
+    overlay:   $('feedback-modal'),
+    title:     $('feedback-title'),
+    lead:      $('feedback-lead'),
+    roomLbl:   $('feedback-room-code'),
+    stars:     $('feedback-stars'),
+    ratingLbl: $('feedback-rating-label'),
+    tagsWrap:  $('feedback-tags'),
+    comment:   $('feedback-comment'),
+    charCount: $('feedback-charcount'),
+    submitBtn: $('feedback-submit-btn'),
+    submitLbl: $('feedback-submit-label'),
+    skipBtn:   $('feedback-skip-btn'),
+    closeBtn:  $('feedback-close-btn'),
   };
 }
+
+// Copy for the two contexts this one modal is used in: the existing
+// post-leave survey, and the new "report a problem right now" entry point
+// reachable from the sidebar at any time during a session. Same modal, same
+// /feedback collection, same Firestore rule — just different framing so it
+// reads naturally in each context. The live-report comment gets a "[LIVE] "
+// prefix (see _fbSubmit) so entries made mid-session are distinguishable
+// from the post-session survey without needing a schema/rules change.
+const _FB_COPY = {
+  session: {
+    title: 'QUICK FEEDBACK',
+    lead: `You've left <strong id="feedback-room-code">the room</strong>. Mind rating your session? It's completely anonymous and helps us improve MiutChat.`,
+    submitLabel: 'SEND FEEDBACK',
+  },
+  live: {
+    title: 'REPORT A PROBLEM',
+    lead: `Something not working right? Let us know what's going on — this is completely anonymous and goes straight to the people building MiutChat.`,
+    submitLabel: 'SEND REPORT',
+  },
+};
 
 const _FB_RATING_LABELS = { 0: 'Tap a star to rate', 1: 'Poor', 2: 'Fair', 3: 'Good', 4: 'Great', 5: 'Excellent' };
 
@@ -5682,26 +5751,43 @@ function _fbReset() {
 }
 
 /**
- * Shows the post-leave feedback modal. Resolves once the user has either
- * submitted, skipped, or dismissed it — never rejects, so callers can just
- * `await` it without a try/catch.
+ * Shows the feedback modal in one of two modes:
+ *   'session' (default) — the existing post-leave survey.
+ *   'live' — "report a problem", reachable from the sidebar at any time
+ *            during an active session, for the person who wants to flag
+ *            something wrong without waiting until they leave.
+ * Resolves once the user has either submitted, skipped, or dismissed it —
+ * never rejects, so callers can just `await` it without a try/catch.
  */
-function showFeedbackModal(roomCode) {
+function showFeedbackModal(roomCode, mode) {
   return new Promise(resolve => {
-    const { overlay, roomLbl } = _fbResolveEls();
+    const { overlay, title, lead } = _fbResolveEls();
     if (!overlay) { resolve(); return; }
 
-    _fbReset();
+    mode = (mode === 'live') ? 'live' : 'session';
+    const copy = _FB_COPY[mode];
+    if (title) title.textContent = copy.title;
+    if (lead) lead.innerHTML = copy.lead;
+    const { roomLbl, submitLbl } = _fbResolveEls(); // re-resolve: 'session' mode just recreated #feedback-room-code
     if (roomLbl) roomLbl.textContent = roomCode ? `“${roomCode}”` : 'the room';
+    if (submitLbl) submitLbl.textContent = copy.submitLabel;
+
+    _fbReset();
     overlay.style.display = 'flex';
 
     const done = () => { overlay.style.display = 'none'; resolve(); };
     overlay.dataset.roomCode = roomCode || '';
-    overlay.dataset._resolve = '1';
+    overlay.dataset.mode = mode;
     overlay._fbDone = done;
 
     setTimeout(() => $('feedback-close-btn')?.focus(), 40);
   });
+}
+
+/** Sidebar "Report a problem" entry point — usable any time mid-session. */
+function openLiveReportModal() {
+  if (typeof closeSidebar === 'function') closeSidebar();
+  showFeedbackModal(state.roomCode, 'live').catch(() => {});
 }
 
 async function _fbSubmit() {
@@ -5709,7 +5795,12 @@ async function _fbSubmit() {
   if (!overlay || _fbRating === 0 || !overlay._fbDone) return;
 
   const roomCode = overlay.dataset.roomCode || '';
-  const commentText = (comment?.value || '').trim().slice(0, 500);
+  const mode = overlay.dataset.mode === 'live' ? 'live' : 'session';
+  // "[LIVE] " prefix marks this as a mid-session report rather than the
+  // post-leave survey, within the comment field the rule already allows —
+  // no schema or rule change needed to tell the two apart later.
+  const prefix = mode === 'live' ? '[LIVE] ' : '';
+  const commentText = (prefix + (comment?.value || '').trim()).slice(0, 500);
 
   if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'SENDING…'; }
 
@@ -5725,26 +5816,30 @@ async function _fbSubmit() {
         createdAt:  firebase.firestore.FieldValue.serverTimestamp(),
       });
     }
-    _fbShowThanks();
+    _fbShowThanks(mode);
     setTimeout(() => overlay._fbDone && overlay._fbDone(), 1400);
   } catch (e) {
     _log('warn', '[MIUT] Feedback submit failed:', e);
-    toast('Feedback', "Couldn't send feedback — thanks for trying!", 'alert');
+    toast('Feedback', "Couldn't send — thanks for trying!", 'alert');
     overlay._fbDone();
   }
 }
 
-function _fbShowThanks() {
+function _fbShowThanks(mode) {
   const body = document.querySelector('#feedback-modal .modal-body');
   if (!body) return;
+  const title = mode === 'live' ? 'REPORT SENT' : 'THANKS FOR THE FEEDBACK';
+  const sub   = mode === 'live'
+    ? 'Thanks for flagging it — we\'ll take a look.'
+    : 'It helps us make MiutChat better for everyone.';
   body.innerHTML = `
     <div class="feedback-submitted">
       <svg viewBox="0 0 24 24" width="40" height="40" fill="none">
         <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6"/>
         <path d="M7.5 12.5l3 3 6-6.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <div class="feedback-submitted-title">THANKS FOR THE FEEDBACK</div>
-      <div class="feedback-submitted-sub">It helps us make MiutChat better for everyone.</div>
+      <div class="feedback-submitted-title">${title}</div>
+      <div class="feedback-submitted-sub">${sub}</div>
     </div>`;
 }
 
@@ -5786,6 +5881,8 @@ function _fbWireOnce() {
   skipBtn?.addEventListener('click', () => _fbSkip());
   closeBtn?.addEventListener('click', () => _fbSkip());
   overlay.addEventListener('click', e => { if (e.target === overlay) _fbSkip(); });
+
+  $('btn-report-problem')?.addEventListener('click', () => openLiveReportModal());
 }
 
 function showError(msg, type) {
