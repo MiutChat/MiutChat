@@ -442,13 +442,20 @@ let   _seenNoncesArr = []; // for eviction (oldest first)
 
 /**
  * validateMessageTimestamp(ts) → boolean
- * Rejects messages older than REPLAY_WINDOW_MS or more than 30s in the future.
+ * Rejects only a timestamp implausibly far in the FUTURE (forged envelope /
+ * bad clock skew) — never rejects on age alone. This gates the live
+ * listener's catch-up path (new messages since last seen), which routinely
+ * includes a batch older than a few minutes whenever someone's tab was
+ * backgrounded or offline for a while; rejecting those on age used to make
+ * them silently vanish — no placeholder, nothing in the DOM, just missing —
+ * which is strictly worse than the matching bug this sibling check in
+ * crypto-engine.js's _validateTimestamp used to have (that one at least
+ * showed "[encrypted]"). Actual message expiry belongs to msgTtlMs /
+ * autoDeleteAt / the TTL sweep, not here.
  */
 function validateMessageTimestamp(ts) {
   const now  = Date.now();
-  const diff = now - ts;
-  if (diff > _REPLAY_WINDOW_MS) return false;
-  if (diff < -30_000)           return false;
+  if (ts - now > 30_000) return false;
   return true;
 }
 

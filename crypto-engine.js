@@ -9,7 +9,6 @@ const SKIP_COMPRESS_MIME = new Set([
   'video/mp4','video/webm','video/ogg','audio/mpeg','audio/ogg',
   'audio/webm','application/zip','application/gzip','application/zstd',
 ]);
-const REPLAY_WINDOW_MS = 300_000;
 const _seenIVs = new Set();
 const _iksCache = new Map();
 
@@ -55,8 +54,19 @@ function _buildAAD(roomCode, senderId, epoch, timestamp, chunkIndex) {
 
 function _validateTimestamp(timestamp) {
   const now = Date.now();
-  const delta = Math.abs(now - timestamp);
-  if (delta > REPLAY_WINDOW_MS) throw new Error(`REPLAY: timestamp delta ${delta}ms exceeds ${REPLAY_WINDOW_MS}ms`);
+  // Only reject a timestamp implausibly far in the FUTURE — a sign of a
+  // forged envelope or badly skewed clock. A message's age in the PAST is
+  // never, on its own, a reason to refuse decryption: that's exactly what
+  // chat history is. The previous version of this check rejected anything
+  // older than REPLAY_WINDOW_MS (5 min) too, which meant simply leaving
+  // and re-entering a room — or just reloading the page — made every
+  // message older than 5 minutes permanently undecryptable. That wasn't a
+  // security feature; it was silent, irreversible data loss (reported by
+  // users as messages stuck showing "[encrypted]"). Actual message expiry
+  // is handled correctly elsewhere — msgTtlMs / autoDeleteAt / the room's
+  // own TTL sweep in fetchHistoryOnce — and has no reason to overlap with
+  // decrypt-time validation at all.
+  if (timestamp - now > 60_000) throw new Error(`REPLAY: timestamp is ${timestamp - now}ms in the future`);
 }
 
 function _checkIVUnique(iv) {
