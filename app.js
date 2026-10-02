@@ -1152,7 +1152,11 @@ function _showAnnouncementPopup(msg) {
   const overlay = $('announcement-modal');
   const body    = $('announcement-body');
   if (!overlay || !body) return;
-  body.textContent = msg;
+  // renderTextContent() escapes first and then applies the same light
+  // **bold** / *italic* / ~~strike~~ / `code` formatting messages get,
+  // so an announcement can use it too — safe, since it HTML-escapes the
+  // raw text before ever touching innerHTML.
+  body.innerHTML = renderTextContent(msg);
   overlay.style.display = 'flex';
 
   const close = () => {
@@ -4539,6 +4543,24 @@ function renderTextContent(text) {
     return token;
   });
 
+  // ── Lightweight inline formatting ───────────────────────────────────
+  // Not real Markdown — just the handful of markers people already type
+  // out of habit. Runs on the already-escaped string (esc() above), so
+  // there's no raw HTML here to worry about; URLs are safely stashed
+  // behind \u0000N\u0000 tokens by this point so a stray */~/` inside a
+  // link can't be mistaken for a formatting marker. Order matters: bold
+  // (**) is matched before italic (*) so **x** isn't half-eaten by the
+  // italic pattern first.
+  // (Note: the bold pass runs first and consumes every ** pair, so by the
+  // time the italic pass runs no double-asterisk sequence is left to
+  // confuse it — no lookbehind needed, which keeps this working on older
+  // Safari/WebViews that don't support it.)
+  html = html
+    .replace(/\*\*([^\n*]+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^\n*]+?)\*/g,     '<em>$1</em>')
+    .replace(/~~([^\n~]+?)~~/g,     '<del>$1</del>')
+    .replace(/`([^\n`]+?)`/g,       '<code>$1</code>');
+
   html = html.replace(/@([A-Za-z][A-Za-z0-9]+(?: [A-Za-z][A-Za-z0-9]+)*)/gi, '<span class="mention">@$1</span>');
 
   return html.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);
@@ -5778,6 +5800,7 @@ function showFeedbackModal(roomCode, mode) {
     const done = () => { overlay.style.display = 'none'; resolve(); };
     overlay.dataset.roomCode = roomCode || '';
     overlay.dataset.mode = mode;
+    overlay.dataset.submitted = '';
     overlay._fbDone = done;
 
     setTimeout(() => $('feedback-close-btn')?.focus(), 40);
@@ -5816,8 +5839,12 @@ async function _fbSubmit() {
         createdAt:  firebase.firestore.FieldValue.serverTimestamp(),
       });
     }
+    // Stay up until the person explicitly closes it (header × button) —
+    // no auto-dismiss timer, and the backdrop-click shortcut is disabled
+    // below once `submitted` is set, so this one confirmation is the only
+    // thing shown and it only goes away on an explicit close.
+    overlay.dataset.submitted = '1';
     _fbShowThanks(mode);
-    setTimeout(() => overlay._fbDone && overlay._fbDone(), 1400);
   } catch (e) {
     _log('warn', '[MIUT] Feedback submit failed:', e);
     toast('Feedback', "Couldn't send — thanks for trying!", 'alert');
@@ -5880,7 +5907,11 @@ function _fbWireOnce() {
   submitBtn?.addEventListener('click', () => _fbSubmit());
   skipBtn?.addEventListener('click', () => _fbSkip());
   closeBtn?.addEventListener('click', () => _fbSkip());
-  overlay.addEventListener('click', e => { if (e.target === overlay) _fbSkip(); });
+  // Once the "report sent" confirmation is showing, only the × above
+  // dismisses it — a stray tap on the backdrop should not.
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay && overlay.dataset.submitted !== '1') _fbSkip();
+  });
 
   $('btn-report-problem')?.addEventListener('click', () => openLiveReportModal());
 }

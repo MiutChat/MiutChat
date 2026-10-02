@@ -299,6 +299,8 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .btn-logout{width:100%;padding:10px 14px;display:flex;align-items:center;justify-content:center;gap:8px;background:transparent;border:1px solid var(--border);border-radius:var(--r);color:var(--text2);font-family:var(--fui);font-size:.67rem;font-weight:600;letter-spacing:2px;transition:border-color var(--fast) ease,color var(--fast) ease,background var(--fast) ease,transform var(--fast) var(--spring)}
 .btn-logout:hover{border-color:var(--danger);color:var(--danger);background:var(--d-dim)}
 .btn-logout:active{transform:scale(.97)}
+.sidebar-footer .btn-skip{width:100%;padding:10px 14px;display:flex;align-items:center;justify-content:center;gap:8px;font-size:.67rem}
+.sidebar-footer .btn-skip:hover{border-color:var(--text2);color:var(--text)}
 /* Sidebar is a direct <body> child — not inside #app stacking context.
    Overlay z-index:30, sidebar z-index:31. Pure CSS z-index works correctly. */
 #sidebar-overlay{
@@ -476,6 +478,8 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .msg-highlight{animation:msg-hl 2s ease!important}
 .editing-highlight{outline:2px solid var(--teal)!important;outline-offset:3px;box-shadow:0 0 0 5px var(--teal-glow)!important}
 .mention{font-family:var(--fui);font-size:.82em;font-weight:700;letter-spacing:.5px;color:var(--teal);background:var(--teal-dim);border-radius:5px;padding:0 3px}
+.msg-bubble code{background:rgba(127,127,127,.18);border-radius:4px;padding:1px 5px;font-family:var(--fmono);font-size:.92em}
+.msg-wrapper.sent .msg-bubble code{background:rgba(5,13,12,.18)}
 .msg-link{color:var(--teal);text-decoration:underline;text-decoration-color:var(--teal-b);word-break:break-word;transition:text-decoration-color var(--fast) ease}
 .msg-link:hover,.msg-link:active{text-decoration-color:var(--teal)}
 /* While selecting messages for bulk actions, tapping a link should toggle
