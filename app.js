@@ -1152,11 +1152,7 @@ function _showAnnouncementPopup(msg) {
   const overlay = $('announcement-modal');
   const body    = $('announcement-body');
   if (!overlay || !body) return;
-  // renderTextContent() escapes first and then applies the same light
-  // **bold** / *italic* / ~~strike~~ / `code` formatting messages get,
-  // so an announcement can use it too — safe, since it HTML-escapes the
-  // raw text before ever touching innerHTML.
-  body.innerHTML = renderTextContent(msg);
+  body.textContent = msg;
   overlay.style.display = 'flex';
 
   const close = () => {
@@ -1645,10 +1641,21 @@ function bootApp() {
   toast('Joined room · ' + state.roomCode, 'Share this code to invite others', 'ok');
 }
 
-async function checkApprovalAndBoot() {
+async function checkApprovalAndBoot(_retryCount) {
+  _retryCount = _retryCount || 0;
   try {
     // (same room code → same hash → same db index) but db may be stale.
     db = await getDb(state.roomCode);
+    // Page-refresh resume races Firebase's async anonymous-session restore:
+    // without this, the reads below can fire before `request.auth` exists,
+    // get permission-denied, land in the catch below, and previously just
+    // booted anyway with _roomSalt/_roomEpoch never set — silently breaking
+    // decryption for every message in the room, not just old ones, since
+    // the key derivation depends on the room's real salt, not per-message
+    // state. getUID() blocks until auth for this specific shard is ready.
+    const _dbName = window.getCurrentDbName?.(state.roomCode) || 'miut-db0';
+    await getUID(_dbName);
+
     const roomSnap = await db.collection('rooms').doc(state.roomCode).get();
     if (roomSnap.exists) {
       _roomEpoch = roomSnap.data()?.epoch || 0;
@@ -1698,14 +1705,24 @@ async function checkApprovalAndBoot() {
       showWaitingScreen();
     }
   } catch(e) {
-    _log('warn', '[MIUT] checkApprovalAndBoot error — falling back to boot:', e?.message || e);
-    // Mark online best-effort; if offline this fails silently
-    if (state.roomCode && state.me?.id) {
-      db.collection('rooms').doc(state.roomCode)
-        .collection('members').doc(state.me.id)
-        .update({ online: true }).catch(() => {});
+    _log('warn', '[MIUT] checkApprovalAndBoot error (attempt ' + (_retryCount + 1) + '):', e?.message || e);
+    // Most failures here are the transient auth-race described above —
+    // worth a couple of short retries before giving up. Capped so a
+    // genuine, non-transient failure (room actually gone, real permission
+    // issue) doesn't retry forever.
+    if (_retryCount < 2) {
+      setTimeout(() => checkApprovalAndBoot(_retryCount + 1), 600 * (_retryCount + 1));
+      return;
     }
-    bootApp();
+    // Retries exhausted. Previously this fell through to bootApp() anyway —
+    // with _roomSalt/_roomEpoch/state.me.role never set from the real room
+    // doc, which is exactly what made every message fail to decrypt and
+    // let a stale role silently re-trigger. Booting into a broken session
+    // is worse than an honest error: send back to the join screen instead.
+    localStorage.removeItem(CONFIG.SESSION_KEY);
+    localStorage.removeItem(CONFIG.ROOM_KEY);
+    showScreen('join-screen');
+    setTimeout(() => showError('Could not reconnect to the room. Please enter the room code again.'), 300);
   }
 }
 
@@ -4543,24 +4560,6 @@ function renderTextContent(text) {
     return token;
   });
 
-  // ── Lightweight inline formatting ───────────────────────────────────
-  // Not real Markdown — just the handful of markers people already type
-  // out of habit. Runs on the already-escaped string (esc() above), so
-  // there's no raw HTML here to worry about; URLs are safely stashed
-  // behind \u0000N\u0000 tokens by this point so a stray */~/` inside a
-  // link can't be mistaken for a formatting marker. Order matters: bold
-  // (**) is matched before italic (*) so **x** isn't half-eaten by the
-  // italic pattern first.
-  // (Note: the bold pass runs first and consumes every ** pair, so by the
-  // time the italic pass runs no double-asterisk sequence is left to
-  // confuse it — no lookbehind needed, which keeps this working on older
-  // Safari/WebViews that don't support it.)
-  html = html
-    .replace(/\*\*([^\n*]+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*([^\n*]+?)\*/g,     '<em>$1</em>')
-    .replace(/~~([^\n~]+?)~~/g,     '<del>$1</del>')
-    .replace(/`([^\n`]+?)`/g,       '<code>$1</code>');
-
   html = html.replace(/@([A-Za-z][A-Za-z0-9]+(?: [A-Za-z][A-Za-z0-9]+)*)/gi, '<span class="mention">@$1</span>');
 
   return html.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);
@@ -5800,7 +5799,6 @@ function showFeedbackModal(roomCode, mode) {
     const done = () => { overlay.style.display = 'none'; resolve(); };
     overlay.dataset.roomCode = roomCode || '';
     overlay.dataset.mode = mode;
-    overlay.dataset.submitted = '';
     overlay._fbDone = done;
 
     setTimeout(() => $('feedback-close-btn')?.focus(), 40);
@@ -5839,12 +5837,8 @@ async function _fbSubmit() {
         createdAt:  firebase.firestore.FieldValue.serverTimestamp(),
       });
     }
-    // Stay up until the person explicitly closes it (header × button) —
-    // no auto-dismiss timer, and the backdrop-click shortcut is disabled
-    // below once `submitted` is set, so this one confirmation is the only
-    // thing shown and it only goes away on an explicit close.
-    overlay.dataset.submitted = '1';
     _fbShowThanks(mode);
+    setTimeout(() => overlay._fbDone && overlay._fbDone(), 1400);
   } catch (e) {
     _log('warn', '[MIUT] Feedback submit failed:', e);
     toast('Feedback', "Couldn't send — thanks for trying!", 'alert');
@@ -5907,11 +5901,7 @@ function _fbWireOnce() {
   submitBtn?.addEventListener('click', () => _fbSubmit());
   skipBtn?.addEventListener('click', () => _fbSkip());
   closeBtn?.addEventListener('click', () => _fbSkip());
-  // Once the "report sent" confirmation is showing, only the × above
-  // dismisses it — a stray tap on the backdrop should not.
-  overlay.addEventListener('click', e => {
-    if (e.target === overlay && overlay.dataset.submitted !== '1') _fbSkip();
-  });
+  overlay.addEventListener('click', e => { if (e.target === overlay) _fbSkip(); });
 
   $('btn-report-problem')?.addEventListener('click', () => openLiveReportModal());
 }
