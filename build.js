@@ -100,13 +100,25 @@ const JS_JOBS = [
   ['crypto-bridge.js',       'crypto-bridge.min.js',       'es2020'],
   ['placeholder-rotator.js', 'placeholder-rotator.min.js', 'es2017'],
   ['security.js',            'security.min.js',            'es2020'],
+  ['storage-engine.js',      'storage-engine.min.js',      'es2020'],
+  ['screen-guard.js',        'screen-guard.min.js',        'es2020'],
 ];
 for (const [inp, out, tgt] of JS_JOBS) {
   if (!fs.existsSync(path.join(ROOT, inp))) { log('  skip', inp+' not found', C.yellow); continue; }
   // app.js declares `const APP_VERSION = '...'` — stamp the unified VERSION
   // in at build time so it's never hand-edited out of sync (see version.js).
+  // crypto-bridge.js loads its worker by the UNMINIFIED filename at
+  // runtime (`new Worker('crypto-worker.js')`) — that file is only ever
+  // emitted here as crypto-worker.min.js (see the worker build step
+  // below), so without this rewrite every production load 404s on
+  // crypto-worker.js, the worker never initializes, and every encrypt/
+  // decrypt call that goes through it fails with "Worker error:
+  // undefined" — which looks exactly like a corrupted/undecryptable
+  // message but is actually just a missing file.
   const versionTransform = inp === 'app.js'
     ? t => t.replace(/const APP_VERSION\s*=\s*'[^']*';/, `const APP_VERSION = '${VERSION}';`)
+    : inp === 'crypto-bridge.js'
+    ? t => t.replace(/'crypto-worker\.js'/g, "'crypto-worker.min.js'").replace(/"crypto-worker\.js"/g, '"crypto-worker.min.js"')
     : undefined;
   const tmp = prepTmp(inp, versionTransform); tmps.push(tmp);
   const orig = fs.statSync(path.join(ROOT,inp)).size;
@@ -197,7 +209,8 @@ html = html
   .replace(/src="crypto-engine\.js"/g,       'src="crypto-engine.min.js"')
   .replace(/src="crypto-bridge\.js"/g,       'src="crypto-bridge.min.js"')
   .replace(/src="storage-engine\.js"/g,      'src="storage-engine.min.js"')
-  .replace(/src="security\.js"/g,            'src="security.min.js"');
+  .replace(/src="security\.js"/g,            'src="security.min.js"')
+  .replace(/src="screen-guard\.js"/g,        'src="screen-guard.min.js"');
 
 if (isProd) {
   for (const [f, h] of Object.entries(sri)) {
