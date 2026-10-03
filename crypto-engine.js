@@ -151,7 +151,7 @@ async function encryptText(plaintext, roomCode, senderId, epoch, salt) {
   const timestamp = Date.now();
   const iv = crypto.getRandomValues(new Uint8Array(12));
   _checkIVUnique(iv);
-  const cacheKey = `${roomCode}:${epoch}`;
+  const cacheKey = `${roomCode}:${epoch}:${salt || ''}`;
   let baseKey = _iksCache.get(cacheKey);
   if (!baseKey) {
     const saltBytes = salt ? _b64FastDecode(salt) : new Uint8Array(32);
@@ -188,7 +188,7 @@ async function decryptText(binaryData, roomCode, senderId, epoch, salt) {
   _validateTimestamp(timestamp);
   const iv = buf.slice(off, off + 12); off += 12;
   const ct = buf.slice(off);
-  const cacheKey = `${roomCode}:${epochStored}`;
+  const cacheKey = `${roomCode}:${epochStored}:${salt || ''}`;
   let baseKey = _iksCache.get(cacheKey);
   if (!baseKey) {
     const saltBytes = salt ? _b64FastDecode(salt) : new Uint8Array(32);
@@ -226,7 +226,7 @@ async function encryptFile(file, metadata, roomCode, senderId, epoch, salt, onPr
   const chunkSize = _computeSafeChunkSize(size, CONCURRENCY);
   const totalChunks = Math.ceil(size / chunkSize) || 1;
   const timestamp = Date.now();
-  const cacheKey = `${roomCode}:${epoch}`;
+  const cacheKey = `${roomCode}:${epoch}:${salt || ''}`;
   let baseKey = _iksCache.get(cacheKey);
   if (!baseKey) {
     const saltBytes = salt ? _b64FastDecode(salt) : new Uint8Array(32);
@@ -290,7 +290,7 @@ async function encryptFile(file, metadata, roomCode, senderId, epoch, salt, onPr
 
 async function decryptFile(chunks, roomCode, senderId, epoch, salt) {
   const sorted = [...chunks].sort((a, b) => a.index - b.index);
-  const cacheKey = `${roomCode}:${epoch}`;
+  const cacheKey = `${roomCode}:${epoch}:${salt || ''}`;
   let baseKey = _iksCache.get(cacheKey);
   if (!baseKey) {
     const saltBytes = salt ? _b64FastDecode(salt) : new Uint8Array(32);

@@ -266,11 +266,26 @@ async function _registryCall(body, timeoutMs) {
   }
 }
 
+const _expiredRooms = new Set();
+
 async function _resolveViaRegistry(roomCode) {
   const data = await _registryCall({ action: 'resolve', roomCode });
   if (!data || !data.db) throw new Error('shard-registry returned no db');
-  return data; // { db, isNew }
+  if (data.expired) _expiredRooms.add(roomCode); else _expiredRooms.delete(roomCode);
+  return data; // { db, isNew, expired? }
 }
+
+window.isRoomExpired = function (roomCode) {
+  return _expiredRooms.has(roomCode);
+};
+
+window.markRoomExpired = function (roomCode, dbName) {
+  const name = dbName || _roomDbCache.get(roomCode);
+  if (!roomCode || !name) return;
+  _registryCall({ action: 'expire', roomCode, db: name }, 6000)
+    .then(r => { if (r && r.ok) _expiredRooms.add(roomCode); })
+    .catch(() => {});
+};
 
 async function _bindRegistry(roomCode, dbName, attempt) {
   // Fire-and-forget from the caller's perspective, but retried internally —
@@ -297,6 +312,7 @@ async function _bindRegistry(roomCode, dbName, attempt) {
  * a burst of failed attempts permanently — not just for the day —
  * biases placement away from a shard nothing was ever created on. */
 function _confirmRoomCreated(roomCode, dbName) {
+  _expiredRooms.delete(roomCode);
   _registryCall({ action: 'confirm', roomCode, db: dbName }, 4000).catch(() => {});
 }
 window.confirmRoomCreated = _confirmRoomCreated;

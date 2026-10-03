@@ -1471,6 +1471,10 @@ async function handleEnter() {
     const uid = await getUID(_dbName);
     const roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
+      if (window.isRoomExpired?.(code)) {
+        showError('This room has expired and was deleted.');
+        return;
+      }
       _recordWrongCode();
       return;
     }
@@ -1654,7 +1658,15 @@ async function checkApprovalAndBoot(_retryCount) {
     // the key derivation depends on the room's real salt, not per-message
     // state. getUID() blocks until auth for this specific shard is ready.
     const _dbName = window.getCurrentDbName?.(state.roomCode) || 'miut-db0';
-    await getUID(_dbName);
+    const _resumeUid = await getUID(_dbName);
+    if (_resumeUid !== state.me.id) {
+      localStorage.removeItem(CONFIG.SESSION_KEY);
+      localStorage.removeItem(CONFIG.ROOM_KEY);
+      state.me = null; state.roomCode = null;
+      showScreen('join-screen');
+      setTimeout(() => showError('Your session expired on this device — enter the room code to rejoin.'), 400);
+      return;
+    }
 
     const roomSnap = await db.collection('rooms').doc(state.roomCode).get();
     if (roomSnap.exists) {
@@ -1744,6 +1756,7 @@ function startApprovalListener() {
     .onSnapshot(snap => {
       if (!snap.exists) { handleDeclined('Room closed or request removed.'); return; }
       const data = snap.data();
+      if (data.blocked) { handleBlocked(); return; }
       if (data.declined) { handleDeclined('Your request to join was declined.'); return; }
       if (data.approved) {
         // ✓ Approved — clean up and boot into the chat
@@ -1755,6 +1768,25 @@ function startApprovalListener() {
         bootApp();
       }
     }, () => {});
+}
+
+let _blockHandled = false;
+function handleBlocked() {
+  if (_blockHandled || !state.roomCode) return;
+  _blockHandled = true;
+  const code = state.roomCode;
+  if (_unsubApproval) { try { _unsubApproval(); } catch {} _unsubApproval = null; }
+  clearInterval(_heartbeat);
+  clearMyTyping();
+  stopListeners();
+  clearCacheForRoom(code).catch(() => {});
+  localStorage.removeItem(CONFIG.SESSION_KEY);
+  localStorage.removeItem(CONFIG.ROOM_KEY);
+  state.me = null; state.roomCode = null; _isAdmin = false;
+  showScreen('join-screen');
+  setTimeout(() => showError('You have been blocked from this room by an admin.'), 300);
+  toast('Removed from room', 'An admin blocked you. You can no longer join this room.', 'err');
+  setTimeout(() => { _blockHandled = false; }, 1500);
 }
 
 function handleDeclined(msg = 'Request declined.') {
@@ -2051,7 +2083,10 @@ function startRoomListener() {
         return;
       }
       const d = snap.data() || {};
-      // Epoch rotation
+      if (state.me?.id && Array.isArray(d.blockedUsers) && d.blockedUsers.includes(state.me.id)) {
+        handleBlocked();
+        return;
+      }
       const newEpoch = d.epoch || 0;
       if (newEpoch > _roomEpoch) {
         _roomEpoch = newEpoch;
@@ -3442,6 +3477,7 @@ async function wipeRoom(code, fsInstance) {
     await batchDelete('members');
     // Firestore rules now require isRoomAdmin() for room doc deletion.
     await fs.collection('rooms').doc(code).delete();
+    window.markRoomExpired?.(code);
   } catch (e) {
     // This used to fail completely silently. A failed wipe here means the
     // room's messages/members subcollections can be left behind even
@@ -3883,7 +3919,7 @@ async function handleFileAttach(e) {
             mime: file.type, fileName: file.name, fileSize: file.size,
             groupId, chunkIdx: idx, chunkOf: parts.length,
             senderId: state.me.id, senderName: state.me.name, senderColor: state.me.color,
-            createdAt: ts_now(), ts: now + idx,
+            createdAt: ts_now(), ts: idx === 0 ? now : Date.now(),
           });
         }));
       }
@@ -4004,7 +4040,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
   $('msg-skeleton')  && ($('msg-skeleton').style.display  = 'none');
   $('room-welcome')  && ($('room-welcome').style.display  = 'none');
 
-  if (data.type === 'chunk' || (data.groupId && data.chunkOf > 1)) {
+  if (!data._assembled && (data.type === 'chunk' || (data.groupId && data.chunkOf > 1))) {
     assembleChunk(data, docId); return;
   }
 
@@ -4290,7 +4326,11 @@ function buildMediaPlaceholder(uid, data) {
 function assembleChunk(data, docId) {
   const gid = data.groupId;
   if (!gid) { _log('warn', '[MIUT media] chunk doc has no groupId, cannot assemble:', docId, data); return; }
-  if (!_chunkGroups[gid]) _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId, firstSeenAt: Date.now() };
+  if (!_chunkGroups[gid]) {
+    _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId, firstSeenAt: Date.now() };
+    setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 8000);
+    setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 30000);
+  }
   _chunkGroups[gid].parts[data.chunkIdx] = data.encData;
   if (data.chunkIdx === 0) { _chunkGroups[gid].meta = data; _chunkGroups[gid].docId = docId; }
   const g = _chunkGroups[gid];
@@ -4309,7 +4349,7 @@ function assembleChunk(data, docId) {
     const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
     delete _chunkGroups[gid];
     _log('debug', `[MIUT media] group ${gid} complete, assembled ${assembled.length} chars, rendering now`);
-    renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type }, g.docId);
+    renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
   }
 }
 
@@ -4347,7 +4387,7 @@ async function _healIncompleteChunkGroups() {
       if (_chunkGroups[gid] && Object.keys(g.parts).length === g.total) {
         const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
         delete _chunkGroups[gid];
-        await renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type }, g.docId);
+        await renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
       }
     } catch (e) { _log('warn', '[MIUT] Could not heal chunk group', gid, e); }
   }
@@ -5376,6 +5416,11 @@ async function joinFromInvite() {
     const uid = await getUID(_dbName);
     const roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
+      if (window.isRoomExpired?.(code)) {
+        if (err) err.textContent = 'This room has expired and was deleted.';
+        if (btn) { btn.disabled = false; const sp = btn.querySelector('span'); if (sp) sp.textContent = 'Join Room'; }
+        return;
+      }
       _recordWrongCode();
       if (err) err.textContent = 'Room not found — check the code and try again.';
       if (btn) { btn.disabled = false; const sp = btn.querySelector('span'); if (sp) sp.textContent = 'Join Room'; }
