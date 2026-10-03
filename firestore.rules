@@ -2,28 +2,70 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ── Helpers ────────────────────────────────────────────────────────────
     function isSignedIn() {
       return request.auth != null;
     }
 
-    function isRoomMember(roomCode) {
-      return exists(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid));
+    function roomData(roomCode) {
+      return get(/databases/$(database)/documents/rooms/$(roomCode)).data;
     }
 
-    function memberRole(roomCode) {
-      return get(/databases/$(database)/documents/rooms/$(roomCode)/members/$(request.auth.uid)).data.role;
+    function memberPath(roomCode, memberId) {
+      return /databases/$(database)/documents/rooms/$(roomCode)/members/$(memberId);
+    }
+
+    function isRoomMember(roomCode) {
+      return isSignedIn() && exists(memberPath(roomCode, request.auth.uid));
+    }
+
+    function myMember(roomCode) {
+      return get(memberPath(roomCode, request.auth.uid)).data;
+    }
+
+    function isApprovedMember(roomCode) {
+      return isRoomMember(roomCode)
+        && myMember(roomCode).get('approved', false) == true
+        && myMember(roomCode).get('blocked', false) != true;
     }
 
     function isRoomAdmin(roomCode) {
-      return isRoomMember(roomCode) && memberRole(roomCode) == 'admin';
+      return isRoomMember(roomCode) && myMember(roomCode).get('role', 'member') == 'admin';
     }
 
     function isRoomCreator(roomCode) {
-      return get(/databases/$(database)/documents/rooms/$(roomCode)).data.creatorId == request.auth.uid;
+      return isSignedIn() && roomData(roomCode).creatorId == request.auth.uid;
     }
 
-    // ── Feedback ─────────────────────────────────────────────────────────────
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function messageExpired(roomCode) {
+      let ttl = roomData(roomCode).get('msgTtlMs', 0);
+      return ttl is number
+        && ttl > 0
+        && resource.data.createdAt is timestamp
+        && request.time.toMillis() > resource.data.createdAt.toMillis() + ttl;
+    }
+
+    function isMemberMessageUpdate() {
+      return changedKeys().hasOnly(['readBy', 'reactions', 'replyTo'])
+        && request.resource.data.get('readBy', {}).diff(resource.data.get('readBy', {})).affectedKeys().hasOnly([request.auth.uid])
+        && request.resource.data.get('reactions', {}).diff(resource.data.get('reactions', {})).affectedKeys().size() <= 1
+        && (
+          !('replyTo' in changedKeys())
+          || (
+            request.resource.data.replyTo.get('enc', 'x') == null
+            && request.resource.data.replyTo.get('deleted', false) == true
+          )
+        );
+    }
+
+    match /config/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
     match /feedback/{feedbackId} {
       allow create: if isSignedIn()
         && request.resource.data.keys().hasOnly(['roomCode','rating','tags','comment','appVersion','createdAt'])
@@ -38,19 +80,12 @@ service cloud.firestore {
         && request.resource.data.appVersion is string
         && request.resource.data.appVersion.size() <= 32
         && request.resource.data.createdAt == request.time;
-      // Feedback is write-once and never readable back through client rules.
       allow read, update, delete: if false;
     }
 
-    // ── Rooms ────────────────────────────────────────────────────────────────
     match /rooms/{roomCode} {
-      // A non-member must be able to check whether a room code is already
-      // taken (createRoom()'s own collision check) BEFORE they're a member
-      // of anything — there's no member doc until the room is created. So
-      // reading a room that doesn't exist yet is allowed for anyone signed
-      // in (it reveals nothing — there's no data there); reading one that
-      // DOES exist still requires membership.
-      allow read: if isSignedIn() && (resource == null || isRoomMember(roomCode));
+      allow get: if isSignedIn();
+      allow list: if false;
 
       allow create: if isSignedIn()
         && request.resource.data.creatorId == request.auth.uid
@@ -58,22 +93,23 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time;
 
       allow update: if isSignedIn()
-        && (isRoomCreator(roomCode) || isRoomAdmin(roomCode))
-        // creatorId can never be reassigned via an update
-        && request.resource.data.creatorId == resource.data.creatorId;
+        && request.resource.data.creatorId == resource.data.creatorId
+        && request.resource.data.get('salt', null) == resource.data.get('salt', null)
+        && (
+          isRoomCreator(roomCode)
+          || isRoomAdmin(roomCode)
+          || (
+            isApprovedMember(roomCode)
+            && changedKeys().hasOnly(['emptyAt', 'autoDeleteAt', 'lastActivity'])
+          )
+        );
 
-      allow delete: if isSignedIn() && isRoomCreator(roomCode);
+      allow delete: if isSignedIn() && (isRoomCreator(roomCode) || isRoomAdmin(roomCode));
 
       match /messages/{msgId} {
-        allow read: if isSignedIn() && isRoomMember(roomCode);
+        allow read: if isApprovedMember(roomCode);
 
-        // Two shapes of message hit this rule: plain text (`enc`, small —
-        // capped generously below plaintext expansion) and image/file/chunk
-        // uploads (`encData`, up to ~800KB base64 per CONFIG.CHUNK_BYTES —
-        // capped just under Firestore's own 1MiB/doc hard limit). A message
-        // has exactly one of the two, never both.
-        allow create: if isSignedIn()
-          && isRoomMember(roomCode)
+        allow create: if isApprovedMember(roomCode)
           && request.resource.data.senderId == request.auth.uid
           && request.resource.data.keys().hasAll(['senderId','createdAt'])
           && request.resource.data.createdAt == request.time
@@ -87,64 +123,68 @@ service cloud.firestore {
               && request.resource.data.encData.size() <= 900000)
           );
 
-        // Only the original fields that are meant to be mutable can change
-        // (e.g. an "edited"/"deleted" flag) — senderId and createdAt are frozen.
-        // Admins may also update (soft-delete-for-everyone) any member's
-        // message — matches the "delete for everyone" moderation feature,
-        // which performs an .update(), not a .delete().
-        allow update: if isSignedIn()
-          && isRoomMember(roomCode)
-          && (resource.data.senderId == request.auth.uid || isRoomAdmin(roomCode))
+        allow update: if isApprovedMember(roomCode)
           && request.resource.data.senderId == resource.data.senderId
-          && request.resource.data.createdAt == resource.data.createdAt;
-
-        allow delete: if isSignedIn()
-          && (resource.data.senderId == request.auth.uid || isRoomAdmin(roomCode));
-      }
-
-      match /members/{uid} {
-        // Same chicken-and-egg as the room doc above, one level deeper:
-        // the enter-room flow's very first step reads its OWN member doc
-        // to check prior approval status — before that doc exists, so
-        // before isRoomMember(roomCode) can ever be true. Reading your OWN
-        // doc must not require already being a proven member; reading
-        // anyone else's still does (room member list, admin views).
-        allow read: if isSignedIn() && (request.auth.uid == uid || isRoomMember(roomCode));
-
-        // A user may only ever write their own membership doc, and may never
-        // grant themselves the admin role. Admins can write any member doc,
-        // including role changes for others, but cannot demote themselves
-        // as the sole admin check happens at the app layer if needed.
-        // `resource` is null on a brand-new doc's first write, so it must
-        // never be dereferenced (resource.data.role) in that branch —
-        // that's a known Firestore rules footgun that silently denies
-        // instead of erroring loudly.
-        //
-        // registerPresence() in app.js does NOT set role='admin' on the
-        // initial create — it always creates as role='member', then sends
-        // a SEPARATE update() escalating to 'admin' right after, for the
-        // room creator specifically. So the update branch below needs its
-        // own creator carve-out too, not just the create branch — the
-        // creator isn't isRoomAdmin(roomCode) yet at the exact moment of
-        // that escalating update (their own role is still 'member' in the
-        // currently-committed doc this rule evaluates against), so
-        // without this they can never actually become admin.
-        allow write: if isSignedIn()
+          && request.resource.data.createdAt == resource.data.createdAt
           && (
-            (request.auth.uid == uid && (
-              !('role' in request.resource.data)
-              || (resource == null
-                    ? (request.resource.data.role != 'admin' || isRoomCreator(roomCode))
-                    : (request.resource.data.role == resource.data.role
-                        || (isRoomCreator(roomCode) && request.resource.data.role == 'admin')))
-            ))
+            resource.data.senderId == request.auth.uid
             || isRoomAdmin(roomCode)
+            || isMemberMessageUpdate()
+          );
+
+        allow delete: if isApprovedMember(roomCode)
+          && (
+            resource.data.senderId == request.auth.uid
+            || isRoomAdmin(roomCode)
+            || messageExpired(roomCode)
           );
       }
 
-      match /typing/{uid} {
-        allow read: if isSignedIn() && isRoomMember(roomCode);
-        allow write: if isSignedIn() && request.auth.uid == uid;
+      match /members/{memberId} {
+        allow read: if isSignedIn() && (request.auth.uid == memberId || isApprovedMember(roomCode));
+
+        allow create: if isSignedIn()
+          && request.auth.uid == memberId
+          && !(request.auth.uid in roomData(roomCode).get('blockedUsers', []))
+          && request.resource.data.keys().hasOnly(['name','color','online','lastSeen','joinedAt','pubKey','role','approved'])
+          && request.resource.data.role == 'member'
+          && request.resource.data.approved == false
+          && request.resource.data.name is string
+          && request.resource.data.name.size() <= 100
+          && request.resource.data.color is string
+          && request.resource.data.color.size() <= 64
+          && (request.resource.data.pubKey == null || (request.resource.data.pubKey is string && request.resource.data.pubKey.size() <= 4000));
+
+        allow update: if isSignedIn()
+          && (
+            (
+              request.auth.uid == memberId
+              && changedKeys().hasOnly(['name','color','online','lastSeen','pubKey'])
+            )
+            || (
+              request.auth.uid == memberId
+              && isRoomCreator(roomCode)
+              && changedKeys().hasOnly(['role','approved'])
+              && request.resource.data.role == 'admin'
+              && request.resource.data.approved == true
+            )
+            || (
+              isRoomAdmin(roomCode)
+              && changedKeys().hasOnly(['approved','role','declined','blocked','online'])
+            )
+          );
+
+        allow delete: if isSignedIn() && (request.auth.uid == memberId || isRoomAdmin(roomCode));
+      }
+
+      match /typing/{typingId} {
+        allow read: if isApprovedMember(roomCode);
+
+        allow create, update: if isApprovedMember(roomCode)
+          && request.auth.uid == typingId
+          && request.resource.data.keys().hasOnly(['name','ts']);
+
+        allow delete: if isSignedIn() && (request.auth.uid == typingId || isRoomAdmin(roomCode));
       }
     }
   }

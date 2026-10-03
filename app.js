@@ -449,13 +449,36 @@ async function enc(text, code, senderId) {
 }
 async function dec(payload, code, senderId) {
   if (!payload) return '';
+  if (!payload.startsWith('x1:')) return '[legacy encrypted — rejoin room to continue]';
   try {
-    if (payload.startsWith('x1:')) {
-      await MiutCryptoBridge.init();
-      const raw = _b64uDec(payload.slice(3));
+    await MiutCryptoBridge.init();
+    const raw = _b64uDec(payload.slice(3));
+    try {
       return await MiutCryptoBridge.decryptText(raw, code, senderId || '', _roomEpoch, _roomSalt || undefined);
+    } catch (e) {
+      // _roomSalt is a module-level var set once from the room doc on
+      // join/boot. If a decrypt runs before that read resolves (or it
+      // silently failed and nothing retried it), every message in this
+      // room fails with a GCM auth error that looks identical to real
+      // corruption. One self-heal attempt: re-read the room doc directly
+      // and retry before giving up, instead of leaving the room's crypto
+      // permanently out of sync with Firestore for the rest of the tab's
+      // life.
+      if (code === state.roomCode && db) {
+        try {
+          const roomSnap = await db.collection('rooms').doc(code).get();
+          const freshSalt = roomSnap.exists ? (roomSnap.data()?.salt || null) : null;
+          if (freshSalt && freshSalt !== _roomSalt) {
+            _roomSalt = freshSalt;
+            return await MiutCryptoBridge.decryptText(raw, code, senderId || '', _roomEpoch, _roomSalt);
+          }
+        } catch {}
+      }
+      _log('warn', '[MIUT decrypt] failed for room', code, {
+        hasSalt: !!_roomSalt, epoch: _roomEpoch, senderIdPresent: !!senderId, err: e?.message,
+      });
+      return '[encrypted]';
     }
-    return '[legacy encrypted — rejoin room to continue]';
   } catch { return '[encrypted]'; }
 }
 
@@ -508,8 +531,26 @@ async function decBytes(b64full, mime, code) {
     const epoch = new DataView(raw.buffer, 0, 4).getUint32(0, false);
     const iv    = raw.slice(4, 16);
     const ct    = raw.slice(16);
-    const key   = await _getEpochKey(code, epoch);
-    let pt      = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
+    let key     = await _getEpochKey(code, epoch);
+    let pt;
+    try {
+      pt = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
+    } catch (e) {
+      // Same self-heal as dec() above: _roomSalt may not have been loaded
+      // into memory yet when this ran.
+      if (code === state.roomCode && db) {
+        try {
+          const roomSnap = await db.collection('rooms').doc(code).get();
+          const freshSalt = roomSnap.exists ? (roomSnap.data()?.salt || null) : null;
+          if (freshSalt && freshSalt !== _roomSalt) {
+            _roomSalt = freshSalt;
+            _epochKeys.delete(`${code}:${epoch}:${freshSalt}`);
+            key = await _getEpochKey(code, epoch);
+            pt = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
+          } else { throw e; }
+        } catch { throw e; }
+      } else { throw e; }
+    }
     // Check compression marker byte
     if (pt.length > 1 && pt[0] === 0xC0) {
       // Decompress
@@ -1676,6 +1717,14 @@ async function checkApprovalAndBoot(_retryCount) {
       _roomSalt  = roomSnap.data()?.salt  || null;
       { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
       _healRoomSchema(state.roomCode, roomSnap.data()).catch(() => {});
+    } else if (_retryCount < 2) {
+      // Room doc read came back empty — almost always the same transient
+      // auth race the comment above describes, just caught one step
+      // later. Treat it the same as the getUID() failure: retry instead
+      // of booting with _roomSalt stuck at its default and every message
+      // in the room failing to decrypt for the rest of this tab's life.
+      setTimeout(() => checkApprovalAndBoot(_retryCount + 1), 600 * (_retryCount + 1));
+      return;
     }
 
     const snap = await db.collection('rooms').doc(state.roomCode)
