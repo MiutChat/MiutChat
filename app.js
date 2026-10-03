@@ -1606,6 +1606,8 @@ async function registerPresence(role = 'member', approved = false) {
 
 function bootApp() {
   _renderedIds.clear();
+  _chunkGroups     = {};    // reset chunk assembly state — stale groups from a prior session
+                            // would block re-assembly of the same groupId on re-enter
   _lastCachedTs    = 0;
   _onlineCount     = 0;
   _presenceSettled = false;  // reset — first snapshot must not trigger wipe
@@ -2457,15 +2459,21 @@ async function loadCachedMessages() {
   _historyExhausted  = false;
 
   // ── Phase 1: render from IDB instantly ──────────
+  // IMPORTANT: renderMsg is async (it awaits MiutCryptoBridge.init() and
+  // decryption). Calling it inside a non-async forEach fires all decryptions
+  // simultaneously BEFORE the crypto bridge worker is ready, causing the
+  // first batch to fail with [encrypted]. Use a sequential for...of loop
+  // so the bridge initialises on the first message and all subsequent ones
+  // share the already-initialised bridge.
   try {
     const cached = await loadCached(code);
     if (cached.length) {
       $('msg-skeleton')  && ($('msg-skeleton').style.display  = 'none');
       $('room-welcome')  && ($('room-welcome').style.display  = 'none');
-      cached.forEach(row => {
+      for (const row of cached) {
         _renderedIds.add(row.id);
-        renderMsg(row.data, row.id);
-      });
+        await renderMsg(row.data, row.id);
+      }
       _lastCachedTs = cached.reduce((m, r) => Math.max(m, r.ts || 0), 0);
       scrollBottom();
     }
@@ -2512,8 +2520,12 @@ async function fetchHistoryOnce(code) {
 
     let hasNew = false;
     for (const doc of docs) {
-      if (_renderedIds.has(doc.id)) continue;
+      // Chunk-type docs (intermediate pieces of a multi-chunk file) must ALWAYS
+      // be passed to assembleChunk even if their docId is in _renderedIds — the
+      // id was added optimistically but the actual chunk data was never assembled.
+      // Only skip for non-chunk types to avoid duplicate text/system bubbles.
       const data = doc.data();
+      if (_renderedIds.has(doc.id) && data.type !== 'chunk') continue;
       // Message TTL (per-message auto-vanish) can lapse while nobody's in
       // the room to run the periodic sweep (_runExpirySweep only acts on
       // messages already rendered in a live DOM). Without this check, an
@@ -4349,6 +4361,11 @@ function assembleChunk(data, docId) {
     const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
     delete _chunkGroups[gid];
     _log('debug', `[MIUT media] group ${gid} complete, assembled ${assembled.length} chars, rendering now`);
+    // Guard: if the primary doc (chunk 0) was already rendered (e.g. history
+    // fetch processed it before all chunks arrived), remove the placeholder
+    // first so we replace it rather than appending a duplicate.
+    const _existingWrap = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(g.docId)}"]`);
+    if (_existingWrap) _existingWrap.remove();
     renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
   }
 }
