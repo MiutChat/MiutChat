@@ -454,7 +454,27 @@ async function getDb(roomCode) {
 
   /* All failed — return primary as last resort to avoid blocking UI */
   const fallback = _ACTIVE_DBS[_hashRoom(roomCode) % _ACTIVE_DBS.length];
-  try { return _instances.get(fallback.name) ?? _initDb(fallback); }
+  try {
+    const fs = _instances.get(fallback.name) ?? _initDb(fallback);
+    // CRITICAL: every OTHER branch above records its pick in _roomDbCache
+    // before returning — this one didn't, which is a real, confirmed bug.
+    // window.getCurrentDbName(roomCode) reads _roomDbCache; every caller
+    // that resolves a dbName for auth (checkApprovalAndBoot, handleCreate,
+    // handleEnter, joinFromInvite) falls back to the literal string
+    // 'miut-db0' when it returns null. If this room's real fallback pick
+    // is a DIFFERENT shard, every one of those callers then signs in
+    // against the WRONG Firebase project — producing a uid that can never
+    // match the one saved for this room. checkApprovalAndBoot's uid
+    // mismatch check (added to detect genuine identity loss) then reads
+    // that as "session expired" and wipes a perfectly good session. This
+    // path is reached whenever the registry AND every shard's own probe
+    // fail/time out together — realistic on a flaky mobile connection,
+    // not a rare edge case — so leaving it unrecorded silently broke
+    // exactly the rooms least likely to have a clean network path.
+    _roomDbCache.set(roomCode, fallback.name);
+    _setPersistedBinding(roomCode, fallback.name);
+    return fs;
+  }
   catch (err) {
     throw new Error('All databases unavailable. Check your network and Firebase credentials. Last error: ' + err.message);
   }

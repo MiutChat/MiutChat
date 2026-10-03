@@ -2224,11 +2224,16 @@ function _sweepStaleChunkGroups() {
     const g = _chunkGroups[gid];
     if (g && g.firstSeenAt && g.firstSeenAt < cutoff) {
       // Never completed after 10 minutes — an interrupted/failed upload.
-      // Evicted rather than kept forever: each entry can hold up to
-      // CONFIG.CHUNK_BYTES worth of base64 text per chunk already
-      // received, which otherwise accumulates for the lifetime of the tab.
+      // This is a backstop behind the per-group 45s stall timer (it only
+      // fires if that timer was somehow missed, e.g. a backgrounded tab
+      // throttling timers). Route through _markChunkGroupFailed() rather
+      // than a bare delete so the UI bubble (if still showing "Receiving…")
+      // gets updated to an explicit failure state instead of being left
+      // stuck forever — each entry can also hold up to CONFIG.CHUNK_BYTES
+      // worth of base64 text per chunk already received, which otherwise
+      // accumulates for the lifetime of the tab.
       _log('debug', `[MIUT media] evicting stale incomplete chunk group ${gid} (${Object.keys(g.parts).length}/${g.total} chunks, never completed)`);
-      delete _chunkGroups[gid];
+      _markChunkGroupFailed(gid);
     }
   }
   // Same leak pattern, smaller payload each but same idea: a placeholder
@@ -3923,17 +3928,42 @@ async function handleFileAttach(e) {
         Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => b.toString(36)).join('').slice(0, 8);
       const now     = Date.now();
       const BATCH   = 4;
-      for (let b = 0; b < parts.length; b += BATCH) {
-        await Promise.all(parts.slice(b, b + BATCH).map((part, li) => {
-          const idx = b + li;
-          return db.collection('rooms').doc(state.roomCode).collection('messages').add({
-            type: idx === 0 ? msgType : 'chunk', encData: part,
-            mime: file.type, fileName: file.name, fileSize: file.size,
-            groupId, chunkIdx: idx, chunkOf: parts.length,
-            senderId: state.me.id, senderName: state.me.name, senderColor: state.me.color,
-            createdAt: ts_now(), ts: idx === 0 ? now : Date.now(),
-          });
-        }));
+      // Tracks every chunk doc actually written so a mid-upload failure can
+      // both report EXACTLY how far it got and clean up the orphaned chunks
+      // that DID succeed. Previously, a batch failure threw straight to the
+      // outer catch while earlier-batch chunks stayed permanently in
+      // Firestore — nothing ever deleted them, so every other room member
+      // would see a file that can never finish assembling (assembleChunk's
+      // part count can never reach the total) with zero indication why,
+      // while the sender just saw a generic "Upload failed" with no count
+      // of how much actually went through.
+      const writtenRefs = [];
+      let chunksSent = 0;
+      try {
+        for (let b = 0; b < parts.length; b += BATCH) {
+          const refs = await Promise.all(parts.slice(b, b + BATCH).map((part, li) => {
+            const idx = b + li;
+            return db.collection('rooms').doc(state.roomCode).collection('messages').add({
+              type: idx === 0 ? msgType : 'chunk', encData: part,
+              mime: file.type, fileName: file.name, fileSize: file.size,
+              groupId, chunkIdx: idx, chunkOf: parts.length,
+              senderId: state.me.id, senderName: state.me.name, senderColor: state.me.color,
+              createdAt: ts_now(), ts: idx === 0 ? now : Date.now(),
+            });
+          }));
+          writtenRefs.push(...refs);
+          chunksSent += refs.length;
+        }
+      } catch (chunkErr) {
+        // Best-effort cleanup of the chunks that DID make it — they can
+        // never complete without the rest, so leaving them orphaned only
+        // guarantees every other member sees a file that hangs forever.
+        // The sender always has delete rights on their own messages
+        // (firestore.rules), so this should normally succeed even though
+        // the write that triggered this catch failed.
+        _log('warn', `[MIUT upload] chunked upload failed after ${chunksSent}/${parts.length} parts for group ${groupId} — cleaning up orphaned chunks:`, chunkErr?.message || chunkErr);
+        await Promise.all(writtenRefs.map(ref => ref.delete().catch(() => {})));
+        throw new Error(`Only ${chunksSent} of ${parts.length} parts uploaded before the connection dropped — the partial upload was cleaned up. Try again.`);
       }
     }
     playSound('send');
@@ -4335,19 +4365,98 @@ function buildMediaPlaceholder(uid, data) {
   return `<div class="msg-media loading" id="${uid}"><div class="media-decrypt-spinner"></div><div class="media-decrypt-label">Decrypting ${data.type}…</div></div>`;
 }
 
+// ─── Chunk-group progress UI ───────────────────────────────────────────────
+// A multi-chunk file/image/video previously rendered NOTHING at all until
+// every chunk had arrived — no placeholder, no progress, nothing. If even
+// one chunk never arrived (sender's upload failed partway, a chunk write
+// was denied, etc.) the message just silently never appeared, forever,
+// with no indication anything was ever sent. This shows a real, visible
+// "receiving N/M parts" bubble the moment the first chunk of a group is
+// seen, keeps it updated as more parts arrive, and — if the group stalls
+// past CHUNK_STALL_MS without completing — replaces it with an explicit
+// "didn't finish uploading" message instead of leaving it stuck forever.
+const CHUNK_STALL_MS = 45_000; // generous for any real multi-chunk upload under normal conditions
+
+function _chunkProgressLabel(have, total, isMine) {
+  const pct = total ? Math.round((have / total) * 100) : 0;
+  return `${isMine ? 'Sending' : 'Receiving'} file… ${have}/${total} parts (${pct}%)`;
+}
+
+function _renderChunkProgressBubble(gid, data, docId) {
+  if (document.querySelector(`[data-group-id="${CSS.escape(gid)}"]`)) return; // already showing
+  const area = $('messages-area');
+  if (!area) return;
+  $('msg-skeleton')  && ($('msg-skeleton').style.display  = 'none');
+  $('room-welcome')  && ($('room-welcome').style.display  = 'none');
+  const isMine = data.senderId === state.me?.id;
+  const wrap = document.createElement('div');
+  wrap.className      = `msg-wrapper ${isMine ? 'sent' : 'received'}`;
+  wrap.dataset.docId   = docId || '';
+  wrap.dataset.groupId = gid;
+  wrap.dataset.ts      = data.ts || '';
+  wrap.innerHTML = `<div class="msg-swipe-wrapper"><div class="msg-bubble-wrap"><div class="msg-inner">
+    <div class="msg-bubble" style="padding:4px;background:transparent">
+      <div class="msg-media loading" data-group-id="${esc(gid)}">
+        <div class="media-decrypt-spinner"></div>
+        <div class="media-decrypt-label">${esc(_chunkProgressLabel(1, data.chunkOf, isMine))}</div>
+      </div>
+    </div>
+  </div></div></div>`;
+  area.appendChild(wrap);
+  scrollBottom();
+}
+
+function _updateChunkProgressBubble(gid, have, total) {
+  const el = document.querySelector(`[data-group-id="${CSS.escape(gid)}"] .media-decrypt-label`);
+  if (!el) return;
+  const isMine = el.closest('.msg-wrapper')?.classList.contains('sent');
+  el.textContent = _chunkProgressLabel(have, total, isMine);
+}
+
+function _removeChunkProgressBubble(gid) {
+  document.querySelectorAll(`[data-group-id="${CSS.escape(gid)}"]`).forEach(el => (el.closest('.msg-wrapper') || el).remove());
+}
+
+/** Called when a chunk group has gone CHUNK_STALL_MS without completing —
+ * replaces its progress bubble (if still showing) with an explicit failure
+ * state so viewers aren't left staring at a "Receiving…" bubble that will
+ * never resolve, with no way to tell a slow upload from a dead one. */
+function _markChunkGroupFailed(gid) {
+  const g = _chunkGroups[gid];
+  if (!g) return;
+  const have = Object.keys(g.parts).length;
+  const total = g.total;
+  delete _chunkGroups[gid];
+  const el = document.querySelector(`[data-group-id="${CSS.escape(gid)}"]`);
+  if (el) {
+    el.classList.remove('loading');
+    el.innerHTML = `<div class="msg-media-err">File didn't finish uploading — only ${have} of ${total} parts arrived. Ask the sender to resend.</div>`;
+  }
+  _log('warn', `[MIUT media] chunk group ${gid} marked failed after stalling at ${have}/${total} parts`);
+}
+
 function assembleChunk(data, docId) {
   const gid = data.groupId;
   if (!gid) { _log('warn', '[MIUT media] chunk doc has no groupId, cannot assemble:', docId, data); return; }
-  if (!_chunkGroups[gid]) {
+  const isNewGroup = !_chunkGroups[gid];
+  if (isNewGroup) {
     _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId, firstSeenAt: Date.now() };
     setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 8000);
     setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 30000);
+    setTimeout(() => {
+      const g = _chunkGroups[gid];
+      if (g && Object.keys(g.parts).length < g.total) _markChunkGroupFailed(gid);
+    }, CHUNK_STALL_MS);
   }
   _chunkGroups[gid].parts[data.chunkIdx] = data.encData;
   if (data.chunkIdx === 0) { _chunkGroups[gid].meta = data; _chunkGroups[gid].docId = docId; }
   const g = _chunkGroups[gid];
   const have = Object.keys(g.parts).length;
   _log('debug', `[MIUT media] chunk ${data.chunkIdx}/${g.total - 1} received for group ${gid} (${have}/${g.total} so far)`);
+
+  if (isNewGroup) _renderChunkProgressBubble(gid, data, docId);
+  else _updateChunkProgressBubble(gid, have, g.total);
+
   if (have === g.total) {
     // Sanity-check every part actually has content before assembling —
     // an empty/undefined part here (e.g. a chunk write that partially
@@ -4361,6 +4470,7 @@ function assembleChunk(data, docId) {
     const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
     delete _chunkGroups[gid];
     _log('debug', `[MIUT media] group ${gid} complete, assembled ${assembled.length} chars, rendering now`);
+    _removeChunkProgressBubble(gid);
     // Guard: if the primary doc (chunk 0) was already rendered (e.g. history
     // fetch processed it before all chunks arrived), remove the placeholder
     // first so we replace it rather than appending a duplicate.
