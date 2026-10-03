@@ -449,7 +449,15 @@ async function enc(text, code, senderId) {
 }
 async function dec(payload, code, senderId) {
   if (!payload) return '';
-  if (!payload.startsWith('x1:')) return '[legacy encrypted — rejoin room to continue]';
+  // Not an "x1:" envelope — this is a message encrypted under a format
+  // this build removed support for entirely (see enc()'s comment above),
+  // not a session/auth problem. There's no key or retry that recovers it:
+  // the old cipher layout itself is gone from this codebase. The previous
+  // copy here ("rejoin room to continue") was actively misleading — it
+  // told people an action existed that would fix this when none does,
+  // which is exactly why rejoining (or even refreshing) never changed
+  // anything and the same message kept reappearing.
+  if (!payload.startsWith('x1:')) return '[message from before an encryption format change — can’t be decrypted]';
   try {
     await MiutCryptoBridge.init();
     const raw = _b64uDec(payload.slice(3));
@@ -4117,6 +4125,48 @@ function _readStatusBadge(data, docId) {
   } catch { return '<span class="msg-status">✓</span>'; }
 }
 
+// ─── Transient-decrypt self-heal ─────────────────────────────────────────────
+// dec() already does ONE same-tick retry (re-fetching the room's salt) when
+// a text message fails to decrypt, but that only fixes a stale _roomSalt —
+// it can't fix a decrypt that failed because the crypto worker, key cache,
+// or WebCrypto subsystem simply wasn't ready yet on this exact tick (a real
+// possibility right after a refresh, when a burst of messages decrypt at
+// once). Previously there was no second chance at all: renderMsg marked the
+// docId in _renderedIds the moment it rendered ANYTHING, including the
+// literal string "[encrypted]", so a one-off transient failure became
+// permanent for the rest of the tab's life even though the ciphertext was
+// perfectly fine and would have decrypted correctly on the very next try.
+// This retries the SAME ciphertext a few times with real delays in between
+// (giving the environment time to actually change) and patches the bubble
+// in place the moment it succeeds — so "[encrypted]" now means "still
+// failing after ~23s of retries", not "failed once, ever."
+const _DECRYPT_RETRY_DELAYS_MS = [2000, 6000, 15000];
+function _scheduleDecryptRetry(wrap, data, docId, onHealed) {
+  let attempt = 0;
+  const tryOnce = async () => {
+    if (!wrap.isConnected) return; // bubble was removed (deleted, room left) — nothing to patch
+    let text;
+    try { text = await dec(data.enc, state.roomCode, data.senderId); } catch { text = '[encrypted]'; }
+    if (text !== '[encrypted]') {
+      const bubbleEl = wrap.querySelector('.msg-bubble');
+      if (bubbleEl) {
+        const editedTag = data.edited ? '<span class="msg-edited"> ✎</span>' : '';
+        bubbleEl.innerHTML = renderTextContent(text) + editedTag;
+      }
+      onHealed?.(text);
+      _log('debug', `[MIUT decrypt] self-healed a transient [encrypted] bubble for ${docId} on retry ${attempt + 1}`);
+      return;
+    }
+    if (attempt < _DECRYPT_RETRY_DELAYS_MS.length - 1) {
+      attempt++;
+      setTimeout(tryOnce, _DECRYPT_RETRY_DELAYS_MS[attempt]);
+    } else {
+      _log('warn', `[MIUT decrypt] bubble ${docId} still "${text}" after ${attempt + 1} retries over ~23s — likely a genuinely wrong key, not a transient race`);
+    }
+  };
+  setTimeout(tryOnce, _DECRYPT_RETRY_DELAYS_MS[0]);
+}
+
 async function renderMsg(data, docId, insertBeforeEl) {
   const area = $('messages-area'); if (!area) return;
 
@@ -4184,7 +4234,11 @@ async function renderMsg(data, docId, insertBeforeEl) {
   }
 
   // Decoded text (used for reply preview)
-  const plainText = data.type === 'text' ? await dec(data.enc, state.roomCode, data.senderId) : null;
+  // `let` (not `const`) — a transient decrypt failure below schedules a
+  // retry that reassigns this once it self-heals, and the reply/react
+  // handlers wired further down close over this same binding, so they see
+  // the healed text too instead of staying stuck quoting "[encrypted]".
+  let plainText = data.type === 'text' ? await dec(data.enc, state.roomCode, data.senderId) : null;
 
   let bubble = '';
   let replyQuote = '';
@@ -4342,6 +4396,33 @@ async function renderMsg(data, docId, insertBeforeEl) {
   if (data.sig && data.type === 'text') {
     // D3: verify signature after DOM paint (async, non-blocking)
     requestAnimationFrame(() => verifyAndBadge(data, docId));
+  }
+
+  if (data.type === 'text') {
+    if (plainText === '[encrypted]' && typeof data.enc === 'string' && data.enc.startsWith('x1:')) {
+      // Self-heal a transient decrypt failure instead of leaving
+      // "[encrypted]" on screen permanently — see _scheduleDecryptRetry's
+      // own comment. Only for genuine x1: envelopes that failed decryption;
+      // a non-x1: payload was never even attempted (see the legacy branch
+      // below) and retrying it would just confirm the same permanent fact.
+      _scheduleDecryptRetry(wrap, data, docId, healedText => { plainText = healedText; });
+    } else if (
+      typeof data.enc === 'string' && data.enc && !data.enc.startsWith('x1:') &&
+      docId && !String(docId).startsWith('local_') && db &&
+      (isMine || _isAdmin)
+    ) {
+      // Permanently-undecryptable pre-unification message (see dec()'s own
+      // comment — there is no retry or rejoin that fixes this one, the old
+      // cipher format itself no longer exists in this codebase). Rather
+      // than let it sit forever as clutter nobody can ever read, clean it
+      // up now that whoever's looking at it actually has delete rights
+      // (their own message, or an admin) — firestore.rules already allows
+      // this exact delete. Fire-and-forget; a failed delete just leaves it
+      // for next time, same as before this existed.
+      db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).delete()
+        .then(() => { wrap.remove(); _renderedIds.delete(docId); })
+        .catch(() => {});
+    }
   }
 }
 
@@ -4745,6 +4826,19 @@ async function patchMsg(id, data) {
 }
 function renderTextContent(text) {
   let html = esc(text).replace(/\n/g, '<br>');
+
+  // Lightweight markdown-style formatting: **bold**, *italic*, ~~strike~~,
+  // `code`. Runs on the already-`esc()`-escaped HTML, so the delimiters can
+  // only ever produce these four fixed tags — there's no way for a message
+  // to inject arbitrary markup through them. Code spans are converted
+  // first so a *, ~ or _ typed inside backticks renders literally instead
+  // of being eaten by the bold/strike/italic passes below; bold runs before
+  // italic so **text** is consumed as a pair before any lone '*' is left
+  // for the italic regex to (correctly) pick up.
+  html = html.replace(/`([^`\n]+)`/g, '<code class="msg-inline-code">$1</code>');
+  html = html.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/~~([^\n]+?)~~/g, '<del>$1</del>');
+  html = html.replace(/(?<![*\w])\*([^\s*][^\n*]*?)\*(?!\w)/g, '<em>$1</em>');
 
   // Linkify URLs before the @mention pass below, stashing them behind
   // placeholder tokens first. Without this, a URL containing "@" (e.g. a

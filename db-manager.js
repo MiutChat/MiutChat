@@ -206,6 +206,51 @@ function _initDb(cfg) {
   return fs;
 }
 
+/* ── Per-shard anonymous auth, needed before the probe below can read ────
+ * firestore.rules requires `isSignedIn()` (request.auth != null) on every
+ * room read, and auth is strictly per-Firebase-project — signing in on one
+ * shard grants no identity on another (see app.js's ensureAuth comment for
+ * the full reasoning). The probe a few lines down used to call
+ * `fs.collection('rooms').doc(roomCode).get()` on each candidate shard
+ * BEFORE anything had signed in to that shard's project at all, which
+ * means that read always came back permission-denied — not because the
+ * room was missing or the credentials were wrong, but because no identity
+ * existed yet for that specific Firebase app. Every candidate would fail
+ * the same way, getDb() would mark every shard "unhealthy", and the
+ * caller would see "all databases unavailable" or a bare permission-denied
+ * for a room that was sitting there the whole time. This path is only
+ * reached when the server-side registry call above didn't resolve — i.e.
+ * exactly the flaky-connection case this fallback exists for — so it was
+ * failing precisely the joins it was supposed to rescue.
+ * This has its own small per-tab cache (keyed by shard name, not
+ * app.js's getUID cache — the two can't share state across files since
+ * minification doesn't preserve cross-file function names) and is purely
+ * about getting ANY authenticated identity on this shard before reading
+ * it; app.js's own getUID()/ensureAuth() will pick up the same already
+ * signed-in user via onAuthStateChanged/currentUser right after, so this
+ * never causes a duplicate sign-in or a different uid. */
+const _probeAuthCache = new Map(); // dbName → Promise<uid>
+function _ensureShardAuth(cfg) {
+  if (_probeAuthCache.has(cfg.name)) return _probeAuthCache.get(cfg.name);
+  const p = new Promise((resolve, reject) => {
+    try {
+      const app      = firebase.app(cfg.name);
+      const authInst = firebase.auth(app);
+      if (authInst.currentUser) { resolve(authInst.currentUser.uid); return; }
+      const unsub = authInst.onAuthStateChanged(user => {
+        unsub();
+        if (user) { resolve(user.uid); return; }
+        authInst.signInAnonymously().then(cred => resolve(cred.user.uid)).catch(reject);
+      }, reject);
+    } catch (e) { reject(e); }
+  });
+  // Don't cache a failure — a transient network blip signing in shouldn't
+  // permanently block this shard for the rest of the tab's life.
+  p.catch(() => _probeAuthCache.delete(cfg.name));
+  _probeAuthCache.set(cfg.name, p);
+  return p;
+}
+
 /* ── Deterministic room → database index ─────────────────────── */
 function _hashRoom(code) {
   let h = 5381;
@@ -437,6 +482,13 @@ async function getDb(roomCode) {
     const cfg = _ACTIVE_DBS[idx];
     const fs  = _initDb(cfg);
     try {
+      // Must be signed in to THIS shard before the read below — see
+      // _ensureShardAuth's comment. Separate timeout from the read itself
+      // so a slow sign-in doesn't eat the read's whole budget.
+      await Promise.race([
+        _ensureShardAuth(cfg),
+        new Promise((_, r) => setTimeout(() => r(new Error('shard auth timeout')), 8000)),
+      ]);
       await Promise.race([
         fs.collection('rooms').doc(roomCode).get(),
         new Promise((_, r) => setTimeout(() => r(new Error('probe timeout')), 8000)),
