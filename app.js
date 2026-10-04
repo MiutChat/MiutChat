@@ -1524,11 +1524,6 @@ async function handleEnter() {
     _log('log', `[MIUT handleEnter] room=${code} resolved shard=${_dbName}`);
     const uid = await getUID(_dbName);
     _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — reading room doc`);
-    // Log auth state immediately before the read so we can confirm auth is active
-    // if this throws permission-denied, the uid logged above is what Firestore saw.
-    _log('log', '[MIUT handleEnter] firebase.auth().currentUser at room-read time:',
-      firebase.auth(window._miutApps?.[_dbName] || window._miutApp)?.currentUser?.uid || '(null — not signed in!)'
-    );
     const roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
       _log('warn', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc does not exist on this shard`);
@@ -1557,7 +1552,6 @@ async function handleEnter() {
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     _healRoomSchema(code, roomSnap.data()).catch(() => {});
 
-    _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — reading member doc`);
     const memberSnap  = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData    = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
@@ -1594,19 +1588,7 @@ async function handleEnter() {
         bootApp();
       }
     }
-  } catch (e) {
-    // Log the raw Firestore error so we can see the exact code/message in DevTools
-    // even in production (these go through _sysConsole, not console.*, so esbuild
-    // --drop:console does not strip them).
-    _log('error', '[MIUT handleEnter] FAILED',
-      'code=' + (e?.code || '(none)'),
-      'message=' + (e?.message || String(e)),
-      'room=' + ($('input-room-code')?.value || '').trim(),
-      'shard=' + (window.getCurrentDbName?.($('input-room-code')?.value?.trim() || '') || '(unresolved)'),
-      e
-    );
-    showSmartError(e, 'enter');
-  }
+  } catch (e) { showSmartError(e, 'enter'); }
   finally { setLoading(btn, false); }
 }
 
@@ -1817,7 +1799,6 @@ async function checkApprovalAndBoot(_retryCount) {
     }
   } catch(e) {
     _log('warn', `[MIUT] checkApprovalAndBoot error (attempt ${_retryCount + 1}) room=${state.roomCode} shard=${window.getCurrentDbName?.(state.roomCode) || '(unresolved)'} — code: ${e?.code || '(none)'} message: ${e?.message || e}`);
-    _log('error', '[MIUT checkApprovalAndBoot] full error object:', e);
     // Most failures here are the transient auth-race described above —
     // worth a couple of short retries before giving up. Capped so a
     // genuine, non-transient failure (room actually gone, real permission
