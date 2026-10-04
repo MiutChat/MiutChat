@@ -1,5 +1,18 @@
 'use strict';
 
+// IMPORTANT: nothing in this file may call `console.xxx(...)` directly —
+// build.js passes esbuild --drop:console for every production build, which
+// deletes any call whose callee is literally the `console` identifier,
+// silently turning it into a no-op in the deployed bundle. Confirmed: every
+// console.* call already in this file (App Check init, remote config
+// failures, per-shard init failures) has been compiling down to nothing in
+// production the whole time, not just in whatever change is being made
+// right now. Going through a variable first — the same pattern app.js's
+// own _log()/_sysConsole already uses — is what makes a log line actually
+// survive into the deployed build where it can be seen.
+const _sysConsole = window.console;
+function _dbg(...args) { try { _sysConsole?.log?.('[MIUT getDb]', ...args); } catch {} }
+
 /**
  * Miut — db-manager.js
  * ═══════════════════════════════════════════════════════════════
@@ -59,7 +72,7 @@ const RECAPTCHA_SITE_KEY = '6LcduZosAAAAAHhBdWag1xYW3myZ_XOA4an3IpmV'; // ← re
       /* isTokenAutoRefreshEnabled */ true
     );
   } catch (e) {
-    console.warn('[Miut] App Check init skipped:', e.message);
+    _sysConsole?.warn?.('[Miut] App Check init skipped:', e.message);
   }
 })();
 
@@ -108,7 +121,7 @@ async function _loadConfig() {
           window.__MIUT_DB_CONFIGS__ = data.databases;
           _ACTIVE_DBS = active;
           _syncHealth();
-          console.log('[MiutDB] Config loaded —', active.length, 'active DB(s)');
+          _sysConsole?.log?.('[MiutDB] Config loaded —', active.length, 'active DB(s)');
         } else {
           throw new Error('No active databases in config response');
         }
@@ -116,12 +129,12 @@ async function _loadConfig() {
         throw new Error('Config response missing databases array');
       }
     } catch (err) {
-      console.warn('[MiutDB] Remote config failed:', err.message);
+      _sysConsole?.warn?.('[MiutDB] Remote config failed:', err.message);
       // Hard fallback: use window.__MIUT_DB_CONFIGS__ if pre-loaded by build
       if (Array.isArray(window.__MIUT_DB_CONFIGS__) && window.__MIUT_DB_CONFIGS__.length) {
         _ACTIVE_DBS = window.__MIUT_DB_CONFIGS__.filter(d => d.active);
         _syncHealth();
-        console.log('[MiutDB] Using pre-loaded config fallback');
+        _sysConsole?.log?.('[MiutDB] Using pre-loaded config fallback');
       }
     }
     _configLoaded = true;
@@ -236,13 +249,15 @@ function _ensureShardAuth(cfg) {
     try {
       const app      = firebase.app(cfg.name);
       const authInst = firebase.auth(app);
-      if (authInst.currentUser) { resolve(authInst.currentUser.uid); return; }
+      if (authInst.currentUser) { _dbg('shardAuth', cfg.name, '→ already signed in as', authInst.currentUser.uid); resolve(authInst.currentUser.uid); return; }
       const unsub = authInst.onAuthStateChanged(user => {
         unsub();
-        if (user) { resolve(user.uid); return; }
-        authInst.signInAnonymously().then(cred => resolve(cred.user.uid)).catch(reject);
-      }, reject);
-    } catch (e) { reject(e); }
+        if (user) { _dbg('shardAuth', cfg.name, '→ onAuthStateChanged gave', user.uid); resolve(user.uid); return; }
+        authInst.signInAnonymously()
+          .then(cred => { _dbg('shardAuth', cfg.name, '→ signInAnonymously gave', cred.user.uid); resolve(cred.user.uid); })
+          .catch(err => { _dbg('shardAuth', cfg.name, 'signInAnonymously FAILED — code:', err?.code, 'message:', err?.message); reject(err); });
+      }, err => { _dbg('shardAuth', cfg.name, 'onAuthStateChanged FAILED — code:', err?.code, 'message:', err?.message); reject(err); });
+    } catch (e) { _dbg('shardAuth', cfg.name, 'threw synchronously:', e?.message || e); reject(e); }
   });
   // Don't cache a failure — a transient network blip signing in shouldn't
   // permanently block this shard for the rest of the tab's life.
@@ -421,7 +436,8 @@ async function getDb(roomCode) {
   if (_roomDbCache.has(roomCode)) {
     const name = _roomDbCache.get(roomCode);
     const inst = _instances.get(name);
-    if (inst && _healthy(name)) return inst;
+    if (inst && _healthy(name)) { _dbg(roomCode, '→ in-memory cache hit:', name); return inst; }
+    _dbg(roomCode, 'in-memory cache entry', name, 'is stale/unhealthy — re-resolving');
     _roomDbCache.delete(roomCode);  // stale — re-probe
   }
 
@@ -434,28 +450,34 @@ async function getDb(roomCode) {
    * blocking room access on it. */
   try {
     const { db: regName } = await _resolveViaRegistry(roomCode);
+    _dbg(roomCode, 'registry resolved →', regName, '| active:', _ACTIVE_DBS.some(d => d.name === regName), '| healthy:', _healthy(regName));
     if (regName && _ACTIVE_DBS.some(d => d.name === regName) && _healthy(regName)) {
       const cfg = _ACTIVE_DBS.find(d => d.name === regName);
       const fs = _initDb(cfg);
       _roomDbCache.set(roomCode, cfg.name);
       _setPersistedBinding(roomCode, cfg.name);
+      _dbg(roomCode, '→ using registry pick:', cfg.name);
       return fs;
     }
-  } catch { /* registry unreachable — fall through */ }
+  } catch (regErr) { _dbg(roomCode, 'registry unreachable, falling through:', regErr?.message || regErr); }
 
   /* Persisted binding from a previous session takes priority over any
    * fresh hash computation — see _getPersistedBinding's comment for why.
    * Only used if that database is still in the active pool (it could in
    * principle have been retired) and currently healthy. */
   const persisted = _getPersistedBinding(roomCode);
+  _dbg(roomCode, 'persisted binding:', persisted?.db || '(none)');
   if (persisted && _ACTIVE_DBS.some(d => d.name === persisted.db)) {
     const cfg = _ACTIVE_DBS.find(d => d.name === persisted.db);
     if (_healthy(cfg.name)) {
       try {
         const fs = _initDb(cfg);
         _roomDbCache.set(roomCode, cfg.name);
+        _dbg(roomCode, '→ using persisted binding:', cfg.name);
         return fs;
-      } catch { /* fall through to normal resolution below */ }
+      } catch (e) { _dbg(roomCode, 'persisted binding init failed, falling through:', e?.message || e); }
+    } else {
+      _dbg(roomCode, 'persisted binding', cfg.name, 'is unhealthy — skipping it');
     }
   }
 
@@ -466,6 +488,7 @@ async function getDb(roomCode) {
     _roomDbCache.set(roomCode, name);
     _setPersistedBinding(roomCode, name);
     _bindRegistry(roomCode, name);
+    _dbg(roomCode, '→ single-shard shortcut:', name);
     return fs;
   }
 
@@ -477,6 +500,7 @@ async function getDb(roomCode) {
       .sort((a, b) => _health.get(_ACTIVE_DBS[a].name).cooldownUntil
                     - _health.get(_ACTIVE_DBS[b].name).cooldownUntil),
   ];
+  _dbg(roomCode, 'registry+persisted both missed — probing candidates in order:', candidates.map(i => _ACTIVE_DBS[i].name));
 
   for (const idx of candidates) {
     const cfg = _ACTIVE_DBS[idx];
@@ -497,15 +521,18 @@ async function getDb(roomCode) {
       _roomDbCache.set(roomCode, cfg.name);
       _setPersistedBinding(roomCode, cfg.name);
       _bindRegistry(roomCode, cfg.name);
+      _dbg(roomCode, '→ probe succeeded on:', cfg.name);
       return fs;
     } catch (err) {
       _onFail(cfg.name, err);
+      _dbg(roomCode, 'probe failed on', cfg.name, '— code:', err?.code || '(none)', 'message:', err?.message || err);
       if (_isQuotaError(err)) _handleQuotaError(roomCode, cfg.name, err);
     }
   }
 
   /* All failed — return primary as last resort to avoid blocking UI */
   const fallback = _ACTIVE_DBS[_hashRoom(roomCode) % _ACTIVE_DBS.length];
+  _dbg(roomCode, 'ALL candidates failed — falling back to hash pick:', fallback.name);
   try {
     const fs = _instances.get(fallback.name) ?? _initDb(fallback);
     // CRITICAL: every OTHER branch above records its pick in _roomDbCache
@@ -583,7 +610,7 @@ window._dbFirebaseReady = new Promise((resolve, reject) => {
       await _loadConfig();
     } catch (configErr) {
       // _loadConfig() swallows its own errors internally; this is extra safety
-      console.warn('[MiutDB] _loadConfig threw:', configErr);
+      _sysConsole?.warn?.('[MiutDB] _loadConfig threw:', configErr);
     }
 
     // 3. Validate we have at least one active database
@@ -601,7 +628,7 @@ window._dbFirebaseReady = new Promise((resolve, reject) => {
     let initErr = null;
     _ACTIVE_DBS.forEach(cfg => {
       try { _initDb(cfg); }
-      catch (e) { initErr = e; console.warn('[MiutDB] initDb failed for', cfg.name, e.message); }
+      catch (e) { initErr = e; _sysConsole?.warn?.('[MiutDB] initDb failed for', cfg.name, e.message); }
     });
 
     // Only reject if the primary db (index 0) failed — others are optional shards

@@ -33,7 +33,7 @@
   }
 
   window.onerror = function (message, source, lineno, colno, error) {
-    console.error('[MIUT] Uncaught error:', message, { source, lineno, colno, error });
+    _sysConsole?.error?.('[MIUT] Uncaught error:', message, { source, lineno, colno, error });
     _reportError({ message, source, lineno, colno, stack: error?.stack });
     return false; // let browser default handling proceed
   };
@@ -41,7 +41,7 @@
   window.addEventListener('unhandledrejection', function (ev) {
     const reason = ev.reason;
     const message = reason instanceof Error ? reason.message : String(reason);
-    console.error('[MIUT] Unhandled rejection:', message, reason);
+    _sysConsole?.error?.('[MIUT] Unhandled rejection:', message, reason);
     _reportError({
       message: 'UnhandledRejection: ' + message,
       stack:   reason instanceof Error ? reason.stack : '',
@@ -120,7 +120,8 @@ const _authReadyByDb = new Map();    // dbName → Promise<uid> — auth is PER 
 // shard, not the other way around.
 async function ensureAuth(dbName) {
   const key = dbName || (window.__MIUT_DB_CONFIGS__ || []).find(d => d.active)?.name || 'miut-db0';
-  if (_authReadyByDb.has(key)) return _authReadyByDb.get(key);
+  if (_authReadyByDb.has(key)) { _log('log', `[MIUT ensureAuth] ${key} → cached promise (dbName passed in was ${dbName || '(none — defaulted)'})`); return _authReadyByDb.get(key); }
+  _log('log', `[MIUT ensureAuth] ${key} → first call this tab (dbName passed in was ${dbName || '(none — defaulted)'})`);
   const p = (async () => {
     if (window._dbFirebaseReady) {
       try { await window._dbFirebaseReady; }
@@ -149,14 +150,17 @@ async function ensureAuth(dbName) {
             }, reject);
           } catch (err) { reject(err); }
         });
+        _log('log', `[MIUT ensureAuth] ${key} → signed in as ${uid} (attempt ${attempt + 1})`);
         return uid;
       } catch (err) {
         lastErr = err;
         const code = err?.code || '';
+        _log('warn', `[MIUT ensureAuth] ${key} attempt ${attempt + 1} failed — code: ${code || '(none)'} message: ${err?.message || err}`);
         // Only retry transient network errors, not config errors
         if (code.startsWith('auth/') && !code.includes('network') && !code.includes('too-many-requests')) break;
       }
     }
+    _log('error', `[MIUT ensureAuth] ${key} → giving up after retries — code: ${lastErr?.code || '(none)'} message: ${lastErr?.message || lastErr}`);
     _authReadyByDb.delete(key);
     throw lastErr;
   })().catch(err => { _authReadyByDb.delete(key); throw err; });
@@ -930,12 +934,12 @@ async function checkRateLimit(type) {
       // explicit decision: allow locally so a temporary edge outage does
       // not block all users. The local token bucket above is still in
       // effect, it's just no longer backed by the edge for this attempt.
-      console.warn('[MiutRL] edge rate limiter unavailable (HTTP ' + res.status + ') — falling back to local-only limiting');
+      _sysConsole?.warn?.('[MiutRL] edge rate limiter unavailable (HTTP ' + res.status + ') — falling back to local-only limiting');
     }
   } catch (err) {
     // Network error or timeout — same explicit fallback as above
     if (err.name !== 'AbortError') {
-      console.warn('[MiutRL] edge rate limiter unreachable — falling back to local-only limiting:', err.message);
+      _sysConsole?.warn?.('[MiutRL] edge rate limiter unreachable — falling back to local-only limiting:', err.message);
     }
   }
 
@@ -1165,7 +1169,7 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     _checkAnnouncement();
   }).catch(err => {
-    console.error('[App] Firebase unavailable at startup:', err.message);
+    _sysConsole?.error?.('[App] Firebase unavailable at startup:', err.message);
   });
 
 /**
@@ -1193,7 +1197,7 @@ async function _checkAnnouncement() {
 
     _showAnnouncementPopup(msg);
   } catch (e) {
-    console.warn('[MIUT] Announcement check skipped:', e.message);
+    _sysConsole?.warn?.('[MIUT] Announcement check skipped:', e.message);
   }
 }
 
@@ -1517,9 +1521,12 @@ async function handleEnter() {
     // project — see ensureAuth's comment for why order matters here.
     db = await getDb(code);
     const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
+    _log('log', `[MIUT handleEnter] room=${code} resolved shard=${_dbName}`);
     const uid = await getUID(_dbName);
+    _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — reading room doc`);
     const roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
+      _log('warn', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc does not exist on this shard`);
       if (window.isRoomExpired?.(code)) {
         showError('This room has expired and was deleted.');
         return;
@@ -1527,6 +1534,7 @@ async function handleEnter() {
       _recordWrongCode();
       return;
     }
+    _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc read OK, creatorId=${roomSnap.data()?.creatorId}`);
     _saveWrongState({ wrongCount: 0, lockedUntil: 0 });
     // A blocked user is permanently barred from this room (see blockMember) —
     // check before anything else so there's no path that lets them back in.
@@ -1547,6 +1555,7 @@ async function handleEnter() {
     const memberSnap  = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData    = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
+    _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — member doc exists=${memberSnap.exists} approved=${prevData?.approved} role=${prevData?.role} declined=${prevData?.declined}`);
 
     state.me = await buildMe(resolveName(), _dbName); state.roomCode = code;
     saveSession(); saveRoom(code);
@@ -1709,8 +1718,18 @@ async function checkApprovalAndBoot(_retryCount) {
     // the key derivation depends on the room's real salt, not per-message
     // state. getUID() blocks until auth for this specific shard is ready.
     const _dbName = window.getCurrentDbName?.(state.roomCode) || 'miut-db0';
+    _log('log', `[MIUT checkApprovalAndBoot] room=${state.roomCode} attempt=${_retryCount + 1} resolved shard=${_dbName} (saved session uid=${state.me.id})`);
     const _resumeUid = await getUID(_dbName);
     if (_resumeUid !== state.me.id) {
+      // This is the single most likely cause of "signed in but still
+      // access denied on a correct room code": getDb() resolved to a
+      // DIFFERENT shard on this resume than whatever shard the saved
+      // session's uid actually belongs to (registry/probe picked
+      // differently this time), so the uid we just got for THIS shard can
+      // never match the saved one — they were never the same identity.
+      // Logging both uids and the shard is exactly the evidence needed to
+      // tell that apart from a genuinely expired/cleared session.
+      _log('error', `[MIUT checkApprovalAndBoot] UID MISMATCH on room=${state.roomCode} shard=${_dbName} — resumed as ${_resumeUid} but saved session was ${state.me.id}. Wiping session.`);
       localStorage.removeItem(CONFIG.SESSION_KEY);
       localStorage.removeItem(CONFIG.ROOM_KEY);
       state.me = null; state.roomCode = null;
@@ -1720,6 +1739,7 @@ async function checkApprovalAndBoot(_retryCount) {
     }
 
     const roomSnap = await db.collection('rooms').doc(state.roomCode).get();
+    _log('log', `[MIUT checkApprovalAndBoot] room=${state.roomCode} shard=${_dbName} uid=${_resumeUid} — room doc exists=${roomSnap.exists}`);
     if (roomSnap.exists) {
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
@@ -1737,9 +1757,11 @@ async function checkApprovalAndBoot(_retryCount) {
 
     const snap = await db.collection('rooms').doc(state.roomCode)
       .collection('members').doc(state.me.id).get();
+    _log('log', `[MIUT checkApprovalAndBoot] room=${state.roomCode} shard=${_dbName} uid=${_resumeUid} — member doc exists=${snap.exists} approved=${snap.data()?.approved} role=${snap.data()?.role}`);
 
     if (!snap.exists) {
       // Room wiped or member doc gone — go back to join
+      _log('warn', `[MIUT checkApprovalAndBoot] room=${state.roomCode} shard=${_dbName} uid=${_resumeUid} — member doc missing, bouncing to join screen`);
       showScreen('join-screen'); return;
     }
     const data = snap.data();
@@ -1776,7 +1798,7 @@ async function checkApprovalAndBoot(_retryCount) {
       showWaitingScreen();
     }
   } catch(e) {
-    _log('warn', '[MIUT] checkApprovalAndBoot error (attempt ' + (_retryCount + 1) + '):', e?.message || e);
+    _log('warn', `[MIUT] checkApprovalAndBoot error (attempt ${_retryCount + 1}) room=${state.roomCode} shard=${window.getCurrentDbName?.(state.roomCode) || '(unresolved)'} — code: ${e?.code || '(none)'} message: ${e?.message || e}`);
     // Most failures here are the transient auth-race described above —
     // worth a couple of short retries before giving up. Capped so a
     // genuine, non-transient failure (room actually gone, real permission
@@ -2220,7 +2242,7 @@ async function _registerCanary(docId, enc) {
 
 // ─── Security lockdown ────────────────────────────────────────────────────────
 function _triggerSecurityLockdown(reason) {
-  console.error('[MIUT Security] Lockdown triggered:', reason);
+  _sysConsole?.error?.('[MIUT Security] Lockdown triggered:', reason);
   toast('Security alert', 'Suspicious activity detected — connection closed.', 'alert');
   setTimeout(() => {
     // Clear all state, stop all listeners, return to join screen
@@ -3560,7 +3582,7 @@ async function wipeRoom(code, fsInstance) {
     // a silently-failed wipe would otherwise be invisible until someone
     // tries to reuse that exact code and gets a confusing "already in
     // use" error for a room they thought was long gone. Surface it.
-    console.warn(`[MIUT] wipeRoom(${code}) failed — subcollections or the room doc itself may still exist:`, e);
+    _sysConsole?.warn?.(`[MIUT] wipeRoom(${code}) failed — subcollections or the room doc itself may still exist:`, e);
   }
 }
 
@@ -6232,6 +6254,23 @@ function showError(msg, type) {
 }
 
 function showSmartError(e, context) {
+  // ── Debug logging for "access denied on a correct room code" reports ──
+  // Every path that shows the user an error funnels through here (both
+  // handleCreate's and handleEnter's entire bodies are wrapped in one
+  // try/catch that lands here). Up to now this discarded the actual
+  // Firebase error the instant it got classified into a generic string —
+  // "Access denied — You don't have permission" told nobody, including
+  // us, which Firestore path was denied, which shard it happened on, or
+  // what uid was signed in at the time. Logging all of that here, in one
+  // place, means the next report can carry real evidence instead of just
+  // the generic message the user already told us about.
+  try {
+    const _code       = ($('input-room-code')?.value || $('input-create-code')?.value || '').trim();
+    const _roomForLog = state.roomCode || _code || '(unknown)';
+    const _dbForLog    = window.getCurrentDbName?.(_roomForLog) || '(unresolved)';
+    _log('error', `[MIUT access] showSmartError context=${context} room=${_roomForLog} shard=${_dbForLog} uid=${state.me?.id || '(none)'} code=${e?.code || '(none)'} message=${e?.message || String(e)}`);
+    if (e?.stack) _log('debug', '[MIUT access] stack:', e.stack);
+  } catch {}
   const { title, detail, icon, type } = _classifyError(e);
   // Build error with SVG icon in a span
   const _errSvg = _toastIcon(icon);
