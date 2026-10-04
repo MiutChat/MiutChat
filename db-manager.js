@@ -347,6 +347,72 @@ window.markRoomExpired = function (roomCode, dbName) {
     .catch(() => {});
 };
 
+/* ── Durable bind retry — closes a real, confirmed hole ──────────────────
+ * CONFIRMED LIVE BUG (user feedback, room "MIUT1999!", v1.1.21): a member
+ * tries to join an existing room and is told "room not found", even
+ * though the room is sitting right there on whatever shard the creator
+ * put it on.
+ *
+ * Root cause: _bindRegistry used to be fire-and-forget with only ~3
+ * seconds of total retry (3 attempts, 1s/2s apart). On the kind of flaky
+ * mobile connection this app is actually used on, that entire window can
+ * fail — and then NOTHING ever retries it again. The registry's `resolve`
+ * action (shard-registry.js) treats "no binding found" as "this must be a
+ * brand-new room" and immediately writes a FRESH, essentially random pick
+ * into the registry, permanently, the very first time anyone calls
+ * resolve for that room code. So: creator creates the room fine (their
+ * own browser's local cache/localStorage binding works regardless of
+ * whether the registry write landed), tells a friend the code, the friend
+ * joins, their resolve() call finds no binding (the creator's bind never
+ * made it), gets assigned a shard that has never heard of this room, and
+ * "room not found" is the result — forever, since the registry now has a
+ * confidently wrong answer cached and nothing was ever going to correct
+ * it.
+ *
+ * Fix, two parts (this part + findRoomAcrossShards below):
+ * Every bind attempt is first recorded to localStorage as "pending". If
+ * all in-session retries fail, it STAYS queued and is retried again on
+ * every future page load (_flushPendingBinds) until it actually lands —
+ * instead of being silently abandoned after a few seconds. */
+const _PENDING_BIND_KEY = 'miut_pending_binds';
+function _loadPendingBinds() {
+  try { return JSON.parse(localStorage.getItem(_PENDING_BIND_KEY)) || {}; }
+  catch { return {}; }
+}
+function _savePendingBinds(map) {
+  try { localStorage.setItem(_PENDING_BIND_KEY, JSON.stringify(map)); } catch {}
+}
+function _markBindPending(roomCode, dbName) {
+  const map = _loadPendingBinds();
+  map[roomCode] = { db: dbName, at: Date.now() };
+  _savePendingBinds(map);
+}
+function _clearBindPending(roomCode) {
+  const map = _loadPendingBinds();
+  if (map[roomCode]) { delete map[roomCode]; _savePendingBinds(map); }
+}
+async function _flushPendingBinds() {
+  const map = _loadPendingBinds();
+  const codes = Object.keys(map);
+  if (!codes.length) return;
+  _dbg('flushPendingBinds', `retrying ${codes.length} unconfirmed registry binding(s) left over from a previous session`);
+  for (const code of codes) {
+    try {
+      await _registryCall({ action: 'bind', roomCode: code, db: map[code].db }, 4000);
+      _clearBindPending(code);
+      _dbg('flushPendingBinds', code, '→ now confirmed in registry as', map[code].db);
+    } catch (e) {
+      _dbg('flushPendingBinds', code, 'still failing, left queued:', e?.message || e);
+    }
+  }
+}
+// Retry once at load, and again a bit later in case the first attempt
+// races the network still coming up right after a cold page load.
+if (typeof window !== 'undefined') {
+  _flushPendingBinds().catch(() => {});
+  setTimeout(() => _flushPendingBinds().catch(() => {}), 15000);
+}
+
 async function _bindRegistry(roomCode, dbName, attempt) {
   // Fire-and-forget from the caller's perspective, but retried internally —
   // this write is what keeps the room findable by every OTHER device, so
@@ -354,12 +420,18 @@ async function _bindRegistry(roomCode, dbName, attempt) {
   // transient failure. A room that only this browser's localStorage knows
   // about is a room a second member can't join.
   attempt = attempt || 0;
+  if (attempt === 0) _markBindPending(roomCode, dbName);
   try {
     await _registryCall({ action: 'bind', roomCode, db: dbName }, 4000);
+    _clearBindPending(roomCode);
   } catch {
     if (attempt < 2) {
       setTimeout(() => _bindRegistry(roomCode, dbName, attempt + 1), 1000 * (attempt + 1));
     }
+    // Else: leave it in the pending store. _flushPendingBinds retries it
+    // on every future page load until it actually lands — see that
+    // function's comment for why this is the part that actually closes
+    // the "member can never join" hole instead of just shrinking it.
   }
 }
 
@@ -417,6 +489,48 @@ function _handleQuotaError(roomCode, dbName, err) {
   _onFail(dbName, err);
   _reportShardDegraded(dbName);
 }
+
+/* ── Self-correcting last resort: brute-force probe every active shard ──
+ * for a room, bypassing the registry and every cache entirely. This is
+ * what actually closes the "member can never join" hole for whoever hits
+ * it FIRST — _bindRegistry's durable retry (above) fixes it eventually,
+ * but only once the CREATOR's browser comes back online and flushes the
+ * pending bind. A joiner hitting a wrong/missing registry binding right
+ * now shouldn't have to wait on that; if the room is actually sitting on
+ * some other shard, this finds it directly and corrects the registry +
+ * local caches on the spot, so this exact join succeeds immediately AND
+ * every future resolve for this room code is now right too.
+ * Call this only after a resolved shard's room-doc read has already come
+ * back "doesn't exist" — it's a deliberately expensive last resort (one
+ * authed read per active shard), not something to run on every join. */
+async function findRoomAcrossShards(roomCode) {
+  await _loadConfig();
+  for (const cfg of _ACTIVE_DBS) {
+    try {
+      await Promise.race([
+        _ensureShardAuth(cfg),
+        new Promise((_, r) => setTimeout(() => r(new Error('shard auth timeout')), 6000)),
+      ]);
+      const fs = _initDb(cfg);
+      const snap = await Promise.race([
+        fs.collection('rooms').doc(roomCode).get(),
+        new Promise((_, r) => setTimeout(() => r(new Error('probe timeout')), 6000)),
+      ]);
+      if (snap.exists) {
+        _dbg(roomCode, 'findRoomAcrossShards FOUND it on', cfg.name, '— correcting registry + local caches');
+        _roomDbCache.set(roomCode, cfg.name);
+        _setPersistedBinding(roomCode, cfg.name);
+        _bindRegistry(roomCode, cfg.name); // overwrites whatever wrong binding the registry had
+        return cfg.name;
+      }
+    } catch (e) {
+      _dbg(roomCode, 'findRoomAcrossShards probe failed on', cfg.name, '—', e?.message || e);
+    }
+  }
+  _dbg(roomCode, 'findRoomAcrossShards searched every active shard, found nothing — room genuinely does not exist');
+  return null;
+}
+window.findRoomAcrossShards = findRoomAcrossShards;
 
 /* ── Core: resolve the best database for a room code ────────── */
 async function getDb(roomCode) {

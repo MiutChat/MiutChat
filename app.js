@@ -1520,19 +1520,48 @@ async function handleEnter() {
     // Resolve the room's SHARD first, then authenticate against THAT
     // project — see ensureAuth's comment for why order matters here.
     db = await getDb(code);
-    const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
+    let _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
     _log('log', `[MIUT handleEnter] room=${code} resolved shard=${_dbName}`);
-    const uid = await getUID(_dbName);
+    let uid = await getUID(_dbName);
     _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — reading room doc`);
-    const roomSnap = await db.collection('rooms').doc(code).get();
+    let roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
       _log('warn', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc does not exist on this shard`);
       if (window.isRoomExpired?.(code)) {
         showError('This room has expired and was deleted.');
         return;
       }
-      _recordWrongCode();
-      return;
+      // Self-heal: the registry's binding for this room code may simply
+      // be wrong (see findRoomAcrossShards's own comment — a confirmed
+      // live bug where a creator's bind never reached the registry on a
+      // flaky connection, so a later joiner's "resolve" call confidently
+      // assigns a shard that has never heard of this room). Before
+      // telling the user the code is wrong, check whether the room is
+      // actually sitting on a different shard and, if so, fix the
+      // registry + retry right here instead of making them retry it
+      // themselves with no better odds of succeeding.
+      if (typeof window.findRoomAcrossShards === 'function') {
+        _log('log', `[MIUT handleEnter] room=${code} — probing every shard before giving up`);
+        const foundOn = await window.findRoomAcrossShards(code);
+        if (foundOn) {
+          _log('log', `[MIUT handleEnter] room=${code} — found on ${foundOn} after all, re-reading`);
+          db = await getDb(code);
+          // CRITICAL: _dbName/uid above were resolved for the OLD (wrong)
+          // shard. If the self-heal corrected us to a DIFFERENT shard,
+          // continuing to use that stale uid would sign every subsequent
+          // read/write (member doc lookup, presence, messages) with an
+          // identity from the wrong Firebase project — a uid that's valid
+          // but for a project `db` no longer points at. Must re-resolve
+          // both before doing anything else with the corrected db.
+          _dbName = window.getCurrentDbName?.(code) || _dbName;
+          uid = await getUID(_dbName);
+          roomSnap = await db.collection('rooms').doc(code).get();
+        }
+      }
+      if (!roomSnap.exists) {
+        _recordWrongCode();
+        return;
+      }
     }
     _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc read OK, creatorId=${roomSnap.data()?.creatorId}`);
     _saveWrongState({ wrongCount: 0, lockedUntil: 0 });

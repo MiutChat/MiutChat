@@ -92,13 +92,19 @@ function compress(fp) {
 const tmps = [];
 const sri  = {};
 
+// TEMPORARY: console/debugger dropping is disabled outright right now so
+// the [MIUT ...] diagnostic logging added to track down the "access
+// denied" / "room not found" reports is guaranteed visible in whatever
+// build Cloudflare actually deploys — not just in a local `--debug` build,
+// since the real deploy pipeline doesn't pass that flag. Re-enable the
+// commented-out line below once the current investigation is done; the
+// --debug flag mechanism (isDebug, above) still works as a scoped
+// alternative to leaving this on permanently.
 const baseFlags =
   '--bundle=false --minify --minify-whitespace --minify-identifiers --minify-syntax'+
   ' --tree-shaking=true --charset=utf8'+
-  // Drop console/debugger in production UNLESS --debug flag is set.
-  // isDebug keeps console.* calls alive so _log() output reaches DevTools
-  // in a deployed build — use it to diagnose production-only auth errors.
-  (isProd && !isDebug ? ' --drop:console --drop:debugger' : '')+
+  // (isProd && !isDebug ? ' --drop:console --drop:debugger' : '')+
+  ''+
   (!isProd ? ' --sourcemap=inline' : '');
 
 log('BUILD JS', 'browser bundles');
