@@ -1205,7 +1205,13 @@ function _showAnnouncementPopup(msg) {
   const overlay = $('announcement-modal');
   const body    = $('announcement-body');
   if (!overlay || !body) return;
-  body.textContent = msg;
+  // Was body.textContent = msg — plain text, so **bold**/__underline__/etc
+  // showed up as literal asterisks and underscores instead of formatting,
+  // even though the same message text renders correctly inside a chat
+  // bubble. renderTextContent() already escapes the input before adding
+  // any markup, so this is the same safe path messages already use, not
+  // raw innerHTML of untrusted input.
+  body.innerHTML = renderTextContent(msg);
   overlay.style.display = 'flex';
 
   const close = () => {
@@ -4889,6 +4895,12 @@ function renderTextContent(text) {
   html = html.replace(/`([^`\n]+)`/g, '<code class="msg-inline-code">$1</code>');
   html = html.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/~~([^\n]+?)~~/g, '<del>$1</del>');
+  // __underline__ — was never added here despite the app's own help text /
+  // UI implying it's supported alongside bold/italic/strike. Disallows a
+  // bare `_` inside the match (same guard the other three delimiters use)
+  // so an ordinary snake_case_word (single underscores) never matches —
+  // only a deliberate double-underscore pair does.
+  html = html.replace(/__([^\n_]+?)__/g, '<u>$1</u>');
   html = html.replace(/(?<![*\w])\*([^\s*][^\n*]*?)\*(?!\w)/g, '<em>$1</em>');
 
   // Linkify URLs before the @mention pass below, stashing them behind
