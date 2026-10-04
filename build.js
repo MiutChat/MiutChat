@@ -9,7 +9,12 @@ const { spawnSync } = require('child_process');
 
 const ROOT   = __dirname;
 const DIST   = path.join(ROOT, 'dist');
-const isProd = process.env.NODE_ENV !== 'development';
+const isProd  = process.env.NODE_ENV !== 'development';
+// --debug: minifies (to catch any minification-specific issues) but keeps
+// console.* calls and debugger statements so _log() output reaches DevTools.
+// Use: node build.js --debug
+// Deploy this build to Cloudflare to diagnose production-only permission errors.
+const isDebug = process.argv.includes('--debug');
 const START  = Date.now();
 const ESB    = path.join(ROOT, 'node_modules/.bin/esbuild');
 
@@ -37,6 +42,7 @@ if (fs.existsSync(DIST)) fs.rmSync(DIST, { recursive: true, force: true });
 fs.mkdirSync(path.join(DIST, 'functions', 'api'), { recursive: true });
 log('CLEAN', 'dist/ wiped');
 log('VERSION', VERSION + '  (bumped by the GitHub Action on push, not by this build step)');
+log('MODE', isProd ? (isDebug ? 'production + DEBUG (console kept)' : 'production (console stripped)') : 'development (sourcemaps)', isProd && !isDebug ? C.green : C.yellow);
 
 function run(cmd) {
   const r = spawnSync(cmd, { shell:true, stdio:['ignore','pipe','pipe'] });
@@ -89,7 +95,10 @@ const sri  = {};
 const baseFlags =
   '--bundle=false --minify --minify-whitespace --minify-identifiers --minify-syntax'+
   ' --tree-shaking=true --charset=utf8'+
-  (isProd ? ' --drop:console --drop:debugger' : '')+
+  // Drop console/debugger in production UNLESS --debug flag is set.
+  // isDebug keeps console.* calls alive so _log() output reaches DevTools
+  // in a deployed build — use it to diagnose production-only auth errors.
+  (isProd && !isDebug ? ' --drop:console --drop:debugger' : '')+
   (!isProd ? ' --sourcemap=inline' : '');
 
 log('BUILD JS', 'browser bundles');
@@ -116,7 +125,17 @@ for (const [inp, out, tgt] of JS_JOBS) {
   // undefined" — which looks exactly like a corrupted/undecryptable
   // message but is actually just a missing file.
   const versionTransform = inp === 'app.js'
-    ? t => t.replace(/const APP_VERSION\s*=\s*'[^']*';/, `const APP_VERSION = '${VERSION}';`)
+    ? t => {
+        t = t.replace(/const APP_VERSION\s*=\s*'[^']*';/, `const APP_VERSION = '${VERSION}';`);
+        // Stamp a MIUT_DEBUG_BUILD constant so the app can surface a visual
+        // indicator that this is a debug build (avoids accidentally leaving
+        // debug builds in production unnoticed).
+        if (isDebug) t = t.replace(
+          "const APP_VERSION = '" + VERSION + "';",
+          "const APP_VERSION = '" + VERSION + "';" + "\nconst MIUT_DEBUG_BUILD = true;"
+        );
+        return t;
+      }
     : inp === 'crypto-bridge.js'
     ? t => t.replace(/'crypto-worker\.js'/g, "'crypto-worker.min.js'").replace(/"crypto-worker\.js"/g, '"crypto-worker.min.js"')
     : undefined;
