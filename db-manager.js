@@ -329,10 +329,22 @@ async function _registryCall(body, timeoutMs) {
 const _expiredRooms = new Set();
 
 async function _resolveViaRegistry(roomCode) {
-  const data = await _registryCall({ action: 'resolve', roomCode });
-  if (!data || !data.db) throw new Error('shard-registry returned no db');
+  // 'lookup' is strictly read-only — it returns the existing binding or
+  // { found: false } when none exists. We deliberately do NOT call 'resolve'
+  // here: 'resolve' picks a shard and WRITES a new binding for any room it
+  // has never seen — which is exactly right when creating a new room, but
+  // catastrophic for re-entry of an existing room that has no binding yet
+  // (created before the registry existed, or whose binding write failed):
+  // it assigns a random shard that has never heard of this room, writes
+  // that as the permanent answer, and every subsequent joiner goes to the
+  // wrong shard forever. 'resolve' is only called from shard-registry's
+  // own placement path, triggered via confirmRoomCreated() after a room
+  // doc has actually been written. getDb()'s job here is lookup only.
+  const data = await _registryCall({ action: 'lookup', roomCode });
+  if (!data) throw new Error('shard-registry returned no response');
+  if (!data.found) throw new Error('shard-registry: no binding for this room');
   if (data.expired) _expiredRooms.add(roomCode); else _expiredRooms.delete(roomCode);
-  return data; // { db, isNew, expired? }
+  return data; // { db, found: true }
 }
 
 window.isRoomExpired = function (roomCode) {
