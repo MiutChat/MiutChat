@@ -552,6 +552,20 @@ async function getDb(roomCode) {
     // exactly the rooms least likely to have a clean network path.
     _roomDbCache.set(roomCode, fallback.name);
     _setPersistedBinding(roomCode, fallback.name);
+    // This branch is only reached when the registry AND every shard probe
+    // failed together — but this browser still ends up with a working
+    // shard pick via the hash fallback. Every OTHER branch above tells
+    // the registry its pick via _bindRegistry(); this one didn't, which
+    // left the registry with no record of this room at all. The next
+    // person to join (once the network recovers) resolves against an
+    // empty registry, gets load-balanced onto a DIFFERENT shard by
+    // _resolveViaRegistry's own placement logic, and gets "room not
+    // found" forever — the room's creator keeps working because their
+    // own session already has this pick cached locally and never needs
+    // to ask the registry again. _bindRegistry retries internally, so
+    // this still lands once connectivity returns, even though the
+    // fallback above already returned a working Firestore instance.
+    _bindRegistry(roomCode, fallback.name);
     return fs;
   }
   catch (err) {
