@@ -5,8 +5,6 @@
 <h1 align="center">MiutChat</h1>
 <p align="center"><strong>End-to-end encrypted, anonymous, self-destructing chat rooms. No accounts. No phone number. No trace.</strong></p>
 
-<p align="center"><strong><a href="https://miutchat.pages.dev">🚀 Launch the live app →</a></strong> — no install, no account, no phone number.</p>
-
 <p align="center">
   <a href="https://miutchat.pages.dev">Live app</a> ·
   <a href="https://miutchat.pages.dev/about.html">About</a> ·
@@ -29,6 +27,7 @@ Rooms are ephemeral by design: once everyone leaves, the room and everything in 
 - [Tech stack](#tech-stack)
 - [Project structure](#project-structure)
 - [How it works](#how-it-works)
+- [Multi-shard architecture](#multi-shard-architecture)
 - [Local development](#local-development)
 - [Deployment](#deployment)
 - [Versioning](#versioning)
@@ -50,17 +49,18 @@ Rooms are ephemeral by design: once everyone leaves, the room and everything in 
 - **Anonymous in-app feedback** — stored in its own top-level Firestore collection, never linked to a room's messages or a user's identity.
 - **Installable PWA** with offline-readable cached history (IndexedDB) via a service worker.
 - **Fully static + serverless** — no backend server to run; deploys as a static site plus a handful of Cloudflare Pages Functions.
+- **Horizontally sharded across multiple Firebase projects** — rooms are spread across any number of independent Firestore "shards" (each its own Firebase project, free Spark tier) to stay within per-project quotas as traffic grows, with a dedicated server-side registry tracking which shard each room lives on. See [Multi-shard architecture](#multi-shard-architecture).
 
 ## Tech stack
 
 | Layer | Choice |
 |---|---|
 | UI | Vanilla HTML/CSS/JS — no framework, no build-time templating beyond esbuild bundling |
-| Data & realtime | [Firebase Firestore](https://firebase.google.com/docs/firestore) (client SDK, realtime listeners) |
+| Data & realtime | [Firebase Firestore](https://firebase.google.com/docs/firestore) (client SDK, realtime listeners), sharded across N independent Firebase projects — see [Multi-shard architecture](#multi-shard-architecture) |
 | Crypto | Browser [Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API) (AES-256-GCM, PBKDF2, ECDSA P-256 for message signing) |
 | Hosting | [Cloudflare Pages](https://pages.cloudflare.com/) (static assets + Pages Functions for a few edge endpoints) |
 | Bundler | [esbuild](https://esbuild.github.io/) via a small custom [`build.js`](./build.js) — no webpack/vite |
-| Offline / caching | Service worker (`sw.js`) + IndexedDB (`db-manager.js`) |
+| Offline / caching | Service worker (`sw.js`) + IndexedDB for local message/blob cache, opened directly in `app.js` / `miut-protocol.js` |
 
 There is intentionally no framework, no npm-dependency-heavy UI layer, and no server-rendered anything. The entire client is a handful of plain JS files loaded by `index.html`, bundled/minified by `build.js` for production.
 
@@ -69,33 +69,39 @@ There is intentionally no framework, no npm-dependency-heavy UI layer, and no se
 ```
 MiutChat/
 ├── index.html              The app itself (chat UI)
-├── app.js                  Core client logic: rooms, messages, reactions, UI wiring (~5.9k lines)
-├── style.css                All styling (~900 lines, one file, CSS custom properties for theming)
+├── app.js                  Core client logic: rooms, messages, reactions, UI wiring
+├── style.css                All styling (CSS custom properties for theming)
 ├── crypto-engine.js         AES-256-GCM encrypt/decrypt, key derivation, signing primitives
 ├── crypto-bridge.js         Glue between the UI and crypto-engine/crypto-worker
 ├── crypto-worker.js         Web Worker offload for heavier crypto operations
 ├── security.js               Replay protection, nonce tracking, timestamp validation, canaries
-├── screen-guard.js           Anti-screenshot/recording blur + watermark overlay
-├── db-manager.js             IndexedDB wrapper (message cache, blob cache)
-├── storage-engine.js         Higher-level cache read/write helpers used by app.js
+├── db-manager.js             Multi-shard Firestore resolution — which of the N Firebase
+│                              projects a given room code actually lives on (registry lookup,
+│                              local caches, self-healing cross-shard probe).
+├── storage-engine.js         Chunked encrypted file read/write against Firestore (splits large
+│                              media across multiple ~600KB message documents, reassembles them)
 ├── sw.js / sw-bridge.js       Service worker + main-thread bridge (cache-first shell, offline fallback)
-├── miut-protocol.js          Shared protocol constants/helpers
+├── miut-protocol.js          Shared protocol constants/helpers; also owns the local IndexedDB cache
 ├── placeholder-rotator.js    Small cosmetic input-placeholder rotation on the join screen
 ├── build.js                  Build pipeline (esbuild + custom transforms; see below)
 ├── version.js                 Single source of truth for the app version (see Versioning)
-├── landing.html / about.html / privacy.html / terms.html / 404.html / offline.html / maintenance.html / vault.html
+├── firestore.rules            Security rules for the chat shards — committed here
+├── landing.html / about.html / privacy.html / terms.html / 404.html / offline.html
 │                              Static marketing/legal/utility pages
 ├── manifest.json              PWA manifest
-├── wrangler.toml              Cloudflare Pages config (KV namespaces, env vars, rate-limit tuning)
+├── wrangler.toml               Cloudflare Pages config (KV namespaces, env vars, rate-limit tuning)
 └── functions/api/             Cloudflare Pages Functions (edge endpoints)
-    ├── health.js               Uptime/health check
+    ├── health.js               Uptime/health check (see known issues — its reported version is stale)
     ├── rate-limit.js            Server-side rate limiting for room create/join/send
     ├── cleanup.js               Cron-triggered sweep that deletes expired rooms
     ├── canary.js                 Replay/injection canary registration
     ├── validate-room.js          Room-code validation endpoint
     ├── csp-report.js             CSP violation report sink
-    ├── maintenance.js            Maintenance-mode toggle endpoint
-    └── config.js                 Client runtime config endpoint
+    ├── analytics.js              Lightweight usage/event logging endpoint
+    ├── config.js                 Tells the client which Firebase shard projects are active —
+    │                              scans env for FIREBASE_* / FIREBASE_DBn_* automatically
+    └── shard-registry.js         Authoritative "which shard is this room on" service, backed by
+                                   its own dedicated Firebase project — see below
 ```
 
 There's no `src/`/`dist/` split in the repo — `dist/` is generated by `build.js` and is not committed (see `.gitignore` if present, or just note it's build output).
@@ -123,6 +129,23 @@ Two independent expiry systems:
 
 Images and videos are encrypted client-side, then — since a single Firestore document is capped at ~1MB — split into ~600KB chunks, each written as its own message document tagged with a shared `groupId`. The receiving client reassembles chunks by `groupId` once all pieces have arrived, then decrypts. If a new member's initial history fetch happens to only pick up part of a large file's chunks (a real edge case with paginated history), a self-healing backfill directly queries the rest by `groupId` so the media doesn't just silently fail to render.
 
+## Multi-shard architecture
+
+MiutChat doesn't run on a single Firestore project. Each **shard** (`miut-db0`, `miut-db1`, `miut-db2`, …) is a *completely separate Firebase project*, each on its own free Spark-tier quota. Rooms are spread across shards so the app can keep growing without ever needing a paid Firebase plan on any single project.
+
+**Discovery — `functions/api/config.js`.** Adding a shard is a Cloudflare dashboard change, not a code change: set `FIREBASE_DBn_API_KEY` / `_PROJECT_ID` / etc. for the next `n`, redeploy, and `config.js` picks it up automatically by scanning env vars. The client fetches `/api/config` once per session to learn which shards are currently active.
+
+**Placement — `functions/api/shard-registry.js`.** A *dedicated* Firebase project (separate from every chat shard) stores a `bindings/{roomCode} → { db: "miut-dbN" }` map and a per-shard load counter, reached over the raw Firestore REST API (not the client SDK). It exposes:
+- `lookup` — read-only. "Which shard is this room on?" Never creates a binding, so a join attempt or a typo'd code can't pollute the registry.
+- `resolve` — read **or** assign-and-bind. Only ever called right after a room is actually created, to place it on whichever active, non-degraded shard currently has the least load.
+- `confirm` — increments that shard's load counter once room creation has actually succeeded.
+- `bind` — explicitly (over)writes a room's binding. Used both by the creator (to tell the registry its real shard) and by the client-side self-heal below.
+- `report-error` — flags a shard as temporarily degraded (e.g. after a quota error) so `resolve` stops handing it new rooms.
+
+**Resolution order — `db-manager.js`, `getDb(roomCode)`.** For an existing room, in priority order: (1) this tab's in-memory cache, (2) the registry (`lookup`), (3) this browser's own `localStorage` binding, (4) a deterministic hash across active shards, as a last resort for a room neither the registry nor this browser has ever seen.
+
+**The failure mode this architecture creates, and how it's addressed:** a room's creator calls `resolve` (placing + binding it), then separately calls `bind` to make that binding durable — but `bind` is a best-effort network call on whatever connection the creator has at that moment. If it never lands (and historically, it had only ~3 seconds of retry — see git history), the registry has no binding for a room that genuinely exists. The *first* person to later look that room code up via `resolve` causes the registry to confidently assign it a fresh, essentially random shard — which has never heard of the room — and write that down as permanent. Every subsequent joiner is sent to the wrong shard. Two mitigations are now in place (`db-manager.js`): a durable, localStorage-backed pending-bind queue that keeps retrying a failed `bind` on every future page load until it lands, and `findRoomAcrossShards()` — a last-resort brute-force probe across every active shard, wired into `handleEnter()`, that self-corrects the registry the moment any joiner's resolved shard says a room doesn't exist.
+
 ## Local development
 
 There's no dev server with hot reload — the project is simple enough that you can iterate directly against the built output.
@@ -140,7 +163,7 @@ This produces a `dist/` folder. Serve it with any static file server, e.g.:
 npx serve dist
 ```
 
-You'll need your own Firebase project (Firestore) to actually connect to a backend — this repo doesn't include Firebase credentials. Wire up your project's config in wherever `app.js` initializes Firebase, and set up Firestore Security Rules (see the comment block above the feedback-collection code in `app.js` for one example of the rule shape this app expects; other collections need similar rules — there's no `firestore.rules` file committed to this repo, rules are managed directly in the Firebase console).
+You'll need your own Firebase project(s) (Firestore) to actually connect to a backend — this repo doesn't include Firebase credentials. Wire up each shard project's config via the `FIREBASE_*` / `FIREBASE_DBn_*` environment variables `functions/api/config.js` reads (see [Multi-shard architecture](#multi-shard-architecture)), and deploy [`firestore.rules`](./firestore.rules) — which **is** committed to this repo — to every chat-shard project (the dedicated registry project referenced in `shard-registry.js` needs its own, much smaller, rule set, not covered by this file).
 
 Local builds never touch the version number — see [Versioning](#versioning) below.
 
@@ -152,7 +175,7 @@ Whatever your deploy path — Cloudflare's Git integration running `node build.j
 
 ## Versioning
 
-The app version is a single source of truth: the `version` field in `package.json`. Every other place a version appears — `app.js`, `sw.js`, `index.html`'s meta tag, `manifest.json`, `wrangler.toml`, `functions/api/health.js`, and the footer of the marketing pages — is stamped in at build time by `build.js` reading through [`version.js`](./version.js). None of those are meant to be hand-edited.
+The app version is a single source of truth: the `version` field in `package.json`. Every other place a version appears — `app.js`, `sw.js`, `index.html`'s meta tag, `manifest.json`, `wrangler.toml`, and the footer of the marketing pages — is stamped in at build time by `build.js` reading through [`version.js`](./version.js). None of those are meant to be hand-edited.
 
 **Bump scheme** (a deliberate product decision, not strict semver): the patch number increments normally and caps at `25`; the next bump after that rolls into the minor version instead of continuing past 25:
 
