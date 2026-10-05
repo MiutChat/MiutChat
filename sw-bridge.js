@@ -12,7 +12,16 @@
 (async function registerSW() {
   if (!('serviceWorker' in navigator)) return;
 
-  const swPath  = new URL('sw.js',  document.baseURI).pathname;
+  // build.js stamps the real release version into SW_VERSION (and
+  // therefore the cache names) ONLY in the built sw.min.js output — the
+  // raw sw.js checked into source always has the literal placeholder
+  // '1.0.0' hardcoded. Registering sw.js directly meant the cache name
+  // never changed across a single deploy of this app: the service worker
+  // kept re-registering under the exact same cache keys every time,
+  // so updated app.js/security.js/etc could sit cached indefinitely
+  // regardless of how many real releases shipped. This is almost
+  // certainly why fixes have appeared to "come back" repeatedly.
+  const swPath  = new URL('sw.min.js',  document.baseURI).pathname;
   const swScope = new URL('./',     document.baseURI).pathname;
 
   try {
