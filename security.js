@@ -227,11 +227,13 @@ function resetRateLimit(action) {
 
 let _spActive       = false;
 let _spUsername     = 'ANONYMOUS';
+let _spWatermarkEl  = null;
 let _spBlurEl       = null;
 let _spTimerID      = null;
 let _spDevtoolsSize = { w: 0, h: 0 };
 
 const _SP_BLUR_CLASS     = 'sp-blur-active';
+const _SP_WATERMARK_ID   = '__sp_wm';
 const _SP_BLUR_ID        = '__sp_blur';
 
 function _spInjectStyles() {
@@ -240,10 +242,37 @@ function _spInjectStyles() {
   s.id = '__sp_styles';
   s.textContent = `
     .${_SP_BLUR_CLASS} { filter: blur(18px) !important; pointer-events: none !important; transition: filter .25s; user-select: none !important; }
+    #${_SP_WATERMARK_ID} {
+      position: fixed; inset: 0; z-index: 99998;
+      pointer-events: none; user-select: none;
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 0;
+      overflow: hidden;
+    }
+    #${_SP_WATERMARK_ID} .sp-wm-inner {
+      position: absolute; inset: -40%;
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 0;
+      transform: rotate(-22deg);
+      opacity: 0;
+      transition: opacity .3s;
+    }
+    #${_SP_WATERMARK_ID}.sp-wm-visible .sp-wm-inner { opacity: 1; }
+    #${_SP_WATERMARK_ID} .sp-wm-cell {
+      display: flex; align-items: center; justify-content: center;
+      padding: 28px 0;
+      font-family: 'Space Mono', monospace;
+      font-size: 11px;
+      color: rgba(78,205,196,0.14);
+      white-space: nowrap;
+      letter-spacing: 1px;
+      user-select: none;
+    }
     #${_SP_BLUR_ID} {
       position: fixed; inset: 0; z-index: 99997;
-      backdrop-filter: blur(24px) brightness(0.5);
-      -webkit-backdrop-filter: blur(24px) brightness(0.5);
+      backdrop-filter: blur(14px) brightness(0.5);
+      -webkit-backdrop-filter: blur(14px) brightness(0.5);
       background: rgba(5,13,12,0.72);
       display: none;
       align-items: center; justify-content: center;
@@ -263,6 +292,28 @@ function _spInjectStyles() {
   document.head.appendChild(s);
 }
 
+function _spBuildWatermark() {
+  if (document.getElementById(_SP_WATERMARK_ID)) return;
+  const wrap = document.createElement('div');
+  wrap.id = _SP_WATERMARK_ID;
+  const inner = document.createElement('div');
+  inner.className = 'sp-wm-inner';
+
+  // Fill grid with repeated cells (cut from 120 — that many DOM nodes
+  // updating text every 2s is real repaint cost on a weak device for no
+  // real deterrent benefit over fewer, still-dense-enough cells)
+  for (let i = 0; i < 48; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'sp-wm-cell';
+    cell.setAttribute('aria-hidden', 'true');
+    cell.dataset.spCell = '1';
+    inner.appendChild(cell);
+  }
+  wrap.appendChild(inner);
+  document.body.appendChild(wrap);
+  _spWatermarkEl = wrap;
+}
+
 function _spBuildBlur() {
   if (document.getElementById(_SP_BLUR_ID)) return;
   const el = document.createElement('div');
@@ -272,15 +323,39 @@ function _spBuildBlur() {
   _spBlurEl = el;
 }
 
+function _spUpdateWatermarkText() {
+  if (!_spWatermarkEl) return;
+  const ts   = new Date().toLocaleTimeString('en-US', { hour12: false });
+  const text = _spUsername + ' · ' + ts;
+  _spWatermarkEl.querySelectorAll('.sp-wm-cell').forEach((c, i) => {
+    c.textContent = (i % 2 === 0) ? text : '· · ·';
+  });
+}
+
+function _spShowWatermark() {
+  if (!_spWatermarkEl) return;
+  _spUpdateWatermarkText();
+  _spWatermarkEl.classList.add('sp-wm-visible');
+  if (_spTimerID) clearInterval(_spTimerID);
+  _spTimerID = setInterval(_spUpdateWatermarkText, 2000);
+}
+
+function _spHideWatermark() {
+  if (!_spWatermarkEl) return;
+  _spWatermarkEl.classList.remove('sp-wm-visible');
+  if (_spTimerID) { clearInterval(_spTimerID); _spTimerID = null; }
+}
+
 function _spBlur() {
   if (!_spBlurEl) return;
   _spBlurEl.classList.add('sp-blur-show');
+  _spShowWatermark();
 }
 
 function _spUnblur() {
   if (!_spBlurEl) return;
   _spBlurEl.classList.remove('sp-blur-show');
-  if (_spTimerID) { clearInterval(_spTimerID); _spTimerID = null; }
+  _spHideWatermark();
 }
 
 /** Approximate DevTools detection by window size delta */
@@ -321,6 +396,7 @@ function initScreenProtection(opts) {
   _spUsername = (opts.username || 'ANONYMOUS').toString().toUpperCase();
 
   _spInjectStyles();
+  _spBuildWatermark();
   _spBuildBlur();
 
   document.body.classList.add('sp-no-select');
@@ -341,10 +417,17 @@ function destroyScreenProtection() {
   window.removeEventListener('focus', _spHandleFocus);
   document.removeEventListener('visibilitychange', _spHandleVisible);
   document.body.classList.remove('sp-no-select');
-  if (_spBlurEl) { _spBlurEl.remove(); _spBlurEl = null; }
+  if (_spWatermarkEl) { _spWatermarkEl.remove(); _spWatermarkEl = null; }
+  if (_spBlurEl)      { _spBlurEl.remove();      _spBlurEl = null; }
   const s = document.getElementById('__sp_styles');
   if (s) s.remove();
 }
+
+/** Update the watermark username (call after login) */
+function setScreenProtectionUsername(name) {
+  _spUsername = (name || 'ANONYMOUS').toString().toUpperCase();
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════
  * PART 8 — SECURITY: REPLAY PROTECTION + IV UNIQUENESS + AAD
@@ -440,6 +523,7 @@ const _SEC = {
   // Screen protection
   initScreenProtection,
   destroyScreenProtection,
+  setScreenProtectionUsername,
 
   // Security primitives
   validateMessageTimestamp,

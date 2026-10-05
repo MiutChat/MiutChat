@@ -42,7 +42,30 @@ if (fs.existsSync(DIST)) fs.rmSync(DIST, { recursive: true, force: true });
 fs.mkdirSync(path.join(DIST, 'functions', 'api'), { recursive: true });
 log('CLEAN', 'dist/ wiped');
 log('VERSION', VERSION + '  (bumped by the GitHub Action on push, not by this build step)');
-log('MODE', isProd ? (isDebug ? 'production + DEBUG (console kept)' : 'production (console stripped)') : 'development (sourcemaps)', isProd && !isDebug ? C.green : C.yellow);
+
+// TEMPORARY: console/debugger dropping is disabled outright right now so
+// the [MIUT ...] diagnostic logging added to track down the "access
+// denied" / "room not found" reports is guaranteed visible in whatever
+// build Cloudflare actually deploys — not just in a local `--debug` build,
+// since the real deploy pipeline doesn't pass that flag. Re-enable the
+// commented-out line below once the current investigation is done; the
+// --debug flag mechanism (isDebug, above) still works as a scoped
+// alternative to leaving this on permanently.
+const baseFlags =
+  '--bundle=false --minify --minify-whitespace --minify-identifiers --minify-syntax'+
+  ' --tree-shaking=true --charset=utf8'+
+  // (isProd && !isDebug ? ' --drop:console --drop:debugger' : '')+
+  ''+
+  (!isProd ? ' --sourcemap=inline' : '');
+
+// Derived from baseFlags itself, not a separate isProd/isDebug guess — the
+// previous version of this line hardcoded its message from those flags
+// directly, so when console-dropping was disabled above without updating
+// this line too, it kept reporting "console stripped" on every deploy
+// while console output was, in fact, fully intact. Reading the real flag
+// string means this can't silently drift out of sync again.
+const _consoleDropped = / --drop:console\b/.test(baseFlags);
+log('MODE', (isProd ? 'production' : 'development') + (_consoleDropped ? ' (console stripped)' : ' (console kept)'), _consoleDropped ? C.yellow : C.green);
 
 function run(cmd) {
   const r = spawnSync(cmd, { shell:true, stdio:['ignore','pipe','pipe'] });
@@ -91,21 +114,6 @@ function compress(fp) {
 
 const tmps = [];
 const sri  = {};
-
-// TEMPORARY: console/debugger dropping is disabled outright right now so
-// the [MIUT ...] diagnostic logging added to track down the "access
-// denied" / "room not found" reports is guaranteed visible in whatever
-// build Cloudflare actually deploys — not just in a local `--debug` build,
-// since the real deploy pipeline doesn't pass that flag. Re-enable the
-// commented-out line below once the current investigation is done; the
-// --debug flag mechanism (isDebug, above) still works as a scoped
-// alternative to leaving this on permanently.
-const baseFlags =
-  '--bundle=false --minify --minify-whitespace --minify-identifiers --minify-syntax'+
-  ' --tree-shaking=true --charset=utf8'+
-  // (isProd && !isDebug ? ' --drop:console --drop:debugger' : '')+
-  ''+
-  (!isProd ? ' --sourcemap=inline' : '');
 
 log('BUILD JS', 'browser bundles');
 const JS_JOBS = [

@@ -1205,12 +1205,6 @@ function _showAnnouncementPopup(msg) {
   const overlay = $('announcement-modal');
   const body    = $('announcement-body');
   if (!overlay || !body) return;
-  // Was body.textContent = msg — plain text, so **bold**/__underline__/etc
-  // showed up as literal asterisks and underscores instead of formatting,
-  // even though the same message text renders correctly inside a chat
-  // bubble. renderTextContent() already escapes the input before adding
-  // any markup, so this is the same safe path messages already use, not
-  // raw innerHTML of untrusted input.
   body.innerHTML = renderTextContent(msg);
   overlay.style.display = 'flex';
 
@@ -4881,8 +4875,43 @@ async function patchMsg(id, data) {
     if (data.sig) requestAnimationFrame(() => verifyAndBadge(data, id));
   }
 }
+/**
+ * Block-level pass: groups consecutive "- "/"* " lines into a <ul>, and
+ * "> " lines into a <blockquote>. Runs on already-esc()-escaped text, line
+ * by line, before \n becomes <br> — list/quote grouping needs real line
+ * boundaries, which <br>-joined text no longer has. Lines that aren't part
+ * of a list/quote run are left untouched (still containing literal \n,
+ * which the caller's existing \n → <br> pass still handles normally).
+ */
+function _renderBlocks(escapedText) {
+  const lines = escapedText.split('\n');
+  const out = [];
+  let list = null;   // accumulating <li> items, or null
+  let quote = null;  // accumulating blockquote lines, or null
+
+  const flushList  = () => { if (list)  { out.push('<ul class="msg-list">' + list.join('') + '</ul>'); list = null; } };
+  const flushQuote = () => { if (quote) { out.push('<blockquote class="msg-quote">' + quote.join('<br>') + '</blockquote>'); quote = null; } };
+
+  for (const line of lines) {
+    const listM  = /^[-*] (.+)$/.exec(line);
+    const quoteM = /^&gt; (.+)$/.exec(line); // esc() already turned '>' into '&gt;'
+    if (listM) {
+      flushQuote();
+      (list || (list = [])).push('<li>' + listM[1] + '</li>');
+    } else if (quoteM) {
+      flushList();
+      (quote || (quote = [])).push(quoteM[1]);
+    } else {
+      flushList(); flushQuote();
+      out.push(line);
+    }
+  }
+  flushList(); flushQuote();
+  return out.join('\n');
+}
+
 function renderTextContent(text) {
-  let html = esc(text).replace(/\n/g, '<br>');
+  let html = _renderBlocks(esc(text)).replace(/\n/g, '<br>');
 
   // Lightweight markdown-style formatting: **bold**, *italic*, ~~strike~~,
   // `code`. Runs on the already-`esc()`-escaped HTML, so the delimiters can
@@ -4895,12 +4924,6 @@ function renderTextContent(text) {
   html = html.replace(/`([^`\n]+)`/g, '<code class="msg-inline-code">$1</code>');
   html = html.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/~~([^\n]+?)~~/g, '<del>$1</del>');
-  // __underline__ — was never added here despite the app's own help text /
-  // UI implying it's supported alongside bold/italic/strike. Disallows a
-  // bare `_` inside the match (same guard the other three delimiters use)
-  // so an ordinary snake_case_word (single underscores) never matches —
-  // only a deliberate double-underscore pair does.
-  html = html.replace(/__([^\n_]+?)__/g, '<u>$1</u>');
   html = html.replace(/(?<![*\w])\*([^\s*][^\n*]*?)\*(?!\w)/g, '<em>$1</em>');
 
   // Linkify URLs before the @mention pass below, stashing them behind

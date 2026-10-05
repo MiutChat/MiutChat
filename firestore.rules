@@ -169,6 +169,15 @@ service cloud.firestore {
               && request.resource.data.approved == true
             )
             || (
+              request.auth.uid == memberId
+              && changedKeys().hasOnly(['approved'])
+              && request.resource.data.approved == true
+              && resource.data.approved == false
+              && resource.data.get('declined', false) != true
+              && resource.data.get('blocked', false)  != true
+              && roomData(roomCode).get('approvalRequired', false) != true
+            )
+            || (
               isRoomAdmin(roomCode)
               && changedKeys().hasOnly(['approved','role','declined','blocked','online'])
             )
