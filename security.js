@@ -11,7 +11,11 @@ const _FLAG_DEFAULTS = {
   ENABLE_COMPRESSION:       true,
   ENABLE_STREAMING:         true,
   ENABLE_CHUNKING:          true,
-  ENABLE_SCREEN_PROTECTION: true,
+  // OFF — this has been requested twice now (slow to resume, watermark
+  // re-rendering on a setInterval every 2s is the likely cause of general
+  // sluggishness, not just dismiss-time). Do not flip this back to true
+  // without re-checking _spUpdateWatermarkText's cost first.
+  ENABLE_SCREEN_PROTECTION: false,
   ENABLE_RATE_LIMIT:        true,
 };
 

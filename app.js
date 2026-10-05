@@ -4911,19 +4911,34 @@ function _renderBlocks(escapedText) {
 }
 
 function renderTextContent(text) {
-  let html = _renderBlocks(esc(text)).replace(/\n/g, '<br>');
+  // Multi-line code blocks (```like this```) are pulled out and stashed
+  // FIRST, before esc()/_renderBlocks() even run — their content must
+  // never be treated as list/blockquote lines, never have other inline
+  // formatting applied inside it (a literal "**not bold**" in a pasted
+  // snippet should stay literal), and must keep real newlines instead of
+  // <br>, which is what a <pre> needs to render correctly. Escaped
+  // explicitly and separately right here — the one place this touches esc().
+  const blockStash = [];
+  const textWithBlockTokens = text.replace(/```([\s\S]*?)```/g, (_, code) => {
+    const token = `\u0001${blockStash.length}\u0001`;
+    blockStash.push(`<pre class="msg-codeblock"><code>${esc(code.replace(/^\n/, '').replace(/\n$/, ''))}</code></pre>`);
+    return token;
+  });
 
-  // Lightweight markdown-style formatting: **bold**, *italic*, ~~strike~~,
-  // `code`. Runs on the already-`esc()`-escaped HTML, so the delimiters can
-  // only ever produce these four fixed tags — there's no way for a message
-  // to inject arbitrary markup through them. Code spans are converted
-  // first so a *, ~ or _ typed inside backticks renders literally instead
-  // of being eaten by the bold/strike/italic passes below; bold runs before
-  // italic so **text** is consumed as a pair before any lone '*' is left
-  // for the italic regex to (correctly) pick up.
+  let html = _renderBlocks(esc(textWithBlockTokens)).replace(/\n/g, '<br>');
+
+  // Lightweight markdown-style formatting: **bold**, *italic*, __underline__,
+  // ~~strike~~, `code`. Runs on the already-`esc()`-escaped HTML, so the
+  // delimiters can only ever produce these fixed tags — there's no way for
+  // a message to inject arbitrary markup through them. Code spans are
+  // converted first so a *, ~ or _ typed inside backticks renders literally
+  // instead of being eaten by the bold/strike/italic/underline passes
+  // below; bold runs before italic so **text** is consumed as a pair
+  // before any lone '*' is left for the italic regex to (correctly) pick up.
   html = html.replace(/`([^`\n]+)`/g, '<code class="msg-inline-code">$1</code>');
   html = html.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/~~([^\n]+?)~~/g, '<del>$1</del>');
+  html = html.replace(/__([^\n_]+?)__/g, '<u>$1</u>');
   html = html.replace(/(?<![*\w])\*([^\s*][^\n*]*?)\*(?!\w)/g, '<em>$1</em>');
 
   // Linkify URLs before the @mention pass below, stashing them behind
@@ -4958,7 +4973,10 @@ function renderTextContent(text) {
 
   html = html.replace(/@([A-Za-z][A-Za-z0-9]+(?: [A-Za-z][A-Za-z0-9]+)*)/gi, '<span class="mention">@$1</span>');
 
-  return html.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);
+  html = html.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);
+  // Code blocks restored last, after every other pass — their content
+  // must never pass back through any of the formatting above.
+  return html.replace(/\u0001(\d+)\u0001/g, (_, i) => blockStash[+i]);
 }
 // Last known reactions per message, keyed by docId — single source of truth
 // used both to actually render and as the base state for optimistic toggles
