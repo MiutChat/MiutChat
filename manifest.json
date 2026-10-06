@@ -2,8 +2,8 @@
   "name": "MIUT",
   "short_name": "MIUT",
   "description": "MiutChat v1.0.0 \u2014 End-to-end encrypted anonymous chat. No accounts. No tracking.",
-  "id": "/index.html",
-  "start_url": "/index.html?source=pwa",
+  "id": "/",
+  "start_url": "/?source=pwa",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait-primary",
@@ -58,11 +58,6 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
-    },
-    {
-      "src": "icons/icon-1024.png",
-      "sizes": "1024x1024",
-      "type": "image/png"
     },
     {
       "src": "icons/icon-maskable-192.png",
