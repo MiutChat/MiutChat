@@ -3,11 +3,12 @@
  * Simple health check endpoint for uptime monitors.
  * Returns version info and CF edge data center.
  */
+const BUILD_VERSION = '0.0.0';
 export async function onRequest(context) {
-  const { env, request } = context;
+  const { request } = context;
   return new Response(JSON.stringify({
     status:  'ok',
-    version: env.MIUT_VERSION || '3.0.0',
+    version: BUILD_VERSION,
     colo:    request.cf?.colo || 'unknown',
     ts:      new Date().toISOString(),
   }), {
