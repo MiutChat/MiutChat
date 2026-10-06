@@ -1174,8 +1174,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
 /**
  * Announcement popup — content lives entirely in Firestore, at
- * config/announcement on the PRIMARY (miut-db0) project, edited directly
- * in the Firebase console (no app deploy needed to change it):
+ * config/announcement, edited directly in the Firebase console (no app
+ * deploy needed to change it):
  *   config/announcement = { message: "Your text here" }
  * Empty or missing `message` → nothing shown, ever. Once shown, a given
  * exact message text is remembered (localStorage) so the SAME announcement
@@ -1183,21 +1183,43 @@ window.addEventListener('DOMContentLoaded', () => {
  * show again to everyone, since it's compared by content, not a flag.
  * Entirely best-effort: any failure here (offline, rules not yet applied,
  * doc doesn't exist) just means no popup — never blocks anything else.
+ *
+ * Shard fallback: this used to hardcode firebase.app('miut-db0') — fine
+ * until db0's daily read quota is exhausted, at which point this read
+ * itself starts failing (caught below, silently — no popup, nothing else
+ * breaks) even though the announcement doc is perfectly fine. Now it
+ * tries every currently-active, non-degraded shard in db-manager.js's own
+ * health order (db0 first if it's healthy, same as before) and stops at
+ * the first one that answers. To actually use a shard other than db0 for
+ * this, create the SAME doc — config/announcement — in that shard's
+ * Firebase project too; no code change needed, this just needs the doc to
+ * exist somewhere it can reach.
  */
 async function _checkAnnouncement() {
-  try {
-    const snap = await firebase.firestore(firebase.app('miut-db0'))
-      .collection('config').doc('announcement').get();
-    const msg = (snap.exists ? (snap.data()?.message || '') : '').trim();
-    if (!msg) return;
+  const statuses = (window.getDbStatus?.() || []).slice();
+  // db0 first if present and healthy — preserves prior behavior/ordering
+  // when nothing is degraded; otherwise whatever's healthy, in the order
+  // db-manager.js already tracks them.
+  statuses.sort((a, b) => (a.name === 'miut-db0' ? -1 : 0) - (b.name === 'miut-db0' ? -1 : 0));
+  const candidates = statuses.length ? statuses.map(s => s.name) : ['miut-db0'];
 
-    let seen = '';
-    try { seen = localStorage.getItem('miut_announcement_seen') || ''; } catch {}
-    if (seen === msg) return;
+  for (const dbName of candidates) {
+    try {
+      const snap = await firebase.firestore(firebase.app(dbName))
+        .collection('config').doc('announcement').get();
+      const msg = (snap.exists ? (snap.data()?.message || '') : '').trim();
+      if (!msg) return; // doc exists on this shard but is empty — don't fall through to others
 
-    _showAnnouncementPopup(msg);
-  } catch (e) {
-    _sysConsole?.warn?.('[MIUT] Announcement check skipped:', e.message);
+      let seen = '';
+      try { seen = localStorage.getItem('miut_announcement_seen') || ''; } catch {}
+      if (seen === msg) return;
+
+      _showAnnouncementPopup(msg);
+      return;
+    } catch (e) {
+      _sysConsole?.warn?.(`[MIUT] Announcement check failed on ${dbName}, trying next shard if any:`, e.message);
+      // fall through to the next candidate shard
+    }
   }
 }
 
@@ -1205,7 +1227,9 @@ function _showAnnouncementPopup(msg) {
   const overlay = $('announcement-modal');
   const body    = $('announcement-body');
   if (!overlay || !body) return;
-  body.innerHTML = renderTextContent(msg);
+  // true = allow "#"/"##" to render as headings here — announcements are
+  // admin-authored, unlike regular chat messages where "#" is just prose.
+  body.innerHTML = renderTextContent(msg, true);
   overlay.style.display = 'flex';
 
   const close = () => {
@@ -3932,7 +3956,10 @@ function handleKey(e) {
     if (first) first.dispatchEvent(new Event('mousedown'));
     return;
   }
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  // Enter always inserts a newline now — sending is button-only (the send
+  // button). Previously Enter sent and Shift+Enter made a newline; that's
+  // reversed by request, so there's deliberately nothing to intercept here
+  // for plain Enter — the textarea's own default behavior handles it.
 }
 
 function handleTyping(el) {
@@ -4877,13 +4904,19 @@ async function patchMsg(id, data) {
 }
 /**
  * Block-level pass: groups consecutive "- "/"* " lines into a <ul>, and
- * "> " lines into a <blockquote>. Runs on already-esc()-escaped text, line
- * by line, before \n becomes <br> — list/quote grouping needs real line
- * boundaries, which <br>-joined text no longer has. Lines that aren't part
- * of a list/quote run are left untouched (still containing literal \n,
- * which the caller's existing \n → <br> pass still handles normally).
+ * "> " lines into a <blockquote>. When allowHeadings is true, "# "/"## "
+ * lines also become a heading/subheading div — gated because regular chat
+ * messages use "#" casually (hashtags, "#1", etc.) and treating every
+ * leading "#" as a heading there would misrender normal prose. Headings
+ * are opt-in, used only for the admin-authored announcement popup, where
+ * "#" really does mean "format this as a heading". Runs on already-
+ * esc()-escaped text, line by line, before \n becomes <br> — list/quote/
+ * heading grouping needs real line boundaries, which <br>-joined text no
+ * longer has. Lines that aren't part of a list/quote/heading run are left
+ * untouched (still containing literal \n, which the caller's existing
+ * \n → <br> pass still handles normally).
  */
-function _renderBlocks(escapedText) {
+function _renderBlocks(escapedText, allowHeadings) {
   const lines = escapedText.split('\n');
   const out = [];
   let list = null;   // accumulating <li> items, or null
@@ -4893,9 +4926,17 @@ function _renderBlocks(escapedText) {
   const flushQuote = () => { if (quote) { out.push('<blockquote class="msg-quote">' + quote.join('<br>') + '</blockquote>'); quote = null; } };
 
   for (const line of lines) {
+    const h1M    = allowHeadings ? /^# (.+)$/.exec(line)  : null;
+    const h2M    = allowHeadings ? /^## (.+)$/.exec(line) : null;
     const listM  = /^[-*] (.+)$/.exec(line);
     const quoteM = /^&gt; (.+)$/.exec(line); // esc() already turned '>' into '&gt;'
-    if (listM) {
+    if (h1M) {
+      flushList(); flushQuote();
+      out.push('<div class="msg-heading">' + h1M[1] + '</div>');
+    } else if (h2M) {
+      flushList(); flushQuote();
+      out.push('<div class="msg-subheading">' + h2M[1] + '</div>');
+    } else if (listM) {
       flushQuote();
       (list || (list = [])).push('<li>' + listM[1] + '</li>');
     } else if (quoteM) {
@@ -4910,7 +4951,7 @@ function _renderBlocks(escapedText) {
   return out.join('\n');
 }
 
-function renderTextContent(text) {
+function renderTextContent(text, allowHeadings) {
   // Multi-line code blocks (```like this```) are pulled out and stashed
   // FIRST, before esc()/_renderBlocks() even run — their content must
   // never be treated as list/blockquote lines, never have other inline
@@ -4925,7 +4966,7 @@ function renderTextContent(text) {
     return token;
   });
 
-  let html = _renderBlocks(esc(textWithBlockTokens)).replace(/\n/g, '<br>');
+  let html = _renderBlocks(esc(textWithBlockTokens), allowHeadings).replace(/\n/g, '<br>');
 
   // Lightweight markdown-style formatting: **bold**, *italic*, __underline__,
   // ~~strike~~, `code`. Runs on the already-`esc()`-escaped HTML, so the
@@ -4971,7 +5012,26 @@ function renderTextContent(text) {
     return token;
   });
 
-  html = html.replace(/@([A-Za-z][A-Za-z0-9]+(?: [A-Za-z][A-Za-z0-9]+)*)/gi, '<span class="mention">@$1</span>');
+  // ── @mentions ─────────────────────────────────────────────────────
+  // @all is always valid, styled distinctly (notify-everyone). Named
+  // mentions only highlight actual room members (_memberNames — the same
+  // list the autocomplete dropdown uses), not any arbitrary "@Word" in
+  // prose — this is deliberately stricter than the old blind regex here,
+  // so "@gmail.com" or "@2 things" in a pasted message no longer gets
+  // styled as a mention just because it happens to match the shape.
+  // Longest name first so "COLD KAI" matches before the "COLD KAI62"
+  // prefix check would otherwise grab just "COLD KAI".
+  html = html.replace(/@all\b/gi, '<span class="mention mention-all">@all</span>');
+  if (typeof _memberNames !== 'undefined' && _memberNames.length) {
+    const sorted = [..._memberNames].sort((a, b) => b.length - a.length);
+    for (const name of sorted) {
+      const escaped = esc(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      html = html.replace(
+        new RegExp('@(' + escaped + ')(?=[\\s<.,;:!?]|$)', 'gi'),
+        '<span class="mention">@$1</span>'
+      );
+    }
+  }
 
   html = html.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);
   // Code blocks restored last, after every other pass — their content
@@ -5442,10 +5502,13 @@ function handleMentionInput(input) {
   }
   if (atIdx === -1) { hideMentionDropdown(); return; }
   const query = val.slice(atIdx + 1, pos).toUpperCase();
-  const matches = _memberNames.filter(n => n.toUpperCase().startsWith(query));
-  if (!matches.length) { hideMentionDropdown(); return; }
+  // @all is always offered as a match when it fits the typed query, in
+  // addition to the usual per-member name matches.
+  const allMatch = 'ALL'.startsWith(query);
+  const matches  = _memberNames.filter(n => n.toUpperCase().startsWith(query));
+  if (!matches.length && !allMatch) { hideMentionDropdown(); return; }
   _mentionActive = true; _mentionStart = atIdx;
-  showMentionDropdown(matches, input);
+  showMentionDropdown(allMatch ? ['@all', ...matches] : matches, input);
 }
 
 function showMentionDropdown(names, input) {
@@ -5455,9 +5518,14 @@ function showMentionDropdown(names, input) {
     $('input-area')?.insertAdjacentElement('beforebegin', dd);
   }
   dd.innerHTML = '';
-  names.slice(0, 5).forEach(name => {
-    const btn = document.createElement('button'); btn.className = 'mention-item';
-    btn.innerHTML = `<div class="mention-av" style="background:${avatarColor(name)}">${esc(initials(name))}</div><span>${esc(name)}</span>`;
+  names.slice(0, 6).forEach(name => {
+    const btn = document.createElement('button');
+    btn.className = name === '@all' ? 'mention-item mention-item-all' : 'mention-item';
+    if (name === '@all') {
+      btn.innerHTML = `<div class="mention-av mention-av-all">&#10022;</div><span>@all <small>&#8212; notify everyone</small></span>`;
+    } else {
+      btn.innerHTML = `<div class="mention-av" style="background:${avatarColor(name)}">${esc(initials(name))}</div><span>${esc(name)}</span>`;
+    }
     btn.addEventListener('mousedown', e => { e.preventDefault(); insertMention(name, input); });
     dd.appendChild(btn);
   });
@@ -5470,9 +5538,12 @@ function hideMentionDropdown() {
 }
 
 function insertMention(name, input) {
-  const val = input.value, pos = input.selectionStart;
-  const before = val.slice(0, _mentionStart) + '@' + name + ' ';
-  input.value = before + val.slice(pos);
+  const val    = input.value, pos = input.selectionStart;
+  // @all arrives pre-formatted as the literal string '@all' from the
+  // dropdown; every other name is a plain member name needing the '@' added.
+  const insert = name === '@all' ? '@all ' : '@' + name + ' ';
+  const before = val.slice(0, _mentionStart) + insert;
+  input.value  = before + val.slice(pos);
   const np = before.length; input.setSelectionRange(np, np);
   hideMentionDropdown(); input.focus();
 }

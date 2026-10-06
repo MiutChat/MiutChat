@@ -272,7 +272,7 @@ const STATIC = [
   '_headers','_redirects','_middleware.js','config.js','privacy.html','landing.html',
   'terms.html','about.html','404.html','maintenance.html',
   'secure-chat-for-journalists.html','ephemeral-chat-for-support-groups.html',
-  'robots.txt','ads.txt','sitemap.xml','wrangler.toml','CNAME',
+  'robots.txt','ads.txt','wrangler.toml','CNAME', // sitemap.xml generated at build time below
 ];
 // Files that need the unified VERSION text-stamped in rather than a plain
 // byte copy. manifest.json/wrangler.toml carry their own version fields;
@@ -322,6 +322,38 @@ function copyDirExcept(src, dest, exclude) {
 }
 copyDirExcept(path.join(ROOT,'functions'), DIST+'/functions', CF_JOBS_SET);
 log('  done', nc+' files + icons/ + functions/');
+
+// ── Generate sitemap.xml with today's build date ──────────────────────────
+// lastmod reflects the actual build date — crawlers use this to decide
+// whether to re-crawl. A static 2026-04-01 meant Google thought nothing
+// ever changed. Generated here so it's always correct without manual edits.
+{
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const BASE  = 'https://miutchat.pages.dev';
+  const pages = [
+    { loc: '/landing.html',                               priority: '1.0', changefreq: 'monthly'  },
+    { loc: '/',                                           priority: '0.9', changefreq: 'weekly'   },
+    { loc: '/about.html',                                 priority: '0.8', changefreq: 'monthly'  },
+    { loc: '/privacy.html',                               priority: '0.7', changefreq: 'monthly'  },
+    { loc: '/terms.html',                                 priority: '0.7', changefreq: 'monthly'  },
+  ];
+  // Include any optional SEO landing pages if they were copied to dist
+  const seoPages = [
+    'secure-chat-for-journalists.html',
+    'ephemeral-chat-for-support-groups.html',
+  ];
+  for (const p of seoPages) {
+    if (fs.existsSync(DIST + '/' + p)) {
+      pages.push({ loc: '/' + p, priority: '0.6', changefreq: 'monthly' });
+    }
+  }
+  const urls = pages.map(p =>
+    `  <url>\n    <loc>${BASE}${p.loc}</loc>\n    <changefreq>${p.changefreq}</changefreq>\n    <priority>${p.priority}</priority>\n    <lastmod>${today}</lastmod>\n  </url>`
+  ).join('\n');
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
+  fs.writeFileSync(DIST + '/sitemap.xml', xml);
+  log('  stamp', `sitemap.xml generated (lastmod ${today}, ${pages.length} URLs)`);
+}
 log('  stamp', 'version '+VERSION+' applied to manifest.json, wrangler.toml, marketing pages');
 
 if (isProd) {
