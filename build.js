@@ -208,10 +208,11 @@ const CF_JOBS = [
 ];
 for (const f of CF_JOBS) {
   if (!fs.existsSync(path.join(ROOT, f))) continue;
-  // health.js has a hardcoded fallback version literal for when
-  // MIUT_VERSION isn't set as an env var — keep it in sync too.
+  // health.js reports its own baked-in BUILD_VERSION constant rather than
+  // an env var (see the comment in that file for why env.MIUT_VERSION is
+  // unreliable here) — stamp the real version into that literal.
   const versionTransform = f.endsWith('health.js')
-    ? t => t.replace(/env\.MIUT_VERSION\s*\|\|\s*'[^']*'/, `env.MIUT_VERSION || '${VERSION}'`)
+    ? t => t.replace(/const BUILD_VERSION\s*=\s*'[^']*';/, `const BUILD_VERSION = '${VERSION}';`)
     : undefined;
   const tmp = prepTmp(f, versionTransform); tmps.push(tmp);
   run(ESB+' '+tmp+' --bundle=false --minify --platform=neutral --format=esm --target=es2020 --outfile='+DIST+'/'+f);
@@ -281,7 +282,6 @@ const STATIC = [
 const VERSIONED_STATIC = new Set([
   'manifest.json', 'wrangler.toml',
   'privacy.html', 'landing.html', 'terms.html', 'about.html',
-  'secure-chat-for-journalists.html', 'ephemeral-chat-for-support-groups.html',
 ]);
 let nc = 0;
 for (const f of STATIC) {
@@ -304,6 +304,23 @@ for (const f of STATIC) {
   nc++;
 }
 copyDir(path.join(ROOT,'icons'), DIST+'/icons');
+// Any other static content directory of pages (e.g. learn/ — long-form SEO
+// articles) is copied the same way, then gets the same {{APP_VERSION}}
+// stamp the flat marketing pages above get, so new subdirectories of pages
+// don't need their own bespoke build.js wiring just to pick up the version
+// footer. Add a directory name here and everything else (including the
+// sitemap scan below) handles it automatically.
+const PAGE_DIRS = ['learn'];
+for (const d of PAGE_DIRS) {
+  const src = path.join(ROOT, d);
+  if (!fs.existsSync(src)) continue;
+  copyDir(src, DIST + '/' + d);
+  for (const f of fs.readdirSync(DIST + '/' + d)) {
+    if (!f.endsWith('.html')) continue;
+    const fp = DIST + '/' + d + '/' + f;
+    fs.writeFileSync(fp, fs.readFileSync(fp, 'utf8').replace(/\{\{APP_VERSION\}\}/g, VERSION));
+  }
+}
 // Copy functions/ raw EXCEPT the files CF_JOBS already built above (minified
 // + version-stamped for health.js) — a plain copyDir here used to silently
 // clobber that work by overwriting it with the untouched source right after,
@@ -324,36 +341,72 @@ function copyDirExcept(src, dest, exclude) {
 copyDirExcept(path.join(ROOT,'functions'), DIST+'/functions', CF_JOBS_SET);
 log('  done', nc+' files + icons/ + functions/');
 
-// ── Generate sitemap.xml with today's build date ──────────────────────────
-// lastmod reflects the actual build date — crawlers use this to decide
-// whether to re-crawl. A static 2026-04-01 meant Google thought nothing
-// ever changed. Generated here so it's always correct without manual edits.
+// ── Generate sitemap.xml by scanning the actual dist/ output ──────────────
+// Two deliberate decisions here, both by request:
+//
+// 1. EVERY url gets lastmod = today's build date, full stop. This build has
+//    no reliable way to know which specific pages actually changed since
+//    the last deploy (that would mean diffing against git history, previous
+//    builds, etc.) — rather than guess wrong, or leave stale dates sitting
+//    around that under-represent how fresh the site actually is, every URL
+//    in a given build is stamped with that build's date. Simpler and never
+//    actually a lie: the page WAS current as of this date, whether or not
+//    its content literally differs from the last deploy.
+//
+// 2. Pages are DISCOVERED, not hand-listed. This used to be a hardcoded
+//    array that needed a manual edit for every new page (and silently kept
+//    listing pages like a removed maintenance.html if nobody remembered to
+//    delete the entry). Instead this walks the real dist/ output — so a
+//    page that didn't actually build can't end up in the sitemap, and a
+//    new page (e.g. another article dropped into learn/) is picked up
+//    automatically on the next build with zero changes needed here.
 {
   const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
   const BASE  = 'https://miutchat.pages.dev';
-  const pages = [
-    { loc: '/landing.html',                               priority: '1.0', changefreq: 'monthly'  },
-    { loc: '/',                                           priority: '0.9', changefreq: 'weekly'   },
-    { loc: '/about.html',                                 priority: '0.8', changefreq: 'monthly'  },
-    { loc: '/privacy.html',                               priority: '0.7', changefreq: 'monthly'  },
-    { loc: '/terms.html',                                 priority: '0.7', changefreq: 'monthly'  },
-  ];
-  // Include any optional SEO landing pages if they were copied to dist
-  const seoPages = [
-    'secure-chat-for-journalists.html',
-    'ephemeral-chat-for-support-groups.html',
-  ];
-  for (const p of seoPages) {
-    if (fs.existsSync(DIST + '/' + p)) {
-      pages.push({ loc: '/' + p, priority: '0.6', changefreq: 'monthly' });
+
+  // Pages that exist in dist/ but should never be indexed (error/offline/
+  // maintenance shells, not real content) — excluded by filename, root level only.
+  const EXCLUDE_ROOT = new Set(['404.html', 'offline.html', 'maintenance.html']);
+  // Known top-level pages get a deliberate, hand-tuned priority/changefreq;
+  // anything not listed here (a new root page, or anything found in a
+  // PAGE_DIRS subdirectory like learn/) falls through to sensible defaults
+  // below instead of needing an entry added here first.
+  const KNOWN = {
+    'index.html':   { loc: '/',             priority: '0.9', changefreq: 'weekly'  },
+    'landing.html': { loc: '/landing.html', priority: '1.0', changefreq: 'monthly' },
+    'about.html':   { loc: '/about.html',   priority: '0.8', changefreq: 'monthly' },
+    'privacy.html': { loc: '/privacy.html', priority: '0.7', changefreq: 'monthly' },
+    'terms.html':   { loc: '/terms.html',   priority: '0.7', changefreq: 'monthly' },
+  };
+  const NEVER_WALK = new Set(['functions', 'icons']); // not page directories
+
+  const pages = [];
+  function scan(dir, relDir) { // relDir: '' at dist root, 'learn/' one level in, etc.
+    if (!fs.existsSync(dir)) return;
+    for (const f of fs.readdirSync(dir).sort()) {
+      const fp = path.join(dir, f);
+      if (fs.statSync(fp).isDirectory()) {
+        if (relDir === '' && NEVER_WALK.has(f)) continue;
+        if (relDir === '') scan(fp, f + '/'); // one level of subdirectories deep is enough for this site
+        continue;
+      }
+      if (!f.endsWith('.html')) continue;
+      if (relDir === '' && EXCLUDE_ROOT.has(f)) continue;
+      const rel = relDir + f;
+      if (KNOWN[rel]) { pages.push(KNOWN[rel]); continue; }
+      // Any other page — a new article, a future landing page — at a
+      // sane default: root-level pages slightly outrank nested ones.
+      pages.push({ loc: '/' + rel, priority: relDir ? '0.6' : '0.65', changefreq: 'monthly' });
     }
   }
+  scan(DIST, '');
+
   const urls = pages.map(p =>
     `  <url>\n    <loc>${BASE}${p.loc}</loc>\n    <changefreq>${p.changefreq}</changefreq>\n    <priority>${p.priority}</priority>\n    <lastmod>${today}</lastmod>\n  </url>`
   ).join('\n');
   const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
   fs.writeFileSync(DIST + '/sitemap.xml', xml);
-  log('  stamp', `sitemap.xml generated (lastmod ${today}, ${pages.length} URLs)`);
+  log('  stamp', `sitemap.xml generated (lastmod ${today}, ${pages.length} URLs, auto-discovered)`);
 }
 log('  stamp', 'version '+VERSION+' applied to manifest.json, wrangler.toml, marketing pages');
 
