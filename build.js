@@ -281,6 +281,7 @@ const STATIC = [
 const VERSIONED_STATIC = new Set([
   'manifest.json', 'wrangler.toml',
   'privacy.html', 'landing.html', 'terms.html', 'about.html',
+  'secure-chat-for-journalists.html', 'ephemeral-chat-for-support-groups.html',
 ]);
 let nc = 0;
 for (const f of STATIC) {
