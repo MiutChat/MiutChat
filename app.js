@@ -3008,6 +3008,16 @@ function startChatListeners() {
     // after being briefly offline — renders in the order they were sent
     // instead of whichever order each one's decrypt happens to finish in.
     (async () => {
+      // Snapshot scroll position BEFORE any new messages are appended below.
+      // Incoming messages should only auto-scroll the view when the user is
+      // already parked at (or very near) the bottom — i.e. actively reading
+      // live chat. If they've scrolled up to read history, new messages must
+      // NOT yank them back down; they get the FAB (with an unread badge)
+      // instead and only jump to the bottom when they tap it.
+      const _msgsArea = $('messages-area');
+      const _wasNearBottom = _msgsArea
+        ? (_msgsArea.scrollHeight - _msgsArea.scrollTop - _msgsArea.clientHeight) < 120
+        : true;
       let hasNew = false;
       for (const ch of snap.docChanges()) {
         if (ch.type === 'modified') { patchMsg(ch.doc.id, ch.doc.data()); continue; }
@@ -3075,10 +3085,16 @@ function startChatListeners() {
             _unreadCount++;
             document.title = `(${_unreadCount}) MIUT`;
           }
-          showScrollFab();
+          if (!_wasNearBottom) showScrollFab();
         }
       }
-      if (hasNew) { scrollBottom(); setTimeout(_markVisibleAsRead, 300); }
+      if (hasNew) {
+        // Stick to the bottom only if the user was already there; otherwise
+        // leave their scroll position alone — showScrollFab() above already
+        // surfaced the FAB so they can jump down when they choose to.
+        if (_wasNearBottom) scrollBottom();
+        setTimeout(_markVisibleAsRead, 300);
+      }
     })();
   }, () => {});
   // Typing
@@ -4614,8 +4630,13 @@ function _renderChunkProgressBubble(gid, data, docId) {
       </div>
     </div>
   </div></div></div>`;
+  // Snapshot position BEFORE appending — same rule as the live message
+  // listener: an incoming file from someone else only sticks the view to
+  // the bottom if the user was already there; otherwise just show the FAB.
+  const _wasNearBottom = (area.scrollHeight - area.scrollTop - area.clientHeight) < 120;
   area.appendChild(wrap);
-  scrollBottom();
+  if (isMine || _wasNearBottom) scrollBottom();
+  else showScrollFab();
 }
 
 function _updateChunkProgressBubble(gid, have, total) {
