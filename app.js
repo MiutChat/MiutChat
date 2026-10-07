@@ -175,7 +175,7 @@ let state = {
     sound:            true,
     animations:       true,
     approvalRequired: false,
-    enterToSend:      false,   // off by default — Enter = newline; send = button only
+    enterToSend:      true,    // on by default — Enter sends, Shift+Enter = newline
   },
 };
 
@@ -3978,8 +3978,8 @@ function handleKey(e) {
     return;
   }
   // Enter behaviour is controlled by the enterToSend pref (Settings toggle).
-  // OFF (default): Enter = newline (textarea default — nothing to intercept).
-  // ON: Enter sends the message; Shift+Enter inserts a newline instead.
+  // ON (default): Enter sends the message; Shift+Enter inserts a newline instead.
+  // OFF: Enter = newline (textarea default — nothing to intercept); send = button only.
   if (e.key === 'Enter' && state.prefs.enterToSend && !e.shiftKey) {
     e.preventDefault();
     sendMessage();
