@@ -175,6 +175,7 @@ let state = {
     sound:            true,
     animations:       true,
     approvalRequired: false,
+    enterToSend:      false,   // off by default — Enter = newline; send = button only
   },
 };
 
@@ -3956,10 +3957,13 @@ function handleKey(e) {
     if (first) first.dispatchEvent(new Event('mousedown'));
     return;
   }
-  // Enter always inserts a newline now — sending is button-only (the send
-  // button). Previously Enter sent and Shift+Enter made a newline; that's
-  // reversed by request, so there's deliberately nothing to intercept here
-  // for plain Enter — the textarea's own default behavior handles it.
+  // Enter behaviour is controlled by the enterToSend pref (Settings toggle).
+  // OFF (default): Enter = newline (textarea default — nothing to intercept).
+  // ON: Enter sends the message; Shift+Enter inserts a newline instead.
+  if (e.key === 'Enter' && state.prefs.enterToSend && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
 }
 
 function handleTyping(el) {
@@ -5699,7 +5703,13 @@ function initScrollFab() {
   if (!area || !fab) return;
   area.addEventListener('scroll', () => {
     const fromBottom = area.scrollHeight - area.scrollTop - area.clientHeight;
-    if (fromBottom < 60) { hideScrollFab(); _markVisibleAsRead(); }
+    if (fromBottom < 60) {
+      hideScrollFab();
+      _markVisibleAsRead();
+    } else if (fromBottom > 120) {
+      // User scrolled up — show the FAB so they can jump back to latest
+      showScrollFab();
+    }
   }, { passive: true });
   fab.addEventListener('click', () => { scrollBottom(); hideScrollFab(); });
 }
@@ -6077,10 +6087,11 @@ async function handleLogout() {
 }
 
 function openSettings() {
-  const st = $('sound-toggle'), at = $('anim-toggle');
+  const st = $('sound-toggle'), at = $('anim-toggle'), et = $('enter-to-send-toggle');
   const ap = $('approval-toggle'), approvalRow = $('approval-setting-row');
   if (st) st.checked = state.prefs.sound;
   if (at) at.checked = state.prefs.animations;
+  if (et) et.checked = !!state.prefs.enterToSend;
 
   const rotateRow = $('rotate-key-row');
   if (approvalRow) approvalRow.style.display = _isAdmin ? 'flex' : 'none';
@@ -6125,6 +6136,7 @@ function saveSettings() {
 
 function toggleSoundAlerts()   { state.prefs.sound         = $('sound-toggle').checked; }
 function toggleAnimations()    { state.prefs.animations    = $('anim-toggle').checked; }
+function toggleEnterToSend()   { state.prefs.enterToSend   = $('enter-to-send-toggle').checked; }
 
 function toggleApprovalGate() {
   if (!_isAdmin || !state.roomCode) return;
@@ -6760,8 +6772,9 @@ function _wireAllHandlers() {
   });
 
 
-  on('sound-toggle',    'change', () => toggleSoundAlerts());
-  on('anim-toggle',     'change', () => toggleAnimations());
+  on('sound-toggle',         'change', () => toggleSoundAlerts());
+  on('anim-toggle',          'change', () => toggleAnimations());
+  on('enter-to-send-toggle', 'change', () => toggleEnterToSend());
   on('approval-toggle', 'change', () => toggleApprovalGate());
   on('ttl-select',      'change', e => setRoomTtl(+e.target.value));
   on('room-ttl-select', 'change', e => setRoomExpiry(+e.target.value));
@@ -6793,7 +6806,7 @@ Object.assign(_W, {
   _wireAllHandlers,
   cancelJoinRequest, checkInviteCode, joinFromInvite, cancelInvite,
   handleLogout, openSettings, closeSettings, closeModal, saveSettings,
-  toggleSoundAlerts, toggleAnimations, toggleApprovalGate, rotateKey,
+  toggleSoundAlerts, toggleAnimations, toggleEnterToSend, toggleApprovalGate, rotateKey,
   triggerPWAInstall, copyRoomCode, shareRoomLink, toggleSearch, doSearch,
   closeMediaViewer, handleFileAttach, triggerAttach, handleKey, handleTyping, clearReply,
   setRoomTtl, toggleSidebar, closeSidebar,
