@@ -3116,6 +3116,12 @@ function startChatListeners() {
     }, () => {});
 
   updateOnlineUI();
+
+  // If notification permission was already granted in an earlier session
+  // (browser-level, not tied to any one room), (re)attach that push
+  // subscription to THIS room's own member doc so /api/notify can find it.
+  // No-ops instantly if permission was never granted — see sw-bridge.js.
+  window.syncPushSubscriptionForRoom?.().catch(() => {});
 }
 
 function stopChatListeners() {
@@ -6125,6 +6131,24 @@ function openSettings() {
   if (at) at.checked = state.prefs.animations;
   if (et) et.checked = !!state.prefs.enterToSend;
 
+  // Reflects the BROWSER's actual permission state, not a stored pref —
+  // there's nothing to "turn on" client-side beyond what Notification.
+  // permission already says, and the toggle has to stay truthful if the
+  // person changed it from the browser's own site-settings instead.
+  const pt = $('push-toggle'), ptSub = $('push-setting-sublabel');
+  if (pt) {
+    const supported = ('Notification' in window) && ('serviceWorker' in navigator);
+    const perm = supported ? Notification.permission : 'unsupported';
+    pt.checked  = perm === 'granted';
+    pt.disabled = perm === 'denied' || !supported;
+    if (ptSub) {
+      ptSub.textContent =
+        perm === 'denied'      ? 'Blocked in your browser’s site settings — re-enable it there first' :
+        !supported             ? 'Not supported in this browser' :
+                                  'Alerts when the app is closed or backgrounded';
+    }
+  }
+
   const rotateRow = $('rotate-key-row');
   if (approvalRow) approvalRow.style.display = _isAdmin ? 'flex' : 'none';
   if (rotateRow)   rotateRow.style.display   = _isAdmin ? 'flex' : 'none';
@@ -6168,6 +6192,25 @@ function saveSettings() {
 
 function toggleSoundAlerts()   { state.prefs.sound         = $('sound-toggle').checked; }
 function toggleAnimations()    { state.prefs.animations    = $('anim-toggle').checked; }
+// Push isn't a plain stored pref like the others — flipping it has to
+// actually call the browser's permission/subscription APIs (in
+// sw-bridge.js), and the box can get flipped back by openSettings() on
+// next open if the browser denies/revokes it underneath us.
+async function togglePushNotifications() {
+  const pt = $('push-toggle');
+  if (!pt) return;
+  if (pt.checked) {
+    const result = await window.requestPushPermission?.();
+    if (result !== 'granted') {
+      pt.checked = false;
+      if (result === 'denied') toast('Notifications blocked', 'Allow them in your browser’s site settings', 'err');
+    } else {
+      toast('Notifications on', '', 'ok');
+    }
+  } else {
+    await window.disablePush?.();
+  }
+}
 function toggleEnterToSend()   { state.prefs.enterToSend   = $('enter-to-send-toggle').checked; }
 
 function toggleApprovalGate() {
@@ -6847,6 +6890,7 @@ function _wireAllHandlers() {
   on('sound-toggle',         'change', () => toggleSoundAlerts());
   on('anim-toggle',          'change', () => toggleAnimations());
   on('enter-to-send-toggle', 'change', () => toggleEnterToSend());
+  on('push-toggle',          'change', () => togglePushNotifications());
   on('approval-toggle', 'change', () => toggleApprovalGate());
   on('ttl-select',      'change', e => setRoomTtl(+e.target.value));
   on('room-ttl-select', 'change', e => setRoomExpiry(+e.target.value));

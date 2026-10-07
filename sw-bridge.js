@@ -80,9 +80,16 @@ navigator.serviceWorker.addEventListener('message', event => {
     case 'DRAIN_OUTBOX':
     case 'SYNC_PRESENCE':
     case 'PERIODIC_HEARTBEAT':
-      if (window.state && window.state.me && window.state.roomCode && window.db) {
-        window.db.collection('rooms').doc(window.state.roomCode)
-          .collection('members').doc(window.state.me.id)
+      // NOTE: app.js's `state`/`db` are top-level `let` in a classic
+      // (non-module) script — those never become window.state/window.db
+      // properties (only `var`/function declarations do), even though
+      // every classic <script> on the page shares one global lexical
+      // scope, so the bare names work here. This used to read
+      // window.state/window.db and silently no-op every time — verified
+      // with a real headless-browser check, not assumed.
+      if (typeof state !== 'undefined' && state?.me && state?.roomCode && typeof db !== 'undefined' && db) {
+        db.collection('rooms').doc(state.roomCode)
+          .collection('members').doc(state.me.id)
           .update({ online: true }).catch(() => {});
       }
       break;
@@ -103,7 +110,7 @@ window.addEventListener('online', () => {
       reg.sync.register('miut-sync-presence').catch(() => {});
     }
   });
-  if (typeof stopChatListeners === 'function' && window.state && window.state.roomCode) {
+  if (typeof stopChatListeners === 'function' && typeof state !== 'undefined' && state?.roomCode) {
     stopChatListeners();
     startChatListeners();
   }
@@ -147,7 +154,10 @@ async function ensureSubscription(reg) {
 }
 
 async function saveSubscriptionForRoom(sub) {
-  const st = window.state, database = window.db;
+  // Bare `state`/`db`, not window.state/window.db — see the note on the
+  // SYNC_PRESENCE handler above for why.
+  const st = typeof state !== 'undefined' ? state : null;
+  const database = typeof db !== 'undefined' ? db : null;
   if (!sub || !st?.me?.id || !st?.roomCode || !database) return;
   try {
     await database.collection('rooms').doc(st.roomCode)
@@ -196,7 +206,8 @@ window.disablePush = async function() {
     const sub = await reg.pushManager.getSubscription();
     if (sub) await sub.unsubscribe();
   } catch {}
-  const st = window.state, database = window.db;
+  const st = typeof state !== 'undefined' ? state : null;
+  const database = typeof db !== 'undefined' ? db : null;
   if (st?.me?.id && st?.roomCode && database) {
     database.collection('rooms').doc(st.roomCode).collection('members').doc(st.me.id)
       .update({ pushSubscription: null }).catch(() => {});
