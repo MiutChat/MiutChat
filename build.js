@@ -205,6 +205,7 @@ const CF_JOBS = [
   'functions/api/health.js',
   'functions/api/canary.js',
   'functions/api/validate-room.js',
+  'functions/api/notify.js',
 ];
 for (const f of CF_JOBS) {
   if (!fs.existsSync(path.join(ROOT, f))) continue;

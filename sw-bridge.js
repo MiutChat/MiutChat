@@ -55,7 +55,14 @@
       } catch {}
     }
 
-    if (Notification.permission === 'granted') subscribeToPush(reg).catch(() => {});
+    // Returning visitor who already granted notification permission in an
+    // earlier session: silently (re)create the browser-level push
+    // subscription now (this needs no room — it's per-browser, not
+    // per-room). Saving that subscription onto the CURRENT room's member
+    // doc happens separately, once a room is actually joined — see
+    // window.syncPushSubscriptionForRoom, called from app.js right after
+    // chat listeners start.
+    if (Notification.permission === 'granted') ensureSubscription(reg).catch(() => {});
 
   } catch (err) {
     console.error('[Bridge] SW registration failed:', err);
@@ -108,22 +115,93 @@ window.addEventListener('offline', () => {
 
 /* ──────────────────────────────────────────
    PUSH
+   Three layers, kept deliberately separate:
+     1. ensureSubscription(reg)  — browser-level only. Creates (or reuses)
+        the PushManager subscription. No room/Firestore involved — this
+        is the same subscription across every room a person joins in this
+        browser.
+     2. saveSubscriptionForRoom(sub) — writes that subscription onto the
+        CURRENT room's own member doc (rooms/{code}/members/{uid}
+        .pushSubscription), which is what /api/notify reads server-side
+        to know who to push to for messages in that specific room.
+     3. window.requestPushPermission() / window.disablePush() — the two
+        entry points app.js calls: the one-time post-first-message prompt
+        and the Settings toggle.
 ────────────────────────────────────────── */
-async function subscribeToPush(reg) {
-  if (!('PushManager' in window)) return;
-  if (await reg.pushManager.getSubscription()) return;
-  const VAPID = 'BBcjg7g86hx_xP6kV45g8npzi_7_ECe1GvWF1joQzzWlKu5X31Qf1kHxBSz5Vfhr8aILCf9VJsLrbbwXu09FSE0';
-  try {
-    await reg.pushManager.subscribe({
-      userVisibleOnly:      true,
-      applicationServerKey: (function(b64) {
-        const pad = '='.repeat((4 - b64.length % 4) % 4);
-        const raw = atob((b64 + pad).replace(/-/g,'+').replace(/_/g,'/'));
-        return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
-      })(VAPID),
-    });
-  } catch (e) { console.warn('[Bridge] Push subscribe failed:', e.message); }
+const VAPID_PUBLIC_KEY = 'BFcDPBMrMGLLi_7bMcZAMmwdjU2ZVduK3XaIZao3UXJ0JukXbWFzYhpQm-qD9thW-NyNhlbVStIqVKLoaAJU4yI';
+
+function _b64urlToBytes(b64) {
+  const pad = '='.repeat((4 - b64.length % 4) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
 }
+
+async function ensureSubscription(reg) {
+  if (!('PushManager' in window)) return null;
+  const existing = await reg.pushManager.getSubscription();
+  if (existing) return existing;
+  return reg.pushManager.subscribe({
+    userVisibleOnly:      true,
+    applicationServerKey: _b64urlToBytes(VAPID_PUBLIC_KEY),
+  });
+}
+
+async function saveSubscriptionForRoom(sub) {
+  const st = window.state, database = window.db;
+  if (!sub || !st?.me?.id || !st?.roomCode || !database) return;
+  try {
+    await database.collection('rooms').doc(st.roomCode)
+      .collection('members').doc(st.me.id)
+      .update({ pushSubscription: sub.toJSON() });
+  } catch (e) { console.warn('[Bridge] Failed to save push subscription:', e.message); }
+}
+
+// Called once a room is actually joined (from app.js, right after chat
+// listeners start) — covers the "already granted in an earlier session"
+// case, where ensureSubscription() ran silently at page load with no
+// room to attach it to yet.
+window.syncPushSubscriptionForRoom = async function() {
+  if (Notification.permission !== 'granted') return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await ensureSubscription(reg);
+    await saveSubscriptionForRoom(sub);
+  } catch {}
+};
+
+// The one UI entry point that actually asks the browser for permission —
+// called exactly once ever, right after a person's first sent message
+// (see app.js), and again from the Settings toggle if they turn it on
+// later after having left it off.
+window.requestPushPermission = async function() {
+  if (!('Notification' in window) || !('serviceWorker' in navigator)) return 'unsupported';
+  let perm = Notification.permission;
+  if (perm === 'default') perm = await Notification.requestPermission();
+  if (perm !== 'granted') return perm; // 'denied' — nothing more we can do from here
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await ensureSubscription(reg);
+    await saveSubscriptionForRoom(sub);
+  } catch (e) { console.warn('[Bridge] Push subscribe failed:', e.message); }
+  return 'granted';
+};
+
+// Settings toggle "off" — unsubscribes at the browser level and clears
+// the saved subscription from the current room's member doc. Does NOT
+// (can't) revoke the OS-level notification permission itself; that's the
+// browser's own setting if someone wants to fully reset it.
+window.disablePush = async function() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) await sub.unsubscribe();
+  } catch {}
+  const st = window.state, database = window.db;
+  if (st?.me?.id && st?.roomCode && database) {
+    database.collection('rooms').doc(st.roomCode).collection('members').doc(st.me.id)
+      .update({ pushSubscription: null }).catch(() => {});
+  }
+};
 
 /* ──────────────────────────────────────────
    UPDATE BANNER

@@ -176,6 +176,7 @@ let state = {
     animations:       true,
     approvalRequired: false,
     enterToSend:      true,    // on by default — Enter sends, Shift+Enter = newline
+    pushPrompted:     false,   // true once the one-time notification-permission prompt has fired
   },
 };
 
@@ -3783,6 +3784,8 @@ async function sendMessage() {
       _ping('message_sent');
       // Message-count-based epoch rotation is tracked in the live listener
       // (startChatListeners) instead of here — see the comment there for why.
+      _maybePromptPushPermission();
+      _notifyRoomOfNewMessage();
     })
     .catch(e => _handleSendFailure(_localId, state.roomCode, e));
   playSound('send');
@@ -4126,6 +4129,8 @@ async function handleFileAttach(e) {
       }
     }
     playSound('send');
+    _maybePromptPushPermission();
+    _notifyRoomOfNewMessage();
     if (_optimisticEl) {
       // Fade out the optimistic preview — real message from Firestore will appear
       _optimisticEl.style.transition = 'opacity .3s';
@@ -6552,6 +6557,46 @@ function handleRipple(e) {
   r.className = 'ripple-wave'; r.style.cssText = `left:${x-40}px;top:${y-40}px;width:80px;height:80px`;
   $('ripple-container')?.appendChild(r); setTimeout(() => r.remove(), 650);
 }
+/* ──────────────────────────────────────────
+   PUSH NOTIFICATIONS — triggering (sending side)
+   Two small hooks, called right after a message successfully lands in
+   Firestore (text send and file send both call these — see sendMessage()
+   and the attach-file handler):
+     - _maybePromptPushPermission(): fires the browser's notification
+       permission dialog exactly ONCE, ever, the first time a message is
+       successfully sent. Flips state.prefs.pushPrompted to true and
+       persists it immediately — even if the person dismisses/denies the
+       dialog, it never asks again on its own; they can still turn it on
+       later from the Settings "PUSH NOTIFICATIONS" toggle.
+     - _notifyRoomOfNewMessage(): fire-and-forget POST to /api/notify,
+       which fans the actual Web Push out server-side to every other
+       member of this room who has a saved subscription. Only roomCode/
+       shard/senderId/senderName cross the wire — never message content,
+       so this never touches E2EE.
+────────────────────────────────────────── */
+function _maybePromptPushPermission() {
+  if (state.prefs.pushPrompted) return;
+  state.prefs.pushPrompted = true;
+  try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}
+  try { window.requestPushPermission?.().catch(() => {}); } catch {}
+}
+
+function _notifyRoomOfNewMessage() {
+  if (!state.roomCode || !state.me?.id) return;
+  try {
+    fetch('/api/notify', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roomCode:   state.roomCode,
+        shard:      db?.app?.name || 'miut-db0',
+        senderId:   state.me.id,
+        senderName: state.me.name,
+      }),
+    }).catch(() => {});
+  } catch {}
+}
+
 let _audioCtx = null;
 function _getAudioCtx() {
   if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
