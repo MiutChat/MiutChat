@@ -3081,10 +3081,14 @@ function startChatListeners() {
           playSound('receive');
           // Queue read receipt for incoming text messages
           if (!document.hidden) _queueReadAck(id);
-          if (document.hidden) {
-            _unreadCount++;
-            document.title = `(${_unreadCount}) MIUT`;
-          }
+          // Count as unread whenever the message isn't actually in view —
+          // either the tab is hidden, or it's visible but scrolled away
+          // from the bottom. Drives both the tab-title counter (hidden
+          // case) and the red badge on the scroll-to-bottom FAB (either
+          // case), so scrolling up in an open tab still shows you missed
+          // something, not just switching away entirely.
+          if (!_wasNearBottom || document.hidden) _unreadCount++;
+          if (document.hidden) document.title = `(${_unreadCount}) MIUT`;
           if (!_wasNearBottom) showScrollFab();
         }
       }
@@ -5726,6 +5730,8 @@ function initScrollFab() {
     const fromBottom = area.scrollHeight - area.scrollTop - area.clientHeight;
     if (fromBottom < 60) {
       hideScrollFab();
+      _unreadCount = 0;
+      document.title = 'MIUT';
       _markVisibleAsRead();
     } else if (fromBottom > 120) {
       // User scrolled up — show the FAB so they can jump back to latest
