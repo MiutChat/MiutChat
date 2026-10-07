@@ -171,7 +171,14 @@ async function saveSubscriptionForRoom(sub) {
 // case, where ensureSubscription() ran silently at page load with no
 // room to attach it to yet.
 window.syncPushSubscriptionForRoom = async function() {
-  if (Notification.permission !== 'granted') return;
+  // Browser permission alone isn't enough — it can never go back to
+  // "off" once granted, so it can't tell "never asked" apart from "the
+  // person explicitly switched the Settings toggle off." pushEnabled is
+  // app.js's own record of which of those it actually is; without this
+  // check, turning the toggle off only lasted until the next room join,
+  // which silently resubscribed anyway.
+  const st = typeof state !== 'undefined' ? state : null;
+  if (Notification.permission !== 'granted' || !st?.prefs?.pushEnabled) return;
   try {
     const reg = await navigator.serviceWorker.ready;
     const sub = await ensureSubscription(reg);

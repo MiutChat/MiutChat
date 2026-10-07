@@ -177,6 +177,14 @@ let state = {
     approvalRequired: false,
     enterToSend:      true,    // on by default — Enter sends, Shift+Enter = newline
     pushPrompted:     false,   // true once the one-time notification-permission prompt has fired
+    // Explicit user intent for push, tracked SEPARATELY from the
+    // browser's Notification.permission — permission, once granted, can
+    // never be revoked by JS (only the person can do that in their
+    // browser's own site settings), so it can't double as "did they turn
+    // the Settings toggle off." Without this flag, syncPushSubscriptionForRoom
+    // had no way to know the toggle was switched off and would silently
+    // resubscribe on the very next room join.
+    pushEnabled:      false,
   },
 };
 
@@ -6131,15 +6139,19 @@ function openSettings() {
   if (at) at.checked = state.prefs.animations;
   if (et) et.checked = !!state.prefs.enterToSend;
 
-  // Reflects the BROWSER's actual permission state, not a stored pref —
-  // there's nothing to "turn on" client-side beyond what Notification.
-  // permission already says, and the toggle has to stay truthful if the
-  // person changed it from the browser's own site-settings instead.
+  // Checked state is the AND of two different things: the browser's own
+  // Notification.permission (can only ever go from 'default' -> 'granted'
+  // or 'denied' via JS, never back — only the person can undo "denied" in
+  // their browser's own site settings) and state.prefs.pushEnabled (our
+  // own record of whether THEY last chose on or off via this toggle).
+  // Using permission alone was the bug: it can never report "off" once
+  // granted, so the box silently re-checked itself open every time this
+  // panel re-rendered, no matter what the person had just switched it to.
   const pt = $('push-toggle'), ptSub = $('push-setting-sublabel');
   if (pt) {
     const supported = ('Notification' in window) && ('serviceWorker' in navigator);
     const perm = supported ? Notification.permission : 'unsupported';
-    pt.checked  = perm === 'granted';
+    pt.checked  = perm === 'granted' && !!state.prefs.pushEnabled;
     pt.disabled = perm === 'denied' || !supported;
     if (ptSub) {
       ptSub.textContent =
@@ -6205,9 +6217,13 @@ async function togglePushNotifications() {
       pt.checked = false;
       if (result === 'denied') toast('Notifications blocked', 'Allow them in your browser’s site settings', 'err');
     } else {
+      state.prefs.pushEnabled = true;
+      try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}
       toast('Notifications on', '', 'ok');
     }
   } else {
+    state.prefs.pushEnabled = false;
+    try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}
     await window.disablePush?.();
   }
 }
@@ -6621,7 +6637,14 @@ function _maybePromptPushPermission() {
   if (state.prefs.pushPrompted) return;
   state.prefs.pushPrompted = true;
   try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}
-  try { window.requestPushPermission?.().catch(() => {}); } catch {}
+  try {
+    window.requestPushPermission?.().then(result => {
+      if (result === 'granted') {
+        state.prefs.pushEnabled = true;
+        try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}
+      }
+    }).catch(() => {});
+  } catch {}
 }
 
 function _notifyRoomOfNewMessage() {
