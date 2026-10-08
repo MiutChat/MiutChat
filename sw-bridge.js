@@ -80,16 +80,23 @@ navigator.serviceWorker.addEventListener('message', event => {
     case 'DRAIN_OUTBOX':
     case 'SYNC_PRESENCE':
     case 'PERIODIC_HEARTBEAT':
-      // NOTE: app.js's `state`/`db` are top-level `let` in a classic
-      // (non-module) script — those never become window.state/window.db
-      // properties (only `var`/function declarations do), even though
-      // every classic <script> on the page shares one global lexical
-      // scope, so the bare names work here. This used to read
-      // window.state/window.db and silently no-op every time — verified
-      // with a real headless-browser check, not assumed.
-      if (typeof state !== 'undefined' && state?.me && state?.roomCode && typeof db !== 'undefined' && db) {
-        db.collection('rooms').doc(state.roomCode)
-          .collection('members').doc(state.me.id)
+      // NOTE: window.state/window.db ARE explicit accessor properties that
+      // app.js defines right next to its `let state`/`let db` declarations
+      // — not a reliance on bare cross-file scope sharing. An earlier
+      // version of this code used bare `state`/`db` instead, reasoning
+      // that classic <script> tags share one global lexical scope (true,
+      // and confirmed with a real headless-browser test on the raw,
+      // unminified source). But the actual deployed files go through
+      // esbuild with --minify-identifiers, one file at a time — esbuild
+      // has no idea this file also references the name `state`/`db`, so
+      // it freely renamed that declaration inside app.min.js alone,
+      // silently breaking the bare-name reference in the real build even
+      // though local/raw testing looked fine. window.state/window.db
+      // survive minification because esbuild's identifier minifier only
+      // renames variable/declaration names, never object property names.
+      if (window.state?.me && window.state?.roomCode && window.db) {
+        window.db.collection('rooms').doc(window.state.roomCode)
+          .collection('members').doc(window.state.me.id)
           .update({ online: true }).catch(() => {});
       }
       break;
@@ -110,7 +117,7 @@ window.addEventListener('online', () => {
       reg.sync.register('miut-sync-presence').catch(() => {});
     }
   });
-  if (typeof stopChatListeners === 'function' && typeof state !== 'undefined' && state?.roomCode) {
+  if (typeof stopChatListeners === 'function' && window.state?.roomCode) {
     stopChatListeners();
     startChatListeners();
   }
@@ -161,10 +168,11 @@ async function ensureSubscription(reg) {
 // rules rejection (permission-denied) and "not in a room" ended up
 // displaying the exact same misleading toast.
 async function saveSubscriptionForRoom(sub) {
-  // Bare `state`/`db`, not window.state/window.db — see the note on the
-  // SYNC_PRESENCE handler above for why.
-  const st = typeof state !== 'undefined' ? state : null;
-  const database = typeof db !== 'undefined' ? db : null;
+  // window.state/window.db — see the note on the SYNC_PRESENCE handler
+  // above for why these must be the explicit accessor properties, not
+  // bare `state`/`db` identifiers.
+  const st = window.state || null;
+  const database = window.db || null;
   if (!sub || !st?.me?.id || !st?.roomCode || !database) {
     return { ok: false, reason: 'no-room' };
   }
@@ -191,7 +199,7 @@ window.syncPushSubscriptionForRoom = async function() {
   // app.js's own record of which of those it actually is; without this
   // check, turning the toggle off only lasted until the next room join,
   // which silently resubscribed anyway.
-  const st = typeof state !== 'undefined' ? state : null;
+  const st = window.state || null;
   if (Notification.permission !== 'granted' || !st?.prefs?.pushEnabled) return;
   try {
     const reg = await navigator.serviceWorker.ready;
@@ -270,8 +278,8 @@ window.disablePush = async function() {
     const sub = await reg.pushManager.getSubscription();
     if (sub) await sub.unsubscribe();
   } catch {}
-  const st = typeof state !== 'undefined' ? state : null;
-  const database = typeof db !== 'undefined' ? db : null;
+  const st = window.state || null;
+  const database = window.db || null;
   if (st?.me?.id && st?.roomCode && database) {
     database.collection('rooms').doc(st.roomCode).collection('members').doc(st.me.id)
       .update({ pushSubscription: null }).catch(() => {});

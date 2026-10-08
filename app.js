@@ -189,7 +189,38 @@ let state = {
   },
 };
 
+// sw-bridge.js (a separate <script> loaded after this one) needs to read
+// `state`/`db` too. In raw, unminified source that "just worked" because
+// every classic <script> on a page shares one global lexical scope — a
+// bare `let`/`const` in one file is visible by name in another, even
+// though it never becomes a window.* property on its own. That held up
+// in a direct headless-browser test, but the ACTUAL deployed files go
+// through esbuild with --bundle=false --minify-identifiers (build.js),
+// which processes each file in isolation: esbuild has no idea sw-bridge.js
+// also references the name `state`/`db`, so it freely renames this
+// declaration to something short (`a`, `o`, whatever) inside app.min.js
+// alone — silently severing the cross-file reference in the deployed
+// build even though the unminified source and local tests looked fine.
+// An explicit `window.state`/`window.db` accessor survives minification
+// because "state"/"db" there are object PROPERTY names (string keys),
+// which esbuild's identifier minifier never touches — only bare variable
+// and declaration names get renamed. This is also why db needs a
+// get/set pair instead of a single assignment: db is reassigned in
+// several places below (new shard, new room), and the accessor keeps
+// window.db pointed at whatever the current value is without having to
+// touch every reassignment site.
+Object.defineProperty(window, 'state', {
+  get()  { return state; },
+  set(v) { state = v; },
+  configurable: true,
+});
+
 let db             = null;
+Object.defineProperty(window, 'db', {
+  get()  { return db; },
+  set(v) { db = v; },
+  configurable: true,
+});
 let _unsubMsgs     = null;
 let _unsubMembers  = null;
 let _unsubTyping   = null;

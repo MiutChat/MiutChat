@@ -11,8 +11,8 @@
  *
  * Bump scheme (custom, per product decision — not strict semver):
  *   patch increments normally: 1.0.0 → 1.0.1 → 1.0.2 → ...
- *   patch caps at 25: once it would exceed 25, it rolls into minor instead:
- *     1.0.25 → 1.1.0   (not 1.0.26)
+ *   patch caps at 50: once it would exceed 50, it rolls into minor instead:
+ *     1.0.50 → 1.1.0   (not 1.0.51)
  *   minor/major only change via an explicit 'minor'/'major' bump, or by
  *   rolling over from a capped patch as above.
  *
@@ -43,7 +43,7 @@
 const fs   = require('fs');
 const path = require('path');
 
-const PATCH_CAP = 25;               // 1.0.25 is the highest patch — next bump rolls to 1.1.0
+const PATCH_CAP = 50;               // 1.0.50 is the highest patch — next bump rolls to 1.1.0
 const PKG_PATH  = path.join(__dirname, 'package.json');
 
 function parseVersion(v) {
