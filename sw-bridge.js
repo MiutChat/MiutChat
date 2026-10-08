@@ -158,12 +158,21 @@ async function saveSubscriptionForRoom(sub) {
   // SYNC_PRESENCE handler above for why.
   const st = typeof state !== 'undefined' ? state : null;
   const database = typeof db !== 'undefined' ? db : null;
-  if (!sub || !st?.me?.id || !st?.roomCode || !database) return;
+  if (!sub || !st?.me?.id || !st?.roomCode || !database) return false;
   try {
     await database.collection('rooms').doc(st.roomCode)
       .collection('members').doc(st.me.id)
       .update({ pushSubscription: sub.toJSON() });
-  } catch (e) { console.warn('[Bridge] Failed to save push subscription:', e.message); }
+    return true;
+  } catch (e) {
+    // This used to only console.warn and move on, which made a Firestore
+    // rules rejection (permission-denied) indistinguishable from success
+    // everywhere upstream — window.requestPushPermission() always returned
+    // 'granted' regardless, so the Settings toggle/toast lied about the
+    // actual outcome. Now the caller finds out.
+    console.warn('[Bridge] Failed to save push subscription:', e.message);
+    return false;
+  }
 }
 
 // Called once a room is actually joined (from app.js, right after chat
