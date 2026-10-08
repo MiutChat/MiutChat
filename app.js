@@ -6716,6 +6716,17 @@ function _notifyRoomOfNewMessage() {
         } else if (body && body.total > 0 && body.sent === 0) {
           const why = body.results?.find(r => !r.ok);
           toast('Push not delivered', `0/${body.total} — ${why?.reason || why?.status || 'unknown'}`, 'err');
+        } else {
+          // Round 2 of this TEMPORARY diagnostic: the previous version
+          // only spoke up on a failure it recognized, but got total
+          // silence back from a real test — which is itself ambiguous
+          // between "0 other subscribed members found" (total===0, so
+          // none of the failure branches above ever fire) and genuine
+          // success (sent>0, delivered to the push service fine, but the
+          // receiving browser/service-worker never displayed it). Show
+          // the raw numbers every time for this round so we can tell
+          // those two apart, instead of guessing again.
+          toast('Push notify result', `sent ${body?.sent ?? '?'}/${body?.total ?? '?'}`, body?.sent > 0 ? 'ok' : 'err');
         }
       })
       .catch(e => toast('Push notify error', e.message, 'err'));
