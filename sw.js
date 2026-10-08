@@ -430,8 +430,8 @@ self.addEventListener('push', event => {
 
   const options = {
     body:    data.body,
-    icon:    '/icons/icon-192.png',
-    badge:   '/icons/icon-72.png',
+    icon:    BASE + 'icons/icon-192.png',
+    badge:   BASE + 'icons/icon-72.png',
     image:   data.image  || undefined,
     tag:     data.roomCode || 'miut-notification',
     renotify: true,
@@ -441,20 +441,24 @@ self.addEventListener('push', event => {
     requireInteraction: data.type === 'call',
 
     data: {
-      url:      data.url      || '/',
+      url:      data.url      || BASE,
       roomCode: data.roomCode || '',
       senderId: data.senderId || '',
       type:     data.type     || 'message',
     },
 
+    // Uses the same BASE this file already computes for precaching (see
+    // top of file) — currently a no-op path-wise on this app's actual
+    // root-domain Cloudflare Pages deployment (BASE === '/'), but makes
+    // these correct under any subpath too, with zero behavior change here.
     actions: data.type === 'call'
       ? [
-          { action: 'accept', title: 'Accept',  icon: '/icons/action-accept.png' },
-          { action: 'decline', title: 'Decline', icon: '/icons/action-decline.png' },
+          { action: 'accept', title: 'Accept',  icon: BASE + 'icons/action-accept.png' },
+          { action: 'decline', title: 'Decline', icon: BASE + 'icons/action-decline.png' },
         ]
       : [
-          { action: 'reply',   title: 'Reply',       icon: '/icons/action-reply.png' },
-          { action: 'dismiss', title: 'Dismiss',      icon: '/icons/action-dismiss.png' },
+          { action: 'reply',   title: 'Reply',       icon: BASE + 'icons/action-reply.png' },
+          { action: 'dismiss', title: 'Dismiss',      icon: BASE + 'icons/action-dismiss.png' },
         ],
   };
 

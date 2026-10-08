@@ -159,7 +159,23 @@ service cloud.firestore {
           && (
             (
               request.auth.uid == memberId
-              && changedKeys().hasOnly(['name','color','online','lastSeen','pubKey'])
+              // 'pushSubscription' added here — this was the actual bug
+              // breaking push notifications end-to-end. app.js/sw-bridge.js
+              // write pushSubscription onto the signed-in member's OWN doc
+              // via a plain update(), exactly like name/color/online/etc.
+              // already do, but it was missing from this hasOnly() list, so
+              // Firestore silently rejected (permission-denied) every single
+              // one of those writes. The client caught the error and moved
+              // on (see sw-bridge.js's saveSubscriptionForRoom), so nothing
+              // ever surfaced — the subscription was created in the browser
+              // but never actually reached Firestore, so /api/notify's
+              // member lookup never found it and had nobody to push to.
+              && changedKeys().hasOnly(['name','color','online','lastSeen','pubKey','pushSubscription'])
+              && (
+                !('pushSubscription' in changedKeys())
+                || request.resource.data.pushSubscription == null
+                || request.resource.data.pushSubscription is map
+              )
             )
             || (
               request.auth.uid == memberId

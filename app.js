@@ -176,8 +176,9 @@ let state = {
     animations:       true,
     approvalRequired: false,
     enterToSend:      true,    // on by default — Enter sends, Shift+Enter = newline
-    pushPrompted:     false,   // true once the one-time notification-permission prompt has fired
-    // Explicit user intent for push, tracked SEPARATELY from the
+    // Explicit user intent for push — the ONLY thing that turns push on,
+    // set exclusively from the Settings toggle (no auto-prompt anywhere
+    // else). Tracked SEPARATELY from the
     // browser's Notification.permission — permission, once granted, can
     // never be revoked by JS (only the person can do that in their
     // browser's own site settings), so it can't double as "did they turn
@@ -3798,7 +3799,8 @@ async function sendMessage() {
       _ping('message_sent');
       // Message-count-based epoch rotation is tracked in the live listener
       // (startChatListeners) instead of here — see the comment there for why.
-      _maybePromptPushPermission();
+      // Push permission is opt-in only, from the Settings toggle — no
+      // auto-prompt here. See togglePushNotifications().
       _notifyRoomOfNewMessage();
     })
     .catch(e => _handleSendFailure(_localId, state.roomCode, e));
@@ -4143,7 +4145,6 @@ async function handleFileAttach(e) {
       }
     }
     playSound('send');
-    _maybePromptPushPermission();
     _notifyRoomOfNewMessage();
     if (_optimisticEl) {
       // Fade out the optimistic preview — real message from Firestore will appear
@@ -6618,35 +6619,21 @@ function handleRipple(e) {
 }
 /* ──────────────────────────────────────────
    PUSH NOTIFICATIONS — triggering (sending side)
-   Two small hooks, called right after a message successfully lands in
-   Firestore (text send and file send both call these — see sendMessage()
-   and the attach-file handler):
-     - _maybePromptPushPermission(): fires the browser's notification
-       permission dialog exactly ONCE, ever, the first time a message is
-       successfully sent. Flips state.prefs.pushPrompted to true and
-       persists it immediately — even if the person dismisses/denies the
-       dialog, it never asks again on its own; they can still turn it on
-       later from the Settings "PUSH NOTIFICATIONS" toggle.
-     - _notifyRoomOfNewMessage(): fire-and-forget POST to /api/notify,
-       which fans the actual Web Push out server-side to every other
-       member of this room who has a saved subscription. Only roomCode/
-       shard/senderId/senderName cross the wire — never message content,
-       so this never touches E2EE.
-────────────────────────────────────────── */
-function _maybePromptPushPermission() {
-  if (state.prefs.pushPrompted) return;
-  state.prefs.pushPrompted = true;
-  try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}
-  try {
-    window.requestPushPermission?.().then(result => {
-      if (result === 'granted') {
-        state.prefs.pushEnabled = true;
-        try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}
-      }
-    }).catch(() => {});
-  } catch {}
-}
+   Opt-in only: there is no auto-prompt anywhere in the send path. The
+   ONLY way notification permission ever gets requested is the person
+   turning on the "PUSH NOTIFICATIONS" toggle in Settings themselves —
+   see togglePushNotifications() and window.requestPushPermission() in
+   sw-bridge.js. Once granted, it just stays on (synced per room via
+   window.syncPushSubscriptionForRoom() after joining — see
+   startChatListeners()); nothing here asks again.
 
+   _notifyRoomOfNewMessage(): fire-and-forget POST to /api/notify, called
+   right after a message successfully lands in Firestore (both text send
+   and file send call this), which fans the actual Web Push out
+   server-side to every other member of this room who has a saved
+   subscription. Only roomCode/shard/senderId/senderName cross the wire —
+   never message content, so this never touches E2EE.
+────────────────────────────────────────── */
 function _notifyRoomOfNewMessage() {
   if (!state.roomCode || !state.me?.id) return;
   try {
