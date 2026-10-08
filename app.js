@@ -6216,7 +6216,19 @@ async function togglePushNotifications() {
     const result = await window.requestPushPermission?.();
     if (result !== 'granted') {
       pt.checked = false;
-      if (result === 'denied') toast('Notifications blocked', 'Allow them in your browser’s site settings', 'err');
+      // requestPushPermission() used to collapse every failure into a
+      // silent 'granted', so this toggle always reported success even
+      // when nothing had actually been subscribed or saved. It now
+      // returns a specific reason — surface it instead of guessing.
+      if (result === 'denied') {
+        toast('Notifications blocked', 'Allow them in your browser’s site settings', 'err');
+      } else if (result === 'unsupported') {
+        toast('Not supported', 'This browser doesn’t support push notifications', 'err');
+      } else if (result === 'subscribe-failed') {
+        toast('Couldn’t subscribe', 'Your browser rejected the push subscription — try again or reload the app', 'err');
+      } else if (result === 'save-failed') {
+        toast('Couldn’t save', 'Join a room first, then try the toggle again', 'err');
+      }
     } else {
       state.prefs.pushEnabled = true;
       try { localStorage.setItem(CONFIG.PREFS_KEY, JSON.stringify(state.prefs)); } catch {}

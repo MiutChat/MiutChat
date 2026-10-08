@@ -195,20 +195,48 @@ window.syncPushSubscriptionForRoom = async function() {
   } catch {}
 };
 
-// The one UI entry point that actually asks the browser for permission —
-// called exactly once ever, right after a person's first sent message
-// (see app.js), and again from the Settings toggle if they turn it on
-// later after having left it off.
+// The one UI entry point that asks the browser for permission — called
+// from the Settings toggle.
+//
+// Return values (app.js's togglePushNotifications() branches on these):
+//   'unsupported'      — this browser has no Notification/SW/Push support
+//   'denied'           — browser permission prompt was declined/blocked
+//   'granted'          — permission granted AND the subscription was
+//                         created AND saved to Firestore — the only truly
+//                         successful outcome
+//   'subscribe-failed' — permission granted, but the browser-level
+//                         PushManager subscription itself failed (no
+//                         PushManager support, or subscribe() rejected —
+//                         e.g. a bad/mismatched VAPID key)
+//   'save-failed'      — permission granted and subscribed, but writing
+//                         pushSubscription onto the member doc failed
+//                         (most likely Firestore rules rejecting the
+//                         write, or not actually being in a room yet)
+//
+// Previously this swallowed every failure in a try/catch and always
+// returned 'granted' once the browser said yes — so the Settings toggle's
+// "Notifications on" toast and checked state were never actually proof
+// that a subscription existed anywhere. That's what made this silently
+// broken: the UI reported success on every attempt even when nothing
+// useful had happened underneath it.
 window.requestPushPermission = async function() {
   if (!('Notification' in window) || !('serviceWorker' in navigator)) return 'unsupported';
   let perm = Notification.permission;
   if (perm === 'default') perm = await Notification.requestPermission();
   if (perm !== 'granted') return perm; // 'denied' — nothing more we can do from here
+
+  let sub = null;
   try {
     const reg = await navigator.serviceWorker.ready;
-    const sub = await ensureSubscription(reg);
-    await saveSubscriptionForRoom(sub);
-  } catch (e) { console.warn('[Bridge] Push subscribe failed:', e.message); }
+    sub = await ensureSubscription(reg);
+  } catch (e) {
+    console.warn('[Bridge] Push subscribe failed:', e.message);
+  }
+  if (!sub) return 'subscribe-failed';
+
+  const saved = await saveSubscriptionForRoom(sub);
+  if (!saved) return 'save-failed';
+
   return 'granted';
 };
 
