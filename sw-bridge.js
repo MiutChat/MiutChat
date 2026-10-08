@@ -153,25 +153,30 @@ async function ensureSubscription(reg) {
   });
 }
 
+// Returns { ok, reason } instead of a plain boolean — `reason` is either
+// 'no-room' (we're genuinely not in a room / not signed in yet) or the
+// actual error Firestore/the SDK threw (e.code/e.message), so the UI can
+// show the real cause instead of guessing. Previously this only
+// console.warn'd and returned false either way, which is how a Firestore
+// rules rejection (permission-denied) and "not in a room" ended up
+// displaying the exact same misleading toast.
 async function saveSubscriptionForRoom(sub) {
   // Bare `state`/`db`, not window.state/window.db — see the note on the
   // SYNC_PRESENCE handler above for why.
   const st = typeof state !== 'undefined' ? state : null;
   const database = typeof db !== 'undefined' ? db : null;
-  if (!sub || !st?.me?.id || !st?.roomCode || !database) return false;
+  if (!sub || !st?.me?.id || !st?.roomCode || !database) {
+    return { ok: false, reason: 'no-room' };
+  }
   try {
     await database.collection('rooms').doc(st.roomCode)
       .collection('members').doc(st.me.id)
       .update({ pushSubscription: sub.toJSON() });
-    return true;
+    return { ok: true, reason: null };
   } catch (e) {
-    // This used to only console.warn and move on, which made a Firestore
-    // rules rejection (permission-denied) indistinguishable from success
-    // everywhere upstream — window.requestPushPermission() always returned
-    // 'granted' regardless, so the Settings toggle/toast lied about the
-    // actual outcome. Now the caller finds out.
-    console.warn('[Bridge] Failed to save push subscription:', e.message);
-    return false;
+    const reason = e?.code || e?.message || String(e);
+    console.warn('[Bridge] Failed to save push subscription:', reason);
+    return { ok: false, reason };
   }
 }
 
@@ -219,6 +224,13 @@ window.syncPushSubscriptionForRoom = async function() {
 // that a subscription existed anywhere. That's what made this silently
 // broken: the UI reported success on every attempt even when nothing
 // useful had happened underneath it.
+// window._pushLastError carries the actual reason behind a
+// 'subscribe-failed'/'save-failed' result (a browser error message or a
+// Firestore error code like 'permission-denied'), so app.js can show the
+// real cause in its toast instead of a guess. Read it immediately after
+// requestPushPermission() resolves — it's overwritten on every call.
+window._pushLastError = null;
+
 window.requestPushPermission = async function() {
   if (!('Notification' in window) || !('serviceWorker' in navigator)) return 'unsupported';
   let perm = Notification.permission;
@@ -230,13 +242,21 @@ window.requestPushPermission = async function() {
     const reg = await navigator.serviceWorker.ready;
     sub = await ensureSubscription(reg);
   } catch (e) {
-    console.warn('[Bridge] Push subscribe failed:', e.message);
+    window._pushLastError = e?.message || String(e);
+    console.warn('[Bridge] Push subscribe failed:', window._pushLastError);
   }
-  if (!sub) return 'subscribe-failed';
+  if (!sub) {
+    if (!window._pushLastError) window._pushLastError = 'PushManager unavailable in this browser';
+    return 'subscribe-failed';
+  }
 
-  const saved = await saveSubscriptionForRoom(sub);
-  if (!saved) return 'save-failed';
+  const result = await saveSubscriptionForRoom(sub);
+  if (!result.ok) {
+    window._pushLastError = result.reason;
+    return result.reason === 'no-room' ? 'no-room' : 'save-failed';
+  }
 
+  window._pushLastError = null;
   return 'granted';
 };
 

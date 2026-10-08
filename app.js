@@ -6220,14 +6220,20 @@ async function togglePushNotifications() {
       // silent 'granted', so this toggle always reported success even
       // when nothing had actually been subscribed or saved. It now
       // returns a specific reason — surface it instead of guessing.
+      const detail = window._pushLastError || '';
       if (result === 'denied') {
         toast('Notifications blocked', 'Allow them in your browser’s site settings', 'err');
       } else if (result === 'unsupported') {
         toast('Not supported', 'This browser doesn’t support push notifications', 'err');
-      } else if (result === 'subscribe-failed') {
-        toast('Couldn’t subscribe', 'Your browser rejected the push subscription — try again or reload the app', 'err');
-      } else if (result === 'save-failed') {
+      } else if (result === 'no-room') {
         toast('Couldn’t save', 'Join a room first, then try the toggle again', 'err');
+      } else if (result === 'subscribe-failed') {
+        toast('Couldn’t subscribe', detail || 'Your browser rejected the push subscription — try again or reload the app', 'err');
+      } else if (result === 'save-failed') {
+        // Shows the real Firestore error code/message (e.g.
+        // "permission-denied") instead of a guess, so whatever's actually
+        // wrong is visible right on the phone without needing devtools.
+        toast('Couldn’t save', detail || 'The server rejected the subscription — see console for details', 'err');
       }
     } else {
       state.prefs.pushEnabled = true;
