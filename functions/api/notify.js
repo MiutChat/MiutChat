@@ -310,7 +310,11 @@ async function runNotify(env, { roomCode, shard, senderId, senderName }) {
     if (fields.pushSubscription?.endpoint) targets.push({ uid, sub: fields.pushSubscription });
   }
 
-  const payload = { title: 'MIUT', body: `New message from ${senderName || 'someone'}`, roomCode, type: 'message' };
+  // senderName is carried as its own field now (not just baked into body
+  // text) so the client can prefill the Reply action with "@<name> "
+  // instead of just focusing an empty input — see sw.js's
+  // notificationclick handler and sw-bridge.js's FOCUS_REPLY handler.
+  const payload = { title: 'MIUT', body: `New message from ${senderName || 'someone'}`, roomCode, senderName: senderName || '', type: 'message' };
   const results = await Promise.all(targets.map(t =>
     sendWebPush(t.sub, privateKey, env.VAPID_PUBLIC_KEY, payload)
       .then(r => ({ uid: t.uid, ...r }))
