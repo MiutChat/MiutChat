@@ -21,12 +21,32 @@
  * 8291 Appendix A's own worked example before being used here.
  *
  * ENV VARS REQUIRED (Cloudflare Pages dashboard → Settings → Environment
- * variables; VAPID_PRIVATE_KEY must be added as an encrypted "Secret"):
+ * variables; VAPID_PRIVATE_KEY and every *_SA_JSON below must be added as
+ * an encrypted "Secret", not a plain variable):
  *   VAPID_PUBLIC_KEY   — must match the VAPID const in sw-bridge.js
  *   VAPID_PRIVATE_KEY  — the matching private scalar (base64url). SECRET.
  *   FIREBASE_API_KEY / FIREBASE_PROJECT_ID           — shard "miut-db0"
  *   FIREBASE_DBn_API_KEY / FIREBASE_DBn_PROJECT_ID   — any extra shard
  *     (same vars cleanup.js and shard-registry.js already use)
+ *   FIREBASE_SA_JSON / FIREBASE_DBn_SA_JSON — SECRET. The full JSON key
+ *     file for a Google Cloud SERVICE ACCOUNT in that shard's Firebase
+ *     project, pasted verbatim as the variable's value, one per shard:
+ *       1. Firebase Console → that project → ⚙ Project settings →
+ *          Service accounts → Generate new private key. Downloads a
+ *          .json file.
+ *       2. That default service account already has Firestore access
+ *          (it's the same identity the Admin SDK uses) — no extra IAM
+ *          role to add.
+ *       3. Open the downloaded .json file, copy its ENTIRE contents, and
+ *          paste that as the value of FIREBASE_SA_JSON (shard miut-db0)
+ *          or FIREBASE_DB1_SA_JSON / FIREBASE_DB2_SA_JSON / etc. for
+ *          every other shard — one key per Firebase project, since each
+ *          is a separate project with its own service account.
+ *     Without this, every call fails closed with a clear
+ *     "No service account configured for shard ..." error instead of
+ *     the old silent `sent 0, total 0` — see runNotify() below for why
+ *     a regular end-user auth token can never work here regardless of
+ *     how it's obtained.
  *
  * One VAPID keypair covers every shard — VAPID identifies this
  * application server to the browser's push service (FCM, Mozilla
@@ -61,11 +81,17 @@ function concatBytes(...arrs) {
 }
 
 // ── shard discovery — same pattern as cleanup.js ────────────────────────
+// Each shard now ALSO carries an optional `saJson` — a Google Cloud
+// service-account key JSON (see getServiceAccountToken below). This is a
+// different, additive credential from apiKey/projectId: apiKey is still
+// used by config.js for the public client config, but this file no
+// longer authenticates with it (see why below).
 function discoverShards(env) {
   const shards = [{
     name: 'miut-db0',
     apiKey: env.FIREBASE_API_KEY || '',
     projectId: env.FIREBASE_PROJECT_ID || '',
+    saJson: env.FIREBASE_SA_JSON || '',
   }];
   const nums = new Set();
   for (const key of Object.keys(env)) {
@@ -77,19 +103,64 @@ function discoverShards(env) {
       name: `miut-db${n}`,
       apiKey: env[`FIREBASE_DB${n}_API_KEY`] || '',
       projectId: env[`FIREBASE_DB${n}_PROJECT_ID`] || '',
+      saJson: env[`FIREBASE_DB${n}_SA_JSON`] || '',
     });
   }
   return shards;
 }
 
-async function getFirebaseToken(apiKey) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"returnSecureToken":true}' }
+// Decodes a PEM block (standard base64, NOT base64url — PEM uses '+'/'/'
+// and '=' padding, which atob() already understands directly) into raw
+// DER bytes, for crypto.subtle.importKey('pkcs8', ...).
+function pemToBytes(pem) {
+  const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Exchanges a Google Cloud service-account key for a short-lived OAuth2
+// access token (the standard JWT-bearer flow the Admin SDK uses under the
+// hood), scoped to Firestore (datastore). This is NOT the same thing as
+// signing in an end-user: this is an IAM-authenticated request, and
+// Firestore Security Rules are never evaluated for it — exactly like the
+// Admin SDK on a normal Node server, which is the whole point. We can't
+// use the actual firebase-admin npm package here (build.js bundles each
+// Function standalone with no npm deps — see the file header), so this
+// reimplements just the one JWT-bearer call it needs via native
+// crypto.subtle (RSASSA-PKCS1-v1_5/SHA-256, which every service-account
+// key uses).
+async function getServiceAccountToken(saJsonStr) {
+  const sa = JSON.parse(saJsonStr);
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claims = {
+    iss:   sa.client_email,
+    scope: 'https://www.googleapis.com/auth/datastore',
+    aud:   'https://oauth2.googleapis.com/token',
+    iat:   now,
+    exp:   now + 3600,
+  };
+  const seg = o => bytesToB64url(new TextEncoder().encode(JSON.stringify(o)));
+  const signingInput = seg(header) + '.' + seg(claims);
+
+  const key = await crypto.subtle.importKey(
+    'pkcs8', pemToBytes(sa.private_key),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false, ['sign']
   );
-  if (!res.ok) throw new Error('Firebase auth failed: ' + res.status);
+  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(signingInput));
+  const jwt = signingInput + '.' + bytesToB64url(new Uint8Array(sig));
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body:    'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + jwt,
+  });
+  if (!res.ok) throw new Error('Service-account token exchange failed: ' + res.status + ' ' + (await res.text()).slice(0, 200));
   const data = await res.json();
-  return data.idToken;
+  return data.access_token;
 }
 
 // List all member docs of a room via the Firestore REST API — rooms are
@@ -208,10 +279,25 @@ async function sendWebPush(subscription, vapidPrivateKey, vapidPublicKeyB64url, 
 async function runNotify(env, { roomCode, shard, senderId, senderName }) {
   const shards = discoverShards(env);
   const s = shards.find(x => x.name === shard) || shards[0];
-  if (!s?.apiKey || !s?.projectId) return { error: 'Unknown or unconfigured shard' };
+  if (!s?.projectId) return { error: 'Unknown or unconfigured shard' };
   if (!env.VAPID_PRIVATE_KEY || !env.VAPID_PUBLIC_KEY) return { error: 'VAPID keys not configured' };
-
-  const token = await getFirebaseToken(s.apiKey);
+  // This used to sign in a brand-new anonymous Firebase user per call
+  // (getFirebaseToken(s.apiKey)) and read the members subcollection with
+  // THAT token. It silently returned zero members for every single
+  // call, on every room, no matter who sent the message — because that
+  // fresh anonymous user was never actually a member of the room, and
+  // firestore.rules only allows reading a room's members to the member
+  // themself or an already-approved member of that room. The REST call
+  // got rejected, listMembers() swallowed it and returned [], and
+  // runNotify reported a clean-looking `sent 0, total 0` with no error
+  // anywhere — impossible to tell apart from "nobody else is subscribed"
+  // without instrumenting the client the way we just did. A
+  // service-account token is an IAM-authenticated, Admin-SDK-equivalent
+  // credential — Firestore Security Rules are never evaluated for it, by
+  // design, which is exactly what server-side code reading across a
+  // whole room's membership actually needs here.
+  if (!s.saJson) return { error: `No service account configured for shard ${s.name} — set FIREBASE${s.name === 'miut-db0' ? '' : '_' + s.name.replace('miut-', '').toUpperCase()}_SA_JSON` };
+  const token = await getServiceAccountToken(s.saJson);
   const docs = await listMembers(s.projectId, token, roomCode);
   const privateKey = await importVapidPrivateKey(env.VAPID_PRIVATE_KEY, env.VAPID_PUBLIC_KEY);
 
