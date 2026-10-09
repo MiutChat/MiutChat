@@ -430,8 +430,19 @@ self.addEventListener('push', event => {
 
   const options = {
     body:    data.body,
-    icon:    BASE + 'icons/icon-192.png',
-    badge:   BASE + 'icons/icon-72.png',
+    // Was icon-192/icon-72 — the app's home-screen icon art, which is a
+    // fully opaque square (solid white background baked into the PNG,
+    // alpha=255 at every corner), so Android rendered it as a plain
+    // filled box instead of the logo floating free. These notify-icon-*/
+    // notify-badge-* files are the same logo re-exported with real alpha
+    // transparency (generated straight from the transparent source PNG,
+    // padded so it doesn't touch the edges), specifically for
+    // notifications. Android still forces the small `badge` to a
+    // monochrome silhouette regardless of color — that's an OS rule, not
+    // something any image file can override — but it now follows the
+    // logo's actual silhouette instead of a solid square's.
+    icon:    BASE + 'icons/notify-icon-192.png',
+    badge:   BASE + 'icons/notify-badge-96.png',
     image:   data.image  || undefined,
     tag:     data.roomCode || 'miut-notification',
     renotify: true,
@@ -441,10 +452,11 @@ self.addEventListener('push', event => {
     requireInteraction: data.type === 'call',
 
     data: {
-      url:      data.url      || BASE,
-      roomCode: data.roomCode || '',
-      senderId: data.senderId || '',
-      type:     data.type     || 'message',
+      url:        data.url        || BASE,
+      roomCode:   data.roomCode   || '',
+      senderId:   data.senderId   || '',
+      senderName: data.senderName || '',
+      type:       data.type       || 'message',
     },
 
     // Uses the same BASE this file already computes for precaching (see
@@ -488,18 +500,27 @@ self.addEventListener('notificationclick', event => {
         if (client.url.includes(self.location.origin)) {
           await client.focus();
           client.postMessage({
-            type:     action === 'accept' ? 'CALL_ACCEPT' : action === 'reply' ? 'FOCUS_REPLY' : 'OPEN_ROOM',
-            roomCode: data.roomCode,
-            senderId: data.senderId,
+            type:       action === 'accept' ? 'CALL_ACCEPT' : action === 'reply' ? 'FOCUS_REPLY' : 'OPEN_ROOM',
+            roomCode:   data.roomCode,
+            senderId:   data.senderId,
+            senderName: data.senderName,
           });
           return;
         }
       }
 
-      // No open window — open a new one
-      const targetUrl = data.roomCode
+      // No open window — open a new one. The 'reply'/'name' params cover
+      // the same "tapped Reply" case as the postMessage branch above,
+      // just for a cold start where there's no running page yet to
+      // receive a message — app.js reads these off the URL once on load
+      // (see the matching code there) and does the same prefill+focus.
+      let targetUrl = data.roomCode
         ? `/?roomCode=${data.roomCode}&source=notification`
         : '/';
+      if (action === 'reply' && data.roomCode) {
+        targetUrl += '&reply=1';
+        if (data.senderName) targetUrl += '&name=' + encodeURIComponent(data.senderName);
+      }
       await self.clients.openWindow(targetUrl);
     })()
   );

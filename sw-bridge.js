@@ -100,9 +100,26 @@ navigator.serviceWorker.addEventListener('message', event => {
           .update({ online: true }).catch(() => {});
       }
       break;
-    case 'FOCUS_REPLY':
-      setTimeout(() => document.getElementById('msg-input')?.focus(), 200);
+    case 'FOCUS_REPLY': {
+      // Prefill with "@<sender> " so tapping Reply from a notification
+      // actually addresses the person who sent it, instead of just
+      // focusing an empty box — senderName comes from notify.js's push
+      // payload, through sw.js's notificationclick handler, to here.
+      const name = event.data?.senderName;
+      setTimeout(() => {
+        const input = document.getElementById('msg-input');
+        if (!input) return;
+        if (name && !input.value.includes('@' + name)) {
+          const mention = '@' + name + ' ';
+          input.value = mention + input.value;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        input.focus();
+        const end = input.value.length;
+        try { input.setSelectionRange(end, end); } catch {}
+      }, 200);
       break;
+    }
   }
 });
 
