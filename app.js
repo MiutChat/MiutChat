@@ -1315,6 +1315,18 @@ function _showAnnouncementPopup(msg) {
       showInviteScreen();
       return;
     }
+    // PWA shortcut routing: manifest.json's "Create Room"/"Join Room" long-press
+    // shortcuts launch with ?action=create / ?action=join. Route straight to the
+    // matching join-screen tab using the real switchJoinTab()/".join-tab-btn"
+    // structure (the create tab happened to "work" before only because it's the
+    // screen's default tab — join never did anything).
+    const _action = new URLSearchParams(window.location.search).get('action');
+    if (_action === 'create' || _action === 'join') {
+      showScreen('join-screen');
+      switchJoinTab(_action === 'join' ? 'enter' : 'create');
+      window.history.replaceState({}, '', window.location.pathname);
+      return;
+    }
     // Hash-based routing: miutchat.pages.dev/index.html#enterroom or #createroom
     const _hash = (window.location.hash || '').replace('#','').toLowerCase();
     if (_hash === 'enterroom' || _hash === 'joinroom') {
@@ -1675,11 +1687,13 @@ async function handleEnter() {
       if (approvalRequired) {
         // Gate — register as pending and show waiting screen
         await registerPresence('member', false);
+        _notifyRoomEvent('join-request'); // admins only — see functions/api/notify.js
         showWaitingScreen();
       } else {
         // Open room — approve immediately and boot
         await registerPresence('member', true);
         await sendSys(`${state.me.name} joined the room`);
+        _notifyRoomEvent('member-joined'); // everyone else already in the room
         bootApp();
       }
     }
@@ -1996,6 +2010,12 @@ async function approveUser(uid, name) {
       .collection('members').doc(uid)
       .update({ approved: true });
     // Don't send system message here — the newly approved user sends it on their side (bootApp)
+    // senderId/senderName are overridden to the NEW member here, not the
+    // admin doing the approving (state.me, the default) — this is the
+    // moment their join actually becomes real for a gated room, and the
+    // notification should read "<new member> joined", not "<admin>
+    // joined".
+    _notifyRoomEvent('member-joined', { senderId: uid, senderName: name });
     toast(`${name} approved ✓`, 'They can now read and send messages.', 'ok');
   } catch(e) { toast('Approval failed', e.message, 'err'); }
 }
@@ -5996,10 +6016,12 @@ async function joinFromInvite() {
       const approvalRequired = roomSnap.data()?.approvalRequired === true;
       if (approvalRequired) {
         await registerPresence('member', false);
+        _notifyRoomEvent('join-request'); // admins only — see functions/api/notify.js
         showWaitingScreen();
       } else {
         await registerPresence('member', true);
         await sendSys(`${state.me.name} joined the room`);
+        _notifyRoomEvent('member-joined'); // everyone else already in the room
         bootApp();
       }
     }
@@ -6693,8 +6715,17 @@ function handleRipple(e) {
    subscription. Only roomCode/shard/senderId/senderName cross the wire —
    never message content, so this never touches E2EE.
 ────────────────────────────────────────── */
-function _notifyRoomOfNewMessage() {
-  if (!state.roomCode || !state.me?.id) return;
+// Generic version of the fire-and-forget /api/notify call — handles three
+// event types server-side now (see functions/api/notify.js): 'message'
+// (default), 'join-request' (fired when someone asks to join a gated
+// room — goes to admins only), and 'member-joined' (fired once a join is
+// actually final — goes to everyone else already in the room). `extra`
+// can override senderId/senderName, which matters for 'member-joined'
+// when an ADMIN's approval is what finalizes someone ELSE's join: the
+// notification should be about the new member, not the admin who
+// clicked approve.
+function _notifyRoomEvent(type, extra = {}) {
+  if (!state.roomCode) return;
   try {
     fetch('/api/notify', {
       method:  'POST',
@@ -6702,11 +6733,18 @@ function _notifyRoomOfNewMessage() {
       body: JSON.stringify({
         roomCode:   state.roomCode,
         shard:      db?.app?.name || 'miut-db0',
-        senderId:   state.me.id,
-        senderName: state.me.name,
+        type,
+        senderId:   state.me?.id   || '',
+        senderName: state.me?.name || '',
+        ...extra,
       }),
     }).catch(() => {});
   } catch {}
+}
+
+function _notifyRoomOfNewMessage() {
+  if (!state.me?.id) return;
+  _notifyRoomEvent('message');
 }
 
 let _audioCtx = null;

@@ -463,10 +463,20 @@ self.addEventListener('push', event => {
     // top of file) — currently a no-op path-wise on this app's actual
     // root-domain Cloudflare Pages deployment (BASE === '/'), but makes
     // these correct under any subpath too, with zero behavior change here.
+    // 'join-request'/'member-joined' get neither Reply (nothing to reply
+    // to) nor Accept/Decline (approving/declining is an admin-UI action
+    // inside the app, not safely doable from a notification with no
+    // auth context) — just Dismiss. Tapping the notification body itself
+    // (not an action button) still opens straight to the room either
+    // way, same as it always has — see notificationclick below.
     actions: data.type === 'call'
       ? [
           { action: 'accept', title: 'Accept',  icon: BASE + 'icons/action-accept.png' },
           { action: 'decline', title: 'Decline', icon: BASE + 'icons/action-decline.png' },
+        ]
+      : data.type === 'join-request' || data.type === 'member-joined'
+      ? [
+          { action: 'dismiss', title: 'Dismiss', icon: BASE + 'icons/action-dismiss.png' },
         ]
       : [
           { action: 'reply',   title: 'Reply',       icon: BASE + 'icons/action-reply.png' },
