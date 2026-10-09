@@ -4232,6 +4232,16 @@ function setReply(senderName, text, docId, mediaType, fileName) {
   requestAnimationFrame(() => bar.classList.add('visible'));
   $('msg-input')?.focus();
 }
+// sw-bridge.js (a separate <script>) calls this from the notification
+// "Reply" action to set up the same quoted-reply bar as swiping a bubble
+// does — see the window.state/window.db comment earlier in this file for
+// why it must be reached through an explicit window.* property rather
+// than sw-bridge.js calling the bare `setReply` name directly: esbuild's
+// per-file --minify-identifiers would be free to rename this declaration
+// inside app.min.js alone, since it has no idea sw-bridge.js also calls
+// it by that exact name, silently breaking the cross-file call in the
+// actual deployed build even though it'd look fine un-minified.
+window.setReply = setReply;
 
 function clearReply() {
   // If editing, cancel the edit

@@ -101,20 +101,47 @@ navigator.serviceWorker.addEventListener('message', event => {
       }
       break;
     case 'FOCUS_REPLY': {
-      // Prefill with "@<sender> " so tapping Reply from a notification
-      // actually addresses the person who sent it, instead of just
-      // focusing an empty box — senderName comes from notify.js's push
-      // payload, through sw.js's notificationclick handler, to here.
-      const name = event.data?.senderName;
+      // Sets up the SAME quoted-reply bar as swiping a bubble does (via
+      // window.setReply — see app.js), quoting that sender's own actual
+      // last message, rather than just prefixing "@name " as plain text.
+      // notify.js's push payload deliberately never carries message
+      // content (that would defeat E2EE), so there's no text to quote in
+      // the push itself — but the receiving device already has the real,
+      // decrypted message sitting in the DOM (it rendered normally
+      // through the live Firestore listener), so this reads the
+      // sender's most recent bubble straight off the page, exactly like
+      // the on-screen reply icon would.
+      const { senderId, senderName } = event.data || {};
       setTimeout(() => {
         const input = document.getElementById('msg-input');
         if (!input) return;
-        if (name && !input.value.includes('@' + name)) {
-          const mention = '@' + name + ' ';
-          input.value = mention + input.value;
-          input.dispatchEvent(new Event('input', { bubbles: true }));
+
+        let wrap = null;
+        if (senderId) {
+          const candidates = [...document.querySelectorAll(
+            `.msg-wrapper[data-sender-id="${CSS.escape(senderId)}"]:not(.deleted)`
+          )];
+          wrap = candidates.reduce((best, w) => {
+            const ts = Number(w.dataset.ts) || 0;
+            return (!best || ts > (Number(best.dataset.ts) || 0)) ? w : best;
+          }, null);
         }
-        input.focus();
+
+        const docId = wrap?.dataset.docId;
+        const bubbleText = wrap?.querySelector('.msg-bubble')?.textContent?.trim();
+        if (wrap && docId && bubbleText && window.setReply) {
+          window.setReply(senderName || 'Someone', bubbleText, docId);
+        } else {
+          // Couldn't find that message on this page (different room
+          // open, not scrolled into the loaded range, etc.) — fall back
+          // to at least addressing them by name instead of leaving an
+          // empty box.
+          if (senderName && !input.value.includes('@' + senderName)) {
+            input.value = '@' + senderName + ' ' + input.value;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          input.focus();
+        }
         const end = input.value.length;
         try { input.setSelectionRange(end, end); } catch {}
       }, 200);
