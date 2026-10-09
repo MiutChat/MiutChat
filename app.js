@@ -6695,41 +6695,7 @@ function _notifyRoomOfNewMessage() {
         senderId:   state.me.id,
         senderName: state.me.name,
       }),
-    })
-      // TEMPORARY diagnostic — this used to be a bare .catch(()=>{}) with
-      // the response thrown away entirely, which is exactly why "the
-      // toggle shows on but notifications still don't arrive" was
-      // impossible to debug from a phone with no devtools: nothing here
-      // ever reported whether the server-side send actually worked for
-      // the OTHER person. The receiving browser has no way to know
-      // /api/notify was even called, so the only place this can be
-      // surfaced is on the SENDER's screen, right after they send. Stays
-      // silent on a clean send; only speaks up when something's actually
-      // wrong. Safe to ask me to remove once this is confirmed working.
-      .then(async res => {
-        let body = null;
-        try { body = await res.json(); } catch {}
-        if (!res.ok) {
-          toast('Push notify failed', (body && body.error) || ('HTTP ' + res.status), 'err');
-        } else if (body?.error) {
-          toast('Push notify failed', body.error, 'err');
-        } else if (body && body.total > 0 && body.sent === 0) {
-          const why = body.results?.find(r => !r.ok);
-          toast('Push not delivered', `0/${body.total} — ${why?.reason || why?.status || 'unknown'}`, 'err');
-        } else {
-          // Round 2 of this TEMPORARY diagnostic: the previous version
-          // only spoke up on a failure it recognized, but got total
-          // silence back from a real test — which is itself ambiguous
-          // between "0 other subscribed members found" (total===0, so
-          // none of the failure branches above ever fire) and genuine
-          // success (sent>0, delivered to the push service fine, but the
-          // receiving browser/service-worker never displayed it). Show
-          // the raw numbers every time for this round so we can tell
-          // those two apart, instead of guessing again.
-          toast('Push notify result', `sent ${body?.sent ?? '?'}/${body?.total ?? '?'}`, body?.sent > 0 ? 'ok' : 'err');
-        }
-      })
-      .catch(e => toast('Push notify error', e.message, 'err'));
+    }).catch(() => {});
   } catch {}
 }
 
