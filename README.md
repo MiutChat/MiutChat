@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icons/icon-192.png" width="72" alt="MiutChat logo"/>
+  <img src="public/icons/icon-192.png" width="72" alt="MiutChat logo"/>
 </p>
 
 <h1 align="center">MiutChat</h1>
@@ -59,8 +59,8 @@ Rooms are ephemeral by design: once everyone leaves, the room and everything in 
 | Data & realtime | [Firebase Firestore](https://firebase.google.com/docs/firestore) (client SDK, realtime listeners), sharded across N independent Firebase projects — see [Multi-shard architecture](#multi-shard-architecture) |
 | Crypto | Browser [Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API) (AES-256-GCM, PBKDF2, ECDSA P-256 for message signing) |
 | Hosting | [Cloudflare Pages](https://pages.cloudflare.com/) (static assets + Pages Functions for a few edge endpoints) |
-| Bundler | [esbuild](https://esbuild.github.io/) via a small custom [`build.js`](./build.js) — no webpack/vite |
-| Offline / caching | Service worker (`sw.js`) + IndexedDB for local message/blob cache, opened directly in `app.js` / `miut-protocol.js` |
+| Bundler | [esbuild](https://esbuild.github.io/) via a small custom [`scripts/build.js`](./scripts/build.js) — no webpack/vite |
+| Offline / caching | Service worker (`sw.js`) + IndexedDB for local message/blob cache, opened directly in `app.js` |
 
 There is intentionally no framework, no npm-dependency-heavy UI layer, and no server-rendered anything. The entire client is a handful of plain JS files loaded by `index.html`, bundled/minified by `build.js` for production.
 
@@ -68,43 +68,54 @@ There is intentionally no framework, no npm-dependency-heavy UI layer, and no se
 
 ```
 MiutChat/
-├── index.html              The app itself (chat UI)
-├── app.js                  Core client logic: rooms, messages, reactions, UI wiring
-├── style.css                All styling (CSS custom properties for theming)
-├── crypto-engine.js         AES-256-GCM encrypt/decrypt, key derivation, signing primitives
-├── crypto-bridge.js         Glue between the UI and crypto-engine/crypto-worker
-├── crypto-worker.js         Web Worker offload for heavier crypto operations
-├── security.js               Replay protection, nonce tracking, timestamp validation, canaries
-├── db-manager.js             Multi-shard Firestore resolution — which of the N Firebase
-│                              projects a given room code actually lives on (registry lookup,
-│                              local caches, self-healing cross-shard probe).
-├── storage-engine.js         Chunked encrypted file read/write against Firestore (splits large
-│                              media across multiple ~600KB message documents, reassembles them)
-├── sw.js / sw-bridge.js       Service worker + main-thread bridge (cache-first shell, offline fallback)
-├── miut-protocol.js          Shared protocol constants/helpers; also owns the local IndexedDB cache
-├── placeholder-rotator.js    Small cosmetic input-placeholder rotation on the join screen
-├── build.js                  Build pipeline (esbuild + custom transforms; see below)
-├── version.js                 Single source of truth for the app version (see Versioning)
-├── firestore.rules            Security rules for the chat shards — committed here
-├── landing.html / about.html / privacy.html / terms.html / 404.html / offline.html
-│                              Static marketing/legal/utility pages
-├── manifest.json              PWA manifest
-├── wrangler.toml               Cloudflare Pages config (KV namespaces, env vars, rate-limit tuning)
-└── functions/api/             Cloudflare Pages Functions (edge endpoints)
-    ├── health.js               Uptime/health check (see known issues — its reported version is stale)
-    ├── rate-limit.js            Server-side rate limiting for room create/join/send
-    ├── cleanup.js               Cron-triggered sweep that deletes expired rooms
-    ├── canary.js                 Replay/injection canary registration
-    ├── validate-room.js          Room-code validation endpoint
-    ├── csp-report.js             CSP violation report sink
-    ├── analytics.js              Lightweight usage/event logging endpoint
-    ├── config.js                 Tells the client which Firebase shard projects are active —
-    │                              scans env for FIREBASE_* / FIREBASE_DBn_* automatically
-    └── shard-registry.js         Authoritative "which shard is this room on" service, backed by
-                                   its own dedicated Firebase project — see below
+├── src/                          Everything that gets built
+│   ├── index.html                 The app itself (chat UI)
+│   ├── app/
+│   │   ├── app.js                 Core client (ES module): rooms, messages, reactions, UI wiring
+│   │   └── lazy/                  Loaded on demand with dynamic import()
+│   │       ├── file-transfer.js    Attach, chunking, decrypt, media viewer
+│   │       └── feedback.js         Post-leave survey and "report a problem"
+│   ├── core/
+│   │   ├── db-manager.js          Multi-shard Firestore resolution (registry lookup, caches, cross-shard probe)
+│   │   ├── security.js            Replay protection, nonce tracking, timestamp validation, canaries
+│   │   ├── storage-engine.js      Chunked encrypted file read/write against Firestore
+│   │   └── placeholder-rotator.js Input-placeholder rotation on the join screen
+│   ├── crypto/
+│   │   ├── crypto-engine.js       AES-256-GCM, key derivation, signing primitives
+│   │   ├── crypto-bridge.js       Glue between the UI and crypto-engine / crypto-worker
+│   │   └── crypto-worker.js       Web Worker offload for heavier crypto
+│   ├── sw/
+│   │   ├── sw.js                  Service worker (cache-first shell, offline fallback)
+│   │   └── sw-bridge.js           Main-thread bridge to the service worker
+│   ├── styles/style.css           All styling (CSS custom properties for theming)
+│   └── pages/                     Static marketing / legal / utility pages
+│       └── landing, about, privacy, terms, 404, offline, secure-chat-for-journalists,
+│           ephemeral-chat-for-support-groups (.html)
+├── public/                       Copied to the site root as-is
+│   ├── manifest.json  robots.txt  security.txt
+│   └── icons/
+├── config/
+│   └── firestore.rules            Security rules for the chat shards — committed here and published
+├── functions/api/                Cloudflare Pages Functions (must stay at the repo root)
+│   ├── health.js  rate-limit.js  cleanup.js  canary.js  validate-room.js
+│   ├── csp-report.js  analytics.js  notify.js
+│   ├── config.js                  Tells the client which Firebase shard projects are active
+│   └── shard-registry.js          Authoritative "which shard is this room on" service
+├── scripts/
+│   ├── build.js                   Build pipeline (esbuild + custom transforms)
+│   └── version.js                 Single source of truth for the app version
+├── archive/                      Not built and not referenced by the app (kept for review)
+│   ├── notify.js  miut-protocol.js
+├── build.js                      Two-line shim so `node build.js` (Cloudflare build command) keeps working
+├── wrangler.toml                  Cloudflare Pages config (KV namespaces, env vars, rate-limit tuning)
+└── package.json
 ```
 
-There's no `src/`/`dist/` split in the repo — `dist/` is generated by `build.js` and is not committed (see `.gitignore` if present, or just note it's build output).
+### Source layout vs. deployed layout
+
+The repo is organised by role, but `dist/` is always **flat** — every file lands at the site root, so URLs, the service-worker scope and cache keys never depend on how the source is arranged. To make that work, `build.js` indexes `src/`, `public/` and `config/` by file name: references inside HTML and scripts use the flat names (`app.js`, `style.css`, …), and the build fails loudly if two source files share a name. Adding a file means putting it in the folder that fits; add it to `JS_JOBS` in `scripts/build.js` only if it needs to be minified as its own output.
+
+Modules in `src/app/lazy/` are bundled separately into content-hashed `lz-<name>-<hash>.js` chunks and loaded with `import()` the first time the feature is used. `dist/` is generated and not committed (it is in `.gitignore`).
 
 ## How it works
 
@@ -163,7 +174,7 @@ This produces a `dist/` folder. Serve it with any static file server, e.g.:
 npx serve dist
 ```
 
-You'll need your own Firebase project(s) (Firestore) to actually connect to a backend — this repo doesn't include Firebase credentials. Wire up each shard project's config via the `FIREBASE_*` / `FIREBASE_DBn_*` environment variables `functions/api/config.js` reads (see [Multi-shard architecture](#multi-shard-architecture)), and deploy [`firestore.rules`](./firestore.rules) — which **is** committed to this repo — to every chat-shard project (the dedicated registry project referenced in `shard-registry.js` needs its own, much smaller, rule set, not covered by this file).
+You'll need your own Firebase project(s) (Firestore) to actually connect to a backend — this repo doesn't include Firebase credentials. Wire up each shard project's config via the `FIREBASE_*` / `FIREBASE_DBn_*` environment variables `functions/api/config.js` reads (see [Multi-shard architecture](#multi-shard-architecture)), and deploy [`firestore.rules`](./config/firestore.rules) — which **is** committed to this repo — to every chat-shard project (the dedicated registry project referenced in `shard-registry.js` needs its own, much smaller, rule set, not covered by this file).
 
 Local builds never touch the version number — see [Versioning](#versioning) below.
 
@@ -175,7 +186,7 @@ Whatever your deploy path — Cloudflare's Git integration running `node build.j
 
 ## Versioning
 
-The app version is a single source of truth: the `version` field in `package.json`. Every other place a version appears — `app.js`, `sw.js`, `index.html`'s meta tag, `manifest.json`, `wrangler.toml`, and the footer of the marketing pages — is stamped in at build time by `build.js` reading through [`version.js`](./version.js). None of those are meant to be hand-edited.
+The app version is a single source of truth: the `version` field in `package.json`. Every other place a version appears — `app.js`, `sw.js`, `index.html`'s meta tag, `manifest.json`, `wrangler.toml`, and the footer of the marketing pages — is stamped in at build time by `build.js` reading through [`version.js`](./scripts/version.js). None of those are meant to be hand-edited.
 
 **Bump scheme** (a deliberate product decision, not strict semver): the patch number increments normally and caps at `25`; the next bump after that rolls into the minor version instead of continuing past 25:
 
@@ -183,7 +194,7 @@ The app version is a single source of truth: the `version` field in `package.jso
 1.0.24 → 1.0.25 → 1.1.0 → 1.1.1 → ...
 ```
 
-**When it bumps, and where:** automatically, on every push to `main`, via the GitHub Action at [`.github/workflows/bump-version.yml`](./.github/workflows/bump-version.yml). That workflow is the actual source of the bump — it runs `node version.js patch` and **commits the result back to the repository**.
+**When it bumps, and where:** automatically, on every push to `main`, via the GitHub Action at [`.github/workflows/bump-version.yml`](./.github/workflows/bump-version.yml). That workflow is the actual source of the bump — it runs `node scripts/version.js patch` and **commits the result back to the repository**.
 
 This lives in a GitHub Action rather than in `build.js` deliberately. An earlier version of this project tried bumping the version inside `build.js` during the Cloudflare Pages build itself — that doesn't work, because Cloudflare (like most CI) clones the repository fresh, and shallow, for every single build. Any change `build.js` made to `package.json` during that build only ever existed inside that one throwaway container; it never made it back into the actual GitHub repo, so the next push started from the exact same committed version and computed the exact same "next" value — the version looked permanently stuck one bump behind, no matter how many times you deployed. Bumping via a GitHub Action instead means the new version is genuinely committed to git history *before* anything ever clones the repo to build or deploy it, which is the only way this can actually persist across separate deploys.
 
@@ -194,9 +205,9 @@ This lives in a GitHub Action rather than in `build.js` deliberately. An earlier
 **Manual bumps** (e.g. to deliberately jump to a new minor/major before a release):
 
 ```bash
-node version.js patch   # explicit patch bump (same as an automatic one)
-node version.js minor   # 1.4.9  → 1.5.0
-node version.js major   # 1.5.0  → 2.0.0
+node scripts/version.js patch   # explicit patch bump (same as an automatic one)
+node scripts/version.js minor   # 1.4.9  → 1.5.0
+node scripts/version.js major   # 1.5.0  → 2.0.0
 ```
 
 Commit and push the result like any other change — the next automatic bump picks up from wherever this left off.
@@ -208,7 +219,7 @@ MiutChat is designed so that the operator cannot read message content — encryp
 - This is **not audited cryptography** in the sense of a formal third-party security audit. Treat it accordingly for anything genuinely high-stakes.
 - The room code itself is effectively the shared secret; anyone who has it can join (or, if the Approval Gate is off, immediately read). Share codes only with people you trust.
 - Anti-screenshot measures are a deterrent, not a technical guarantee — screen capture can never be fully prevented in a browser.
-- If you find a genuine security issue, please see [`SECURITY.md`](./SECURITY.md) / [`security.txt`](./security.txt) for how to report it responsibly rather than opening a public issue.
+- If you find a genuine security issue, please see [`SECURITY.md`](./SECURITY.md) / [`security.txt`](./public/security.txt) for how to report it responsibly rather than opening a public issue.
 
 ## Contributing
 

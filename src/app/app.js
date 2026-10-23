@@ -1,7 +1,6 @@
 
 'use strict';
 // @ts-check
-(function (_W) {
 // script internals are now encapsulated — only window.X exports below are public.
 
 /* ── Global error telemetry ─────────────────────────────────────────────────
@@ -66,7 +65,7 @@
 // characters like / cause path-traversal, and . / .. cause SDK errors.
 // Applied at every entry point (handleCreate, handleEnter, joinFromInvite).
 const _ROOM_CODE_RE = /^[a-zA-Z0-9 _\-@#!?+*=.]{6,64}$/;
-const APP_VERSION = '1.0.0';
+export const APP_VERSION = '1.0.0';
 
 function validateRoomCode(code) {
   if (!code || typeof code !== 'string') {
@@ -84,7 +83,8 @@ function validateRoomCode(code) {
   return true;
 }
 
-const CONFIG = {
+// Provisional module boundary — extraction scaffolding, not a stable API.
+export const CONFIG = {
   SESSION_KEY:        'miut_session_v2',
   ROOM_KEY:           'miut_room_v1',
   PREFS_KEY:          'miut_prefs_v1',
@@ -118,7 +118,7 @@ const _authReadyByDb = new Map();    // dbName → Promise<uid> — auth is PER 
 // caches and resolves a separate sign-in PER dbName, and callers must
 // resolve getDb(roomCode) FIRST, then authenticate against that same
 // shard, not the other way around.
-async function ensureAuth(dbName) {
+export async function ensureAuth(dbName) {
   const key = dbName || (window.__MIUT_DB_CONFIGS__ || []).find(d => d.active)?.name || 'miut-db0';
   if (_authReadyByDb.has(key)) { _log('log', `[MIUT ensureAuth] ${key} → cached promise (dbName passed in was ${dbName || '(none — defaulted)'})`); return _authReadyByDb.get(key); }
   _log('log', `[MIUT ensureAuth] ${key} → first call this tab (dbName passed in was ${dbName || '(none — defaulted)'})`);
@@ -168,7 +168,7 @@ async function ensureAuth(dbName) {
   return p;
 }
 
-let state = {
+export let state = {
   me:         null,
   roomCode:   null,
   prefs: {
@@ -215,7 +215,9 @@ Object.defineProperty(window, 'state', {
   configurable: true,
 });
 
-let db             = null;
+export let db             = null;
+
+export function setRoomSalt(value) { _roomSalt = value; }
 Object.defineProperty(window, 'db', {
   get()  { return db; },
   set(v) { db = v; },
@@ -246,7 +248,7 @@ let _pendingReadAcks   = new Set();   // docIds queued to be marked as read
 let _expiryTimer       = null;        // setInterval handle for message expiry sweep
 // ─────────────────────────────────────────────────────────────────────────────
 
-function _lruMap(maxSize) {
+export function _lruMap(maxSize) {
   const m = new Map();
   return {
     has: k => m.has(k),
@@ -312,34 +314,34 @@ async function idbTx(stores, mode, fn) {
   });
 }
 
-async function idbPut(store, val) {
+export async function idbPut(store, val) {
   return idbTx(store, 'readwrite', (tx, res) => {
     const req = tx.objectStore(store).put(val);
     req.onsuccess = () => res(req.result);
   });
 }
 
-async function idbGetAll(store) {
+export async function idbGetAll(store) {
   return idbTx(store, 'readonly', (tx, res) => {
     const req = tx.objectStore(store).getAll();
     req.onsuccess = () => res(req.result || []);
   });
 }
 
-async function idbGetMeta(k) {
+export async function idbGetMeta(k) {
   return idbTx('meta', 'readonly', (tx, res) => {
     const req = tx.objectStore('meta').get(k);
     req.onsuccess = () => res(req.result?.v ?? null);
   });
 }
-async function idbSetMeta(k, v) { return idbPut('meta', { k, v }); }
-async function idbGetBlob(id) {
+export async function idbSetMeta(k, v) { return idbPut('meta', { k, v }); }
+export async function idbGetBlob(id) {
   return idbTx('blobs', 'readonly', (tx, res) => {
     const req = tx.objectStore('blobs').get(id);
     req.onsuccess = () => res(req.result?.bytes ?? null);
   });
 }
-async function idbSetBlob(id, bytes) { return idbPut('blobs', { id, bytes }); }
+export async function idbSetBlob(id, bytes) { return idbPut('blobs', { id, bytes }); }
 async function cacheMsg(docId, room, data) {
   try {
     const ts = data.createdAt?.toMillis?.() ?? data.ts ?? 0;
@@ -379,11 +381,10 @@ async function clearCacheForRoom(room) {
   } catch {}
 }
 
-let _roomEpoch   = 0;
-let _roomSalt    = /** @type {string|null} */ (null); // null = legacy deterministic salt
+export let _roomEpoch   = 0;
+export let _roomSalt    = /** @type {string|null} */ (null); // null = legacy deterministic salt
 let _unsubRoom   = null;
 
-const _epochKeys       = _lruMap(50);   // (code:epoch) → CryptoKey
 const _importedPubKeys = _lruMap(200);  // b64 → CryptoKey
 
 // ─── Auto epoch rotation counters ────────────────────────────────────────────
@@ -391,49 +392,16 @@ const _AUTO_EPOCH_MSG_COUNT = 100; // rotate key every N messages (admin only)
 let   _msgsSinceEpoch       = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function _getEpochKey(code, epoch) {
-  // v2 rooms: random salt stored in Firestore (more secure)
-  // v1 rooms: deterministic salt (backward-compatible with existing rooms)
-  const saltTag  = _roomSalt || 'v1';
-  const cacheKey = `${code}:${epoch}:${saltTag}`;
-  if (_epochKeys.has(cacheKey)) return _epochKeys.get(cacheKey);
-
-  let salt;
-  if (_roomSalt) {
-    const roomSaltBytes = _b64uDec(_roomSalt);            // random 16 bytes from room doc
-    const epochTag = new TextEncoder().encode(`|epoch:${epoch}`);
-    const combined = new Uint8Array(roomSaltBytes.length + epochTag.length);
-    combined.set(roomSaltBytes, 0);
-    combined.set(epochTag, roomSaltBytes.length);
-    salt = new Uint8Array(await crypto.subtle.digest('SHA-256', combined)).slice(0, 16);
-  } else {
-    const saltInput = new TextEncoder().encode(`NEXUS_EPOCH|${code}|${epoch}`);
-    const saltHash  = await crypto.subtle.digest('SHA-256', saltInput);
-    salt = new Uint8Array(saltHash).slice(0, 16);         // legacy deterministic
-  }
-
-  const raw  = new TextEncoder().encode(code);
-  const base = await crypto.subtle.importKey('raw', raw, 'PBKDF2', false, ['deriveKey']);
-  const key  = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
-    base,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-  _epochKeys.set(cacheKey, key);
-  return key;
-}
 function _b64uEnc(buf) {
   let s = ''; const u = new Uint8Array(buf);
   for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode(...u.subarray(i, i + 8192));
   return btoa(s).replace(/\+/g,'-').split('/').join('_').replace(/=/g,'');
 }
-function _b64uDec(s) {
+export function _b64uDec(s) {
   return Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
 }
 let _compressionSupported = null;
-async function _testCompression() {
+export async function _testCompression() {
   if (_compressionSupported !== null) return _compressionSupported;
   try {
     if (typeof CompressionStream === 'undefined' || typeof DecompressionStream === 'undefined') {
@@ -452,18 +420,6 @@ async function _testCompression() {
   return _compressionSupported;
 }
 
-async function _collectStream(readable) {
-  const chunks = [], reader = readable.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-  let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.length; }
-  return out;
-}
 
 // ─── Text message encryption — single production crypto implementation ──────
 // Delegates entirely to MiutCryptoBridge (crypto-engine.js / crypto-worker.js):
@@ -493,7 +449,7 @@ async function enc(text, code, senderId) {
     return out;
   } catch { return ''; }
 }
-async function dec(payload, code, senderId) {
+export async function dec(payload, code, senderId) {
   if (!payload) return '';
   // Not an "x1:" envelope — this is a message encrypted under a format
   // this build removed support for entirely (see enc()'s comment above),
@@ -536,92 +492,6 @@ async function dec(payload, code, senderId) {
   } catch { return '[encrypted]'; }
 }
 
-async function encBytes(file, code) {
-  try {
-    const epoch = _roomEpoch;
-    const key   = await _getEpochKey(code, epoch);
-    const iv    = crypto.getRandomValues(new Uint8Array(12));
-    // Compress file bytes before encryption to reduce Firestore document size
-    let fileBuf = new Uint8Array(await file.arrayBuffer());
-    let compressed = false;
-    if (await _testCompression() && file.size > 1024) {
-      try {
-        const cs = new CompressionStream('deflate-raw');
-        const w  = cs.writable.getWriter();
-        w.write(fileBuf); w.close();
-        const cBuf = await _collectStream(cs.readable);
-        if (cBuf.length < fileBuf.length * 0.95) { // only use if >5% saving
-          fileBuf = cBuf; compressed = true;
-        }
-      } catch {}
-    }
-    // Prepend 1-byte marker: 0xC0 = compressed, 0x00 = raw
-    const markedBuf = new Uint8Array(1 + fileBuf.length);
-    markedBuf[0] = compressed ? 0xC0 : 0x00;
-    markedBuf.set(fileBuf, 1);
-    const ct = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      key,
-      markedBuf
-    );
-    const epochBuf = new Uint8Array(4);
-    new DataView(epochBuf.buffer).setUint32(0, epoch, false);
-    const ctBytes = new Uint8Array(ct);
-    const out = new Uint8Array(4 + 12 + ctBytes.byteLength);
-    out.set(epochBuf, 0);
-    out.set(iv, 4);
-    out.set(ctBytes, 16);
-    // Build base64 in 16KB chunks to avoid stack overflow on large arrays.
-    let s = '';
-    for (let i = 0; i < out.length; i += 16384) {
-      s += String.fromCharCode(...out.subarray(i, i + 16384));
-    }
-    return 'b:' + btoa(s);
-  } catch(e) { throw e; }
-}
-async function decBytes(b64full, mime, code) {
-  if (b64full.startsWith('b:')) {
-    const raw   = Uint8Array.from(atob(b64full.slice(2)), c => c.charCodeAt(0));
-    const epoch = new DataView(raw.buffer, 0, 4).getUint32(0, false);
-    const iv    = raw.slice(4, 16);
-    const ct    = raw.slice(16);
-    let key     = await _getEpochKey(code, epoch);
-    let pt;
-    try {
-      pt = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
-    } catch (e) {
-      // Same self-heal as dec() above: _roomSalt may not have been loaded
-      // into memory yet when this ran.
-      if (code === state.roomCode && db) {
-        try {
-          const roomSnap = await db.collection('rooms').doc(code).get();
-          const freshSalt = roomSnap.exists ? (roomSnap.data()?.salt || null) : null;
-          if (freshSalt && freshSalt !== _roomSalt) {
-            _roomSalt = freshSalt;
-            _epochKeys.delete(`${code}:${epoch}:${freshSalt}`);
-            key = await _getEpochKey(code, epoch);
-            pt = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
-          } else { throw e; }
-        } catch { throw e; }
-      } else { throw e; }
-    }
-    // Check compression marker byte
-    if (pt.length > 1 && pt[0] === 0xC0) {
-      // Decompress
-      try {
-        const ds = new DecompressionStream('deflate-raw');
-        const w  = ds.writable.getWriter();
-        w.write(pt.slice(1)); w.close();
-        pt = await _collectStream(ds.readable);
-      } catch {}
-    } else if (pt.length > 1 && pt[0] === 0x00) {
-      pt = pt.slice(1); // strip raw marker
-    }
-    // Legacy files (no marker byte) are returned as-is
-    return new Blob([pt], { type: mime });
-  }
-  throw new Error('Unsupported legacy media format');
-}
 
 const _EC_ALGO = { name: 'ECDSA', namedCurve: 'P-256' };
 const _EC_SIGN = { name: 'ECDSA', hash: 'SHA-256' };
@@ -667,7 +537,7 @@ async function initSigningKey() {
   }
 }
 
-async function signMsg(senderId, ts, encText) {
+export async function signMsg(senderId, ts, encText) {
   if (!_sigPrivKey) await initSigningKey(); // lazy retry — idempotent, loads the existing keypair rather than generating a new one
   if (!_sigPrivKey) return null;
   try {
@@ -738,7 +608,7 @@ async function verifyAndBadge(data, docId) {
   }
 }
 
-const $  = id  => document.getElementById(id);
+export const $  = id  => document.getElementById(id);
 
 // Production builds run esbuild with --drop:console (see build.js) to strip
 // debug output shipped to end users. That's fine for routine logs, but it
@@ -750,10 +620,10 @@ const $  = id  => document.getElementById(id);
 // of indirection lets diagnostically-important logs survive into
 // production while routine ones can still use console.* directly.
 const _sysConsole = window.console;
-function _log(level, ...args) { try { _sysConsole?.[level]?.(...args); } catch {} }
+export function _log(level, ...args) { try { _sysConsole?.[level]?.(...args); } catch {} }
 const qs = sel => document.querySelector(sel);
 
-function esc(s) {
+export function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
@@ -1110,10 +980,10 @@ function fmtTime(ts) {
     ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
-function fmtBytes(b) {
+export function fmtBytes(b) {
   return b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(1) + ' KB' : (b/1048576).toFixed(1) + ' MB';
 }
-function ts_now() { return firebase.firestore.FieldValue.serverTimestamp(); }
+export function ts_now() { return firebase.firestore.FieldValue.serverTimestamp(); }
 
 const AV_COLORS = ['#2dd4bf','#06b6d4','#3b82f6','#8b5cf6','#ec4899','#f43f5e','#f97316','#eab308','#22c55e','#14b8a6','#6366f1','#a855f7'];
 const REACTION_EMOJIS  = ['👍','❤️','😂','😮','😢','🔥','👀','🎉'];
@@ -1134,7 +1004,7 @@ function genCallsign() { return `${_A[Math.random()*_A.length|0]} ${_N[Math.rand
 // first to know which shard a room is on, THEN call getUID(thatDbName).
 // If auth fails (network down, quota exceeded), throws — callers must handle.
 // A localStorage fallback UID has no JWT and fails all Firestore rules.
-async function getUID(dbName) {
+export async function getUID(dbName) {
   const uid = await ensureAuth(dbName); // throws on auth failure — handled by callers
   return uid;
 }
@@ -1462,7 +1332,7 @@ function openSidebar() {
   document.body.classList.add('sidebar-active');
 }
 
-function closeSidebar() {
+export function closeSidebar() {
   _sidebarOpen = false;
   $('sidebar')?.classList.remove('open');
   $('sidebar-overlay')?.classList.remove('active');
@@ -1773,8 +1643,6 @@ async function registerPresence(role = 'member', approved = false) {
 
 function bootApp() {
   _renderedIds.clear();
-  _chunkGroups     = {};    // reset chunk assembly state — stale groups from a prior session
-                            // would block re-assembly of the same groupId on re-enter
   _lastCachedTs    = 0;
   _onlineCount     = 0;
   _presenceSettled = false;  // reset — first snapshot must not trigger wipe
@@ -2408,36 +2276,9 @@ let _roomTtlMs = 0; // 0 = no expiry
 //   }
 function _startExpirySweep() {
   if (_expiryTimer) clearInterval(_expiryTimer);
-  _expiryTimer = setInterval(() => { _runExpirySweep(); _sweepStaleChunkGroups(); }, 5000); // check every 5s for accurate countdowns
+  _expiryTimer = setInterval(() => { _runExpirySweep(); }, 5000); // check every 5s for accurate countdowns — chunk-group sweeping now lives entirely inside file-transfer.js's own timer, started once that module loads
 }
 
-const STALE_CHUNK_GROUP_MS = 10 * 60 * 1000; // 10 min — long enough for any real upload to finish, short enough to not leak memory
-function _sweepStaleChunkGroups() {
-  const cutoff = Date.now() - STALE_CHUNK_GROUP_MS;
-  for (const gid of Object.keys(_chunkGroups)) {
-    const g = _chunkGroups[gid];
-    if (g && g.firstSeenAt && g.firstSeenAt < cutoff) {
-      // Never completed after 10 minutes — an interrupted/failed upload.
-      // This is a backstop behind the per-group 45s stall timer (it only
-      // fires if that timer was somehow missed, e.g. a backgrounded tab
-      // throttling timers). Route through _markChunkGroupFailed() rather
-      // than a bare delete so the UI bubble (if still showing "Receiving…")
-      // gets updated to an explicit failure state instead of being left
-      // stuck forever — each entry can also hold up to CONFIG.CHUNK_BYTES
-      // worth of base64 text per chunk already received, which otherwise
-      // accumulates for the lifetime of the tab.
-      _log('debug', `[MIUT media] evicting stale incomplete chunk group ${gid} (${Object.keys(g.parts).length}/${g.total} chunks, never completed)`);
-      _markChunkGroupFailed(gid);
-    }
-  }
-  // Same leak pattern, smaller payload each but same idea: a placeholder
-  // whose message was deleted or whose room was left before it ever
-  // scrolled into view never triggers the IntersectionObserver callback
-  // that would otherwise clean this up.
-  for (const uid of _lazyDataMap.keys()) {
-    if (!document.getElementById(uid)) _lazyDataMap.delete(uid);
-  }
-}
 
 function _runExpirySweep() {
   if (!_roomTtlMs || !state.roomCode) return;
@@ -2760,8 +2601,6 @@ async function fetchHistoryOnce(code) {
     // Show "load earlier" button if there are more messages
     if (!_lastCachedTs) _updateLoadEarlierBtn();
 
-    // Backfill any image/video whose chunks straddled this page's boundary
-    _healIncompleteChunkGroups().catch(() => {});
   } catch (e) {
   }
 }
@@ -2805,8 +2644,6 @@ async function loadEarlierMessages() {
     // Preserve scroll position after prepending
     if (area) area.scrollTop += (area.scrollHeight - prevScrollHeight);
 
-    // Backfill any image/video whose chunks straddled this page's boundary
-    _healIncompleteChunkGroups().catch(() => {});
   } catch (e) {
   } finally {
     _updateLoadEarlierBtn();
@@ -3052,7 +2889,7 @@ function updateOnlineUI() {
   }
 }
 
-function startChatListeners() {
+export function startChatListeners() {
   const code = state.roomCode;
 
   // Messages — only NEW since history fetch set _lastCachedTs
@@ -3184,7 +3021,7 @@ function startChatListeners() {
   window.syncPushSubscriptionForRoom?.().catch(() => {});
 }
 
-function stopChatListeners() {
+export function stopChatListeners() {
   if (_unsubMsgs)    { try { _unsubMsgs();    } catch {} _unsubMsgs    = null; }
   if (_unsubTyping)  { try { _unsubTyping();  } catch {} _unsubTyping  = null; }
   clearMyTyping();
@@ -4084,146 +3921,8 @@ function clearMyTyping() {
   }
 }
 
-async function handleFileAttach(e) {
-  const file = e.target.files?.[0];
-  if (!file || !state.roomCode) return;
-  e.target.value = '';
-  updateActionBtn();
 
-  if (file.size > CONFIG.MAX_FILE_BYTES) {
-    toast('File too large', 'Max 25 MB per file', 'err'); return;
-  }
 
-  const isImg   = file.type.startsWith('image/');
-  const isVid   = file.type.startsWith('video/');
-  const msgType = isImg ? 'image' : isVid ? 'video' : 'file';
-
-  // ── Optimistic UI: show local preview IMMEDIATELY ───────────────────
-  // User sees their image at once; upload happens in background.
-  let _optimisticEl = null;
-  if (isImg) {
-    const localUrl  = URL.createObjectURL(file);
-    const fakeDocId = 'opt_' + Date.now();
-    const fakeData  = {
-      type: 'image', senderId: state.me.id, senderName: state.me.name,
-      senderColor: state.me.color, ts: Date.now(), enc: '', sig: null,
-    };
-    // Inject a temporary message wrapper with the local blob URL
-    const area = $('messages-area');
-    if (area) {
-      const wrap = document.createElement('div');
-      wrap.className    = 'msg-wrapper sent';
-      wrap.dataset.docId = fakeDocId;
-      wrap.dataset.ts    = fakeData.ts;
-      wrap.style.opacity = '0.75';
-      wrap.innerHTML = `<div class="msg-swipe-wrapper"><div class="msg-bubble-wrap">
-        <div class="msg-inner">
-          <div class="msg-bubble" style="padding:4px;background:transparent">
-            <img src="${localUrl}" style="max-width:220px;max-height:220px;border-radius:14px;display:block" loading="eager"/>
-            <div class="msg-upload-progress"><div class="msg-upload-bar"></div></div>
-          </div>
-          <div class="msg-meta"><span class="msg-time-sm">Sending…</span></div>
-        </div>
-      </div></div>`;
-      area.appendChild(wrap);
-      scrollBottom();
-      _optimisticEl = wrap;
-      // Animate progress bar
-      const bar = wrap.querySelector('.msg-upload-bar');
-      if (bar) { setTimeout(() => { bar.style.width = '60%'; }, 50); }
-    }
-  } else {
-    toast('Encrypting…', file.name, 'dot');
-  }
-
-  try {
-    const encrypted = await encBytes(file, state.roomCode);
-    const totalSize = encrypted.length;
-
-    if (totalSize <= CONFIG.CHUNK_BYTES) {
-      const fts  = Date.now();
-      const fsig = await signMsg(state.me.id, fts, encrypted.slice(0, 64));
-      await db.collection('rooms').doc(state.roomCode).collection('messages').add({
-        type: msgType, encData: encrypted, mime: file.type,
-        fileName: file.name, fileSize: file.size, chunks: 1, chunkOf: 1,
-        senderId: state.me.id, senderName: state.me.name, senderColor: state.me.color,
-        sig: fsig, ts: fts, createdAt: ts_now(),
-      });
-    } else {
-      const parts   = [];
-      for (let i = 0; i < totalSize; i += CONFIG.CHUNK_BYTES)
-        parts.push(encrypted.slice(i, i + CONFIG.CHUNK_BYTES));
-      const groupId = 'grp_' + state.me.id.slice(0, 8) + '_' + Date.now() + '_' +
-        Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => b.toString(36)).join('').slice(0, 8);
-      const now     = Date.now();
-      const BATCH   = 4;
-      // Tracks every chunk doc actually written so a mid-upload failure can
-      // both report EXACTLY how far it got and clean up the orphaned chunks
-      // that DID succeed. Previously, a batch failure threw straight to the
-      // outer catch while earlier-batch chunks stayed permanently in
-      // Firestore — nothing ever deleted them, so every other room member
-      // would see a file that can never finish assembling (assembleChunk's
-      // part count can never reach the total) with zero indication why,
-      // while the sender just saw a generic "Upload failed" with no count
-      // of how much actually went through.
-      const writtenRefs = [];
-      let chunksSent = 0;
-      try {
-        for (let b = 0; b < parts.length; b += BATCH) {
-          const refs = await Promise.all(parts.slice(b, b + BATCH).map((part, li) => {
-            const idx = b + li;
-            return db.collection('rooms').doc(state.roomCode).collection('messages').add({
-              type: idx === 0 ? msgType : 'chunk', encData: part,
-              mime: file.type, fileName: file.name, fileSize: file.size,
-              groupId, chunkIdx: idx, chunkOf: parts.length,
-              senderId: state.me.id, senderName: state.me.name, senderColor: state.me.color,
-              createdAt: ts_now(), ts: idx === 0 ? now : Date.now(),
-            });
-          }));
-          writtenRefs.push(...refs);
-          chunksSent += refs.length;
-        }
-      } catch (chunkErr) {
-        // Best-effort cleanup of the chunks that DID make it — they can
-        // never complete without the rest, so leaving them orphaned only
-        // guarantees every other member sees a file that hangs forever.
-        // The sender always has delete rights on their own messages
-        // (firestore.rules), so this should normally succeed even though
-        // the write that triggered this catch failed.
-        _log('warn', `[MIUT upload] chunked upload failed after ${chunksSent}/${parts.length} parts for group ${groupId} — cleaning up orphaned chunks:`, chunkErr?.message || chunkErr);
-        await Promise.all(writtenRefs.map(ref => ref.delete().catch(() => {})));
-        throw new Error(`Only ${chunksSent} of ${parts.length} parts uploaded before the connection dropped — the partial upload was cleaned up. Try again.`);
-      }
-    }
-    playSound('send');
-    _notifyRoomOfNewMessage();
-    if (_optimisticEl) {
-      // Fade out the optimistic preview — real message from Firestore will appear
-      _optimisticEl.style.transition = 'opacity .3s';
-      _optimisticEl.style.opacity = '0';
-      setTimeout(() => _optimisticEl?.remove(), 320);
-    } else {
-      toast('Sent!', file.name, 'ok');
-    }
-  } catch (err) {
-    if (_optimisticEl) { _optimisticEl.remove(); }
-    toast('Upload failed', err.message || 'Check your connection', 'err');
-  }
-}
-
-function triggerAttach() { toggleAttachTabs(); }
-
-function toggleAttachTabs() {
-  const tabs = $('attach-tabs'), btn = $('attach-btn');
-  if (!tabs) return;
-  const opening = !tabs.classList.contains('open');
-  tabs.classList.toggle('open', opening);
-  btn?.setAttribute('aria-expanded', opening ? 'true' : 'false');
-}
-function closeAttachTabs() {
-  $('attach-tabs')?.classList.remove('open');
-  $('attach-btn')?.setAttribute('aria-expanded', 'false');
-}
 
 let _replyTo = null;  // { senderName, text, docId }
 
@@ -4273,7 +3972,6 @@ function clearReply() {
   setTimeout(() => { bar.style.display = 'none'; }, 250);
 }
 
-let _chunkGroups = {};
 let _memberNames  = [];      // tracked for @mention autocomplete
 let _editingDocId = null;    // docId of message currently being edited
 let _editingWrap  = null;
@@ -4350,7 +4048,7 @@ function _scheduleDecryptRetry(wrap, data, docId, onHealed) {
   setTimeout(tryOnce, _DECRYPT_RETRY_DELAYS_MS[0]);
 }
 
-async function renderMsg(data, docId, insertBeforeEl) {
+export async function renderMsg(data, docId, insertBeforeEl) {
   const area = $('messages-area'); if (!area) return;
 
   // Hide the empty-room welcome/skeleton state as soon as ANY message
@@ -4365,7 +4063,8 @@ async function renderMsg(data, docId, insertBeforeEl) {
   $('room-welcome')  && ($('room-welcome').style.display  = 'none');
 
   if (!data._assembled && (data.type === 'chunk' || (data.groupId && data.chunkOf > 1))) {
-    assembleChunk(data, docId); return;
+    try { (await _loadFileTransfer()).assembleChunk(data, docId); } catch (e) { _log('error', '[MIUT] chunk assemble unavailable:', e?.message || e); }
+    return;
   }
 
   const isMine = data.senderId === state.me?.id;
@@ -4613,7 +4312,7 @@ async function renderMsg(data, docId, insertBeforeEl) {
 // Only decrypts media when the placeholder element enters the viewport.
 // Falls back to setTimeout on browsers without IntersectionObserver.
 // Use Map to store encData — avoids huge DOM dataset attributes that break large files
-const _lazyDataMap = new Map(); // uid → {encData,mime,type,fileName}
+export const _lazyDataMap = new Map(); // uid → {encData,mime,type,fileName}
 
 const _lazyIO = typeof IntersectionObserver !== 'undefined'
   ? new IntersectionObserver((entries, obs) => {
@@ -4624,7 +4323,7 @@ const _lazyIO = typeof IntersectionObserver !== 'undefined'
         const data = uid && _lazyDataMap.get(uid);
         if (data) {
           _lazyDataMap.delete(uid);
-          decryptAndShow(data.encData, data.mime, data.type, data.fileName, uid);
+          _loadFileTransfer().then(ft => ft.decryptAndShow(data.encData, data.mime, data.type, data.fileName, uid)).catch(() => {});
         }
       });
     }, { rootMargin: '400px' })  // pre-load 400px ahead
@@ -4633,7 +4332,7 @@ const _lazyIO = typeof IntersectionObserver !== 'undefined'
 function _lazyDecrypt(uid, data) {
   const _do = () => {
     _log('debug', '[MIUT media] decrypting now (poll gave up or no IntersectionObserver):', uid, { type: data.type, hasEncData: !!data.encData });
-    decryptAndShow(data.encData, data.mime || 'application/octet-stream', data.type, data.fileName, uid);
+    _loadFileTransfer().then(ft => ft.decryptAndShow(data.encData, data.mime || 'application/octet-stream', data.type, data.fileName, uid)).catch(() => {});
   };
   if (!data.encData) {
     _log('warn', '[MIUT media] _lazyDecrypt called with no encData at all — this message will show "Media unavailable":', uid, data);
@@ -4673,10 +4372,6 @@ function _lazyDecrypt(uid, data) {
   }, 50);
 }
 
-function buildMediaPlaceholder(uid, data) {
-  if (data.type === 'file') return `<div class="msg-media loading" id="${uid}"><div class="media-decrypt-spinner"></div><div class="media-decrypt-label">${esc(data.fileName||'File')} · Decrypting…</div></div>`;
-  return `<div class="msg-media loading" id="${uid}"><div class="media-decrypt-spinner"></div><div class="media-decrypt-label">Decrypting ${data.type}…</div></div>`;
-}
 
 // ─── Chunk-group progress UI ───────────────────────────────────────────────
 // A multi-chunk file/image/video previously rendered NOTHING at all until
@@ -4688,115 +4383,16 @@ function buildMediaPlaceholder(uid, data) {
 // seen, keeps it updated as more parts arrive, and — if the group stalls
 // past CHUNK_STALL_MS without completing — replaces it with an explicit
 // "didn't finish uploading" message instead of leaving it stuck forever.
-const CHUNK_STALL_MS = 45_000; // generous for any real multi-chunk upload under normal conditions
 
-function _chunkProgressLabel(have, total, isMine) {
-  const pct = total ? Math.round((have / total) * 100) : 0;
-  return `${isMine ? 'Sending' : 'Receiving'} file… ${have}/${total} parts (${pct}%)`;
-}
 
-function _renderChunkProgressBubble(gid, data, docId) {
-  if (document.querySelector(`[data-group-id="${CSS.escape(gid)}"]`)) return; // already showing
-  const area = $('messages-area');
-  if (!area) return;
-  $('msg-skeleton')  && ($('msg-skeleton').style.display  = 'none');
-  $('room-welcome')  && ($('room-welcome').style.display  = 'none');
-  const isMine = data.senderId === state.me?.id;
-  const wrap = document.createElement('div');
-  wrap.className      = `msg-wrapper ${isMine ? 'sent' : 'received'}`;
-  wrap.dataset.docId   = docId || '';
-  wrap.dataset.groupId = gid;
-  wrap.dataset.ts      = data.ts || '';
-  wrap.innerHTML = `<div class="msg-swipe-wrapper"><div class="msg-bubble-wrap"><div class="msg-inner">
-    <div class="msg-bubble" style="padding:4px;background:transparent">
-      <div class="msg-media loading" data-group-id="${esc(gid)}">
-        <div class="media-decrypt-spinner"></div>
-        <div class="media-decrypt-label">${esc(_chunkProgressLabel(1, data.chunkOf, isMine))}</div>
-      </div>
-    </div>
-  </div></div></div>`;
-  // Snapshot position BEFORE appending — same rule as the live message
-  // listener: an incoming file from someone else only sticks the view to
-  // the bottom if the user was already there; otherwise just show the FAB.
-  const _wasNearBottom = (area.scrollHeight - area.scrollTop - area.clientHeight) < 120;
-  area.appendChild(wrap);
-  if (isMine || _wasNearBottom) scrollBottom();
-  else showScrollFab();
-}
 
-function _updateChunkProgressBubble(gid, have, total) {
-  const el = document.querySelector(`[data-group-id="${CSS.escape(gid)}"] .media-decrypt-label`);
-  if (!el) return;
-  const isMine = el.closest('.msg-wrapper')?.classList.contains('sent');
-  el.textContent = _chunkProgressLabel(have, total, isMine);
-}
 
-function _removeChunkProgressBubble(gid) {
-  document.querySelectorAll(`[data-group-id="${CSS.escape(gid)}"]`).forEach(el => (el.closest('.msg-wrapper') || el).remove());
-}
 
 /** Called when a chunk group has gone CHUNK_STALL_MS without completing —
  * replaces its progress bubble (if still showing) with an explicit failure
  * state so viewers aren't left staring at a "Receiving…" bubble that will
  * never resolve, with no way to tell a slow upload from a dead one. */
-function _markChunkGroupFailed(gid) {
-  const g = _chunkGroups[gid];
-  if (!g) return;
-  const have = Object.keys(g.parts).length;
-  const total = g.total;
-  delete _chunkGroups[gid];
-  const el = document.querySelector(`[data-group-id="${CSS.escape(gid)}"]`);
-  if (el) {
-    el.classList.remove('loading');
-    el.innerHTML = `<div class="msg-media-err">File didn't finish uploading — only ${have} of ${total} parts arrived. Ask the sender to resend.</div>`;
-  }
-  _log('warn', `[MIUT media] chunk group ${gid} marked failed after stalling at ${have}/${total} parts`);
-}
 
-function assembleChunk(data, docId) {
-  const gid = data.groupId;
-  if (!gid) { _log('warn', '[MIUT media] chunk doc has no groupId, cannot assemble:', docId, data); return; }
-  const isNewGroup = !_chunkGroups[gid];
-  if (isNewGroup) {
-    _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId, firstSeenAt: Date.now() };
-    setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 8000);
-    setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 30000);
-    setTimeout(() => {
-      const g = _chunkGroups[gid];
-      if (g && Object.keys(g.parts).length < g.total) _markChunkGroupFailed(gid);
-    }, CHUNK_STALL_MS);
-  }
-  _chunkGroups[gid].parts[data.chunkIdx] = data.encData;
-  if (data.chunkIdx === 0) { _chunkGroups[gid].meta = data; _chunkGroups[gid].docId = docId; }
-  const g = _chunkGroups[gid];
-  const have = Object.keys(g.parts).length;
-  _log('debug', `[MIUT media] chunk ${data.chunkIdx}/${g.total - 1} received for group ${gid} (${have}/${g.total} so far)`);
-
-  if (isNewGroup) _renderChunkProgressBubble(gid, data, docId);
-  else _updateChunkProgressBubble(gid, have, g.total);
-
-  if (have === g.total) {
-    // Sanity-check every part actually has content before assembling —
-    // an empty/undefined part here (e.g. a chunk write that partially
-    // failed) would silently produce a corrupted encData string that then
-    // fails decryption with no obvious reason.
-    const missing = [];
-    for (let i = 0; i < g.total; i++) if (!g.parts[i]) missing.push(i);
-    if (missing.length) {
-      _log('error', `[MIUT media] group ${gid} reports complete (${have}/${g.total}) but part(s) are empty:`, missing, '— assembling anyway, but decryption will likely fail');
-    }
-    const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
-    delete _chunkGroups[gid];
-    _log('debug', `[MIUT media] group ${gid} complete, assembled ${assembled.length} chars, rendering now`);
-    _removeChunkProgressBubble(gid);
-    // Guard: if the primary doc (chunk 0) was already rendered (e.g. history
-    // fetch processed it before all chunks arrived), remove the placeholder
-    // first so we replace it rather than appending a duplicate.
-    const _existingWrap = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(g.docId)}"]`);
-    if (_existingWrap) _existingWrap.remove();
-    renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
-  }
-}
 
 /**
  * _healIncompleteChunkGroups — large images/videos are split across many
@@ -4811,32 +4407,6 @@ function assembleChunk(data, docId) {
  * any group still missing pieces, so the file completes regardless of
  * where its chunks happen to fall relative to a page cutoff.
  */
-async function _healIncompleteChunkGroups() {
-  const gids = Object.keys(_chunkGroups);
-  if (!gids.length || !state.roomCode) return;
-  for (const gid of gids) {
-    const g = _chunkGroups[gid];
-    if (!g || Object.keys(g.parts).length >= g.total) continue;
-    try {
-      const snap = await db.collection('rooms').doc(state.roomCode)
-        .collection('messages').where('groupId', '==', gid).get();
-      snap.forEach(doc => {
-        const d = doc.data();
-        if (g.parts[d.chunkIdx] === undefined) {
-          g.parts[d.chunkIdx] = d.encData;
-          if (d.chunkIdx === 0) { g.meta = d; g.docId = doc.id; }
-        }
-      });
-      // Re-check the group is still pending (another path — e.g. the live
-      // listener — could have completed and deleted it while we awaited above).
-      if (_chunkGroups[gid] && Object.keys(g.parts).length === g.total) {
-        const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
-        delete _chunkGroups[gid];
-        await renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
-      }
-    } catch (e) { _log('warn', '[MIUT] Could not heal chunk group', gid, e); }
-  }
-}
 
 function addSwipeReply(wrap, data, plainText) {
   if (data.type !== 'text') return;  // only swipe-reply on text messages
@@ -5693,94 +5263,8 @@ function clearSearch() {
   const inp = $('search-bar')?.querySelector('input'); if (inp) inp.value = '';
   const c = $('search-count'); if (c) c.textContent = '';
 }
-async function decryptAndShow(encData, mime, type, fileName, domId) {
-  if (!encData) {
-    _log('warn', '[MIUT media] decryptAndShow called with empty/missing encData — nothing to decrypt:', domId, { type, fileName });
-    const el0 = $(domId);
-    if (el0) el0.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">Media unavailable</div>`;
-    return;
-  }
-  const cacheKey = 'blob_' + btoa(encData.slice(0, 32).replace(/[^a-zA-Z0-9]/g,'').padEnd(8,'0')).slice(0,16);
 
-  let url = null;
-
-  // Check IDB for cached bytes first
-  const cachedBytes = await idbGetBlob(cacheKey).catch(e => { _log('debug', '[MIUT media] IDB cache miss/error (not fatal, will re-decrypt):', domId, e); return null; });
-  if (cachedBytes) {
-    try {
-      const blob = new Blob([cachedBytes], { type: mime });
-      url = URL.createObjectURL(blob);
-      _log('debug', '[MIUT media] served from IDB cache:', domId);
-    } catch (e) { _log('debug', '[MIUT media] cached blob construction failed, falling through to re-decrypt:', domId, e); }
-  }
-
-  if (!url) {
-    try {
-      const blob  = await decBytes(encData, mime, state.roomCode);
-      url = URL.createObjectURL(blob);
-      // Store raw bytes (not the blob: URL) so cache survives page reloads
-      const arrBuf = await blob.arrayBuffer();
-      await idbSetBlob(cacheKey, new Uint8Array(arrBuf));
-      _log('debug', '[MIUT media] decrypted fresh and cached:', domId, { bytes: arrBuf.byteLength });
-    } catch (e) {
-      // This is the single most likely place for "the file is in Firestore
-      // but never renders" to actually originate — decBytes throws for
-      // several distinct reasons (wrong/rotated epoch key, corrupted/
-      // truncated encData from an incompletely-healed chunk group, a
-      // malformed base64 payload) that all looked identical from the UI:
-      // just a quiet "This message could not be decrypted" with nothing in
-      // the console before now. Logging the real error here is the key
-      // diagnostic for tracking that bug down for real.
-      _log('error', '[MIUT media] decryption FAILED — this is why the media never rendered:', domId, { type, mime, encDataLength: encData?.length }, e);
-      const el = $(domId);
-      if (el) el.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">This message could not be decrypted</div>`;
-      return;
-    }
-  }
-
-  const el = $(domId);
-  if (!el) {
-    _log('warn', '[MIUT media] decryption succeeded but the placeholder element is gone from the DOM — media decrypted into nothing:', domId, '(the wrap was likely removed/replaced — e.g. re-rendered, deleted, or the room was left — between when decrypt started and finished)');
-    return;
-  }
-
-  if (type === 'image') {
-    // esc() escapes HTML entities, not JS string chars — fragile inside onclick="...".
-    const img = document.createElement('img');
-    img.src = url; img.alt = 'image'; img.loading = 'lazy'; img.style.cursor = 'pointer';
-    img.addEventListener('click', () => openViewer('img', url));
-    const hint = document.createElement('div');
-    hint.className = 'media-tap-hint'; hint.textContent = 'Tap to expand';
-    el.innerHTML = ''; el.appendChild(img); el.appendChild(hint);
-    el.classList.remove('loading');
-
-  } else if (type === 'video') {
-    const thumb = document.createElement('div');
-    thumb.className = 'video-thumb';
-    thumb.innerHTML = `<div class="video-play-btn"><svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28"><path d="M8 5v14l11-7z"/></svg></div><div class="video-label">${esc(fileName||'Video')}</div>`;
-    thumb.addEventListener('click', () => openViewer('video', url));
-    el.innerHTML = ''; el.appendChild(thumb);
-    el.classList.remove('loading');
-
-  } else {
-    // File — show download link
-    const size = esc(fmtBytes(el.dataset?.size || 0));
-    el.outerHTML = `<a class="msg-file" href="${esc(url)}" download="${esc(fileName||'file')}" target="_blank" rel="noopener">
-      <div class="file-icon"><svg viewBox="0 0 20 20" fill="none" width="22" height="22">
-        <path d="M4 4a2 2 0 012-2h5l5 5v9a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" stroke="currentColor" stroke-width="1.5"/>
-        <path d="M11 2v5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-      </svg></div>
-      <div class="file-info">
-        <div class="file-name">${esc(fileName||'File')}</div>
-      </div>
-      <div class="file-dl"><svg viewBox="0 0 20 20" fill="none" width="16" height="16">
-        <path d="M10 3v10M6 9l4 4 4-4M4 17h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg></div>
-    </a>`;
-  }
-}
-
-function showScrollFab() {
+export function showScrollFab() {
   const area = $('messages-area');
   const fab   = $('scroll-fab');
   if (!area || !fab) return;
@@ -5824,7 +5308,7 @@ function initScrollFab() {
 
 
 let _scrollDebounce = null;
-function scrollBottom() {
+export function scrollBottom() {
   // Debounce: during a batch of message renders only scroll once at the end
   if (_scrollDebounce) return;
   _scrollDebounce = requestAnimationFrame(() => {
@@ -5855,21 +5339,6 @@ if (window.visualViewport) {
   });
 }
 
-function openViewer(type, src) {
-  const v = $('media-viewer'), img = $('mv-img'), vid = $('mv-video');
-  if (!v) return;
-  if (img) { img.src = ''; img.style.display = 'none'; }
-  if (vid) { vid.src = ''; vid.style.display = 'none'; }
-  if (type === 'img'   && img) { img.src = src; img.style.display = 'block'; }
-  if (type === 'video' && vid) { vid.src = src; vid.style.display = 'block'; }
-  v.style.display = 'flex';
-}
-function closeMediaViewer() {
-  const v = $('media-viewer'); if (!v) return;
-  v.style.display = 'none';
-  const vid = $('mv-video'); if (vid) { vid.pause?.(); vid.src = ''; }
-  const img = $('mv-img');   if (img) img.src = '';
-}
 
 function copyRoomCode() {
   if (!state.roomCode) return;
@@ -6156,7 +5625,7 @@ async function handleLogout() {
     // Ask how the session went — anonymous, skippable, stored in /feedback
     // (a sibling of /rooms in Firestore). Runs even if a step above failed,
     // so a network hiccup never silently swallows the prompt.
-    showFeedbackModal(_leavingRoomCode).catch(() => {});
+    _loadFeedback().then(m => m.showFeedbackModal(_leavingRoomCode)).catch(() => {});
   }
 
   // ── Background network cleanup (fire-and-forget) ───────────────────────
@@ -6347,240 +5816,6 @@ function showConfirm(title, msg, confirmLabel = 'CONFIRM') {
   });
 }
 
-// ─── Post-leave feedback ───────────────────────────────────────────────────
-// Firestore layout: feedback lives in its own TOP-LEVEL collection, a sibling
-// of 'rooms' — i.e. /rooms/{roomCode} and /feedback/{feedbackId} — rather than
-// a subcollection of the room. This is deliberate: a room (and its
-// subcollections) can be wiped/auto-deleted a few minutes after everyone
-// leaves (see functions/api/cleanup.js), but feedback should outlive that
-// cleanup so it can actually be reviewed later. It only stores which
-// roomCode it refers to, never a member id/name, matching Miut's
-// "no digital footprint" privacy model.
-//
-// NOT centralized: this writes to `db` — whichever shard the room the
-// person was just in happens to live on. With multiple shards (see
-// db-manager.js), that means feedback is scattered across each shard
-// project's own /feedback collection, not collected in one place. Checking
-// feedback means checking every active shard project's console.
-//
-// Required Firestore Security Rule — see firestore.rules in this repo
-// (apply the SAME rule to every shard project's console individually;
-// Firestore rules are per-project, there's no way to apply one rule file
-// to multiple projects automatically):
-//
-//   match /feedback/{feedbackId} {
-//     allow create: if request.auth != null
-//       && request.resource.data.keys().hasOnly(['roomCode','rating','tags','comment','appVersion','createdAt'])
-//       && request.resource.data.rating is int
-//       && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
-//       && request.resource.data.comment is string
-//       && request.resource.data.comment.size() <= 500
-//       && request.resource.data.tags is list && request.resource.data.tags.size() <= 6
-//       && request.resource.data.createdAt == request.time;
-//     allow read, update, delete: if false; // write-only from the client
-//   }
-
-let _fbRating = 0;
-const _fbTags = new Set();
-
-function _fbResolveEls() {
-  return {
-    overlay:   $('feedback-modal'),
-    title:     $('feedback-title'),
-    lead:      $('feedback-lead'),
-    roomLbl:   $('feedback-room-code'),
-    stars:     $('feedback-stars'),
-    ratingLbl: $('feedback-rating-label'),
-    tagsWrap:  $('feedback-tags'),
-    comment:   $('feedback-comment'),
-    charCount: $('feedback-charcount'),
-    submitBtn: $('feedback-submit-btn'),
-    submitLbl: $('feedback-submit-label'),
-    skipBtn:   $('feedback-skip-btn'),
-    closeBtn:  $('feedback-close-btn'),
-  };
-}
-
-// Copy for the two contexts this one modal is used in: the existing
-// post-leave survey, and the new "report a problem right now" entry point
-// reachable from the sidebar at any time during a session. Same modal, same
-// /feedback collection, same Firestore rule — just different framing so it
-// reads naturally in each context. The live-report comment gets a "[LIVE] "
-// prefix (see _fbSubmit) so entries made mid-session are distinguishable
-// from the post-session survey without needing a schema/rules change.
-const _FB_COPY = {
-  session: {
-    title: 'QUICK FEEDBACK',
-    lead: `You've left <strong id="feedback-room-code">the room</strong>. Mind rating your session? It's completely anonymous and helps us improve MiutChat.`,
-    submitLabel: 'SEND FEEDBACK',
-  },
-  live: {
-    title: 'REPORT A PROBLEM',
-    lead: `Something not working right? Let us know what's going on — this is completely anonymous and goes straight to the people building MiutChat.`,
-    submitLabel: 'SEND REPORT',
-  },
-};
-
-const _FB_RATING_LABELS = { 0: 'Tap a star to rate', 1: 'Poor', 2: 'Fair', 3: 'Good', 4: 'Great', 5: 'Excellent' };
-
-function _fbRenderStars() {
-  const { stars, ratingLbl, submitBtn } = _fbResolveEls();
-  if (!stars) return;
-  stars.querySelectorAll('.star-btn').forEach(btn => {
-    btn.classList.toggle('filled', +btn.dataset.value <= _fbRating);
-  });
-  if (ratingLbl) {
-    ratingLbl.textContent = _FB_RATING_LABELS[_fbRating] || '';
-    ratingLbl.classList.toggle('rated', _fbRating > 0);
-  }
-  if (submitBtn) submitBtn.disabled = _fbRating === 0;
-}
-
-function _fbReset() {
-  _fbRating = 0;
-  _fbTags.clear();
-  const { tagsWrap, comment, charCount } = _fbResolveEls();
-  if (tagsWrap) tagsWrap.querySelectorAll('.tag-chip').forEach(c => c.classList.remove('active'));
-  if (comment) comment.value = '';
-  if (charCount) charCount.textContent = '0';
-  _fbRenderStars();
-}
-
-/**
- * Shows the feedback modal in one of two modes:
- *   'session' (default) — the existing post-leave survey.
- *   'live' — "report a problem", reachable from the sidebar at any time
- *            during an active session, for the person who wants to flag
- *            something wrong without waiting until they leave.
- * Resolves once the user has either submitted, skipped, or dismissed it —
- * never rejects, so callers can just `await` it without a try/catch.
- */
-function showFeedbackModal(roomCode, mode) {
-  return new Promise(resolve => {
-    const { overlay, title, lead } = _fbResolveEls();
-    if (!overlay) { resolve(); return; }
-
-    mode = (mode === 'live') ? 'live' : 'session';
-    const copy = _FB_COPY[mode];
-    if (title) title.textContent = copy.title;
-    if (lead) lead.innerHTML = copy.lead;
-    const { roomLbl, submitLbl } = _fbResolveEls(); // re-resolve: 'session' mode just recreated #feedback-room-code
-    if (roomLbl) roomLbl.textContent = roomCode ? `“${roomCode}”` : 'the room';
-    if (submitLbl) submitLbl.textContent = copy.submitLabel;
-
-    _fbReset();
-    overlay.style.display = 'flex';
-
-    const done = () => { overlay.style.display = 'none'; resolve(); };
-    overlay.dataset.roomCode = roomCode || '';
-    overlay.dataset.mode = mode;
-    overlay._fbDone = done;
-
-    setTimeout(() => $('feedback-close-btn')?.focus(), 40);
-  });
-}
-
-/** Sidebar "Report a problem" entry point — usable any time mid-session. */
-function openLiveReportModal() {
-  if (typeof closeSidebar === 'function') closeSidebar();
-  showFeedbackModal(state.roomCode, 'live').catch(() => {});
-}
-
-async function _fbSubmit() {
-  const { overlay, submitBtn, comment } = _fbResolveEls();
-  if (!overlay || _fbRating === 0 || !overlay._fbDone) return;
-
-  const roomCode = overlay.dataset.roomCode || '';
-  const mode = overlay.dataset.mode === 'live' ? 'live' : 'session';
-  // "[LIVE] " prefix marks this as a mid-session report rather than the
-  // post-leave survey, within the comment field the rule already allows —
-  // no schema or rule change needed to tell the two apart later.
-  const prefix = mode === 'live' ? '[LIVE] ' : '';
-  const commentText = (prefix + (comment?.value || '').trim()).slice(0, 500);
-
-  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'SENDING…'; }
-
-  try {
-    const database = (typeof db !== 'undefined' && db) ? db : null;
-    if (database) {
-      await database.collection('feedback').add({
-        roomCode,
-        rating:     _fbRating,
-        tags:       Array.from(_fbTags),
-        comment:    commentText,
-        appVersion: typeof APP_VERSION !== 'undefined' ? APP_VERSION : '',
-        createdAt:  firebase.firestore.FieldValue.serverTimestamp(),
-      });
-    }
-    _fbShowThanks(mode);
-    setTimeout(() => overlay._fbDone && overlay._fbDone(), 1400);
-  } catch (e) {
-    _log('warn', '[MIUT] Feedback submit failed:', e);
-    toast('Feedback', "Couldn't send — thanks for trying!", 'alert');
-    overlay._fbDone();
-  }
-}
-
-function _fbShowThanks(mode) {
-  const body = document.querySelector('#feedback-modal .modal-body');
-  if (!body) return;
-  const title = mode === 'live' ? 'REPORT SENT' : 'THANKS FOR THE FEEDBACK';
-  const sub   = mode === 'live'
-    ? 'Thanks for flagging it — we\'ll take a look.'
-    : 'It helps us make MiutChat better for everyone.';
-  body.innerHTML = `
-    <div class="feedback-submitted">
-      <svg viewBox="0 0 24 24" width="40" height="40" fill="none">
-        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6"/>
-        <path d="M7.5 12.5l3 3 6-6.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      <div class="feedback-submitted-title">${title}</div>
-      <div class="feedback-submitted-sub">${sub}</div>
-    </div>`;
-}
-
-function _fbSkip() {
-  const { overlay } = _fbResolveEls();
-  if (overlay?._fbDone) overlay._fbDone();
-}
-
-function _fbWireOnce() {
-  const { overlay, stars, tagsWrap, comment, charCount, submitBtn, skipBtn, closeBtn } = _fbResolveEls();
-  if (!overlay || overlay.dataset.wired) return;
-  overlay.dataset.wired = '1';
-
-  stars?.addEventListener('click', e => {
-    const btn = e.target.closest('.star-btn');
-    if (!btn) return;
-    const firstRating = _fbRating === 0;
-    _fbRating = +btn.dataset.value;
-    _fbRenderStars();
-    // Open the keyboard on the comment box right after a first rating —
-    // saves a tap, and the low-contrast placeholder fix above means people
-    // can actually read what they're being asked once it's focused.
-    if (firstRating) setTimeout(() => comment?.focus(), 200);
-  });
-
-  tagsWrap?.addEventListener('click', e => {
-    const chip = e.target.closest('.tag-chip');
-    if (!chip) return;
-    const tag = chip.dataset.tag;
-    if (_fbTags.has(tag)) { _fbTags.delete(tag); chip.classList.remove('active'); }
-    else if (_fbTags.size < 6) { _fbTags.add(tag); chip.classList.add('active'); }
-  });
-
-  comment?.addEventListener('input', () => {
-    if (charCount) charCount.textContent = String(comment.value.length);
-  });
-
-  submitBtn?.addEventListener('click', () => _fbSubmit());
-  skipBtn?.addEventListener('click', () => _fbSkip());
-  closeBtn?.addEventListener('click', () => _fbSkip());
-  overlay.addEventListener('click', e => { if (e.target === overlay) _fbSkip(); });
-
-  $('btn-report-problem')?.addEventListener('click', () => openLiveReportModal());
-}
-
 function showError(msg, type) {
   const el = $('join-error'); if (!el) return;
   el.textContent = msg;
@@ -6652,14 +5887,14 @@ function setupClipboardPaste() {
       if (item.type.startsWith('image/')) {
         e.preventDefault();
         const file = item.getAsFile();
-        if (file) await handleFileAttach({ target: { files: [file], value: '' } });
+        if (file) { try { await (await _loadFileTransfer()).handleFileAttach({ target: { files: [file], value: '' } }); } catch {} }
         return;
       }
     }
   });
 }
 
-function updateActionBtn() {
+export function updateActionBtn() {
   const btn = $('send-btn');
   if (!btn) return;
   const hasText = ($('msg-input')?.value || '').trim().length > 0;
@@ -6742,7 +5977,7 @@ function _notifyRoomEvent(type, extra = {}) {
   } catch {}
 }
 
-function _notifyRoomOfNewMessage() {
+export function _notifyRoomOfNewMessage() {
   if (!state.me?.id) return;
   _notifyRoomEvent('message');
 }
@@ -6754,7 +5989,7 @@ function _getAudioCtx() {
   return _audioCtx;
 }
 
-function playSound(type) {
+export function playSound(type) {
   if (!state.prefs.sound) return;
   try {
     const ctx  = _getAudioCtx();
@@ -6792,7 +6027,7 @@ function _toastIcon(i) {
   if (i && i.startsWith('<')) return i;
   return _TOAST_ICONS[i] || _TOAST_ICONS['dot'];
 }
-function toast(title, msg, icon='dot') {
+export function toast(title, msg, icon='dot') {
   const c = $('toast-container'); if (!c) return null;
   const el = document.createElement('div');
   el.className = 'toast';
@@ -6971,10 +6206,10 @@ function _wireAllHandlers() {
   });
 
   // ── File inputs ───────────────────────────────────────────────────────────────
-  on('file-input-camera', 'change', e => handleFileAttach(e));
-  on('file-input-photo',  'change', e => handleFileAttach(e));
-  on('file-input-video',  'change', e => handleFileAttach(e));
-  on('file-input-file',   'change', e => handleFileAttach(e));
+  on('file-input-camera', 'change', async e => { try { (await _loadFileTransfer()).handleFileAttach(e); } catch {} });
+  on('file-input-photo', 'change', async e => { try { (await _loadFileTransfer()).handleFileAttach(e); } catch {} });
+  on('file-input-video', 'change', async e => { try { (await _loadFileTransfer()).handleFileAttach(e); } catch {} });
+  on('file-input-file', 'change', async e => { try { (await _loadFileTransfer()).handleFileAttach(e); } catch {} });
 
   // ── Member detail panel ──────────────────────────────────────────────────────
   on('member-detail-close-btn', 'click', () => closeMemberDetail());
@@ -7012,38 +6247,85 @@ function _wireAllHandlers() {
   if (installBtn) installBtn.addEventListener('click', () => triggerPWAInstall());
 
   // ── Media viewer ──────────────────────────────────────────────────────────────
-  on('media-viewer', 'click', () => closeMediaViewer());
-  on('mv-close',     'click', e => { e.stopPropagation(); closeMediaViewer(); });
+  on('media-viewer', 'click', () => _loadFileTransfer.peek()?.closeMediaViewer());
+  on('mv-close',     'click', e => { e.stopPropagation(); _loadFileTransfer.peek()?.closeMediaViewer(); });
 
   // ── Post-leave feedback modal ────────────────────────────────────────────────
-  _fbWireOnce();
+  on('btn-report-problem', 'click', () => openLiveReportModal());
 
   // ── Version label (Settings) — single unified source, see version.js ─────────
   const _vLabel = $('app-version-label');
   if (_vLabel) _vLabel.textContent = 'MIUT v' + (typeof APP_VERSION !== 'undefined' ? APP_VERSION : '?');
 }
 
-// ── Public API — only these names escape the IIFE onto window ─────────────────
-Object.assign(_W, {
+// ── Public API for classic (non-module) scripts that still read these as
+// globals — sw-bridge.js, security.js hooks, inline usage, etc. ───────────────
+Object.assign(window, {
   switchJoinTab, handleCreate, handleEnter, toggleVis, updateEntropyMeter, _wireEntropyListeners,
   _wireAllHandlers,
   cancelJoinRequest, checkInviteCode, joinFromInvite, cancelInvite,
   handleLogout, openSettings, closeSettings, closeModal, saveSettings,
   toggleSoundAlerts, toggleAnimations, toggleEnterToSend, toggleApprovalGate, rotateKey,
   triggerPWAInstall, copyRoomCode, shareRoomLink, toggleSearch, doSearch,
-  closeMediaViewer, handleFileAttach, triggerAttach, handleKey, handleTyping, clearReply,
+  handleKey, handleTyping, clearReply,
   setRoomTtl, toggleSidebar, closeSidebar,
   toast, startChatListeners, stopChatListeners,
-  showFeedbackModal,
   get state() { return state; },
   get db()    { return db; },
 });
 
 // Expose security module integration helpers for operator use
-if (typeof registerHook === 'function') _W.registerHook = registerHook;
-if (typeof runHooks     === 'function') _W.runHooks     = runHooks;
-if (typeof HOOK_EVENTS  !== 'undefined') _W.HOOK_EVENTS = HOOK_EVENTS;
-if (typeof isEnabled    === 'function') _W.isEnabled    = isEnabled;
-if (typeof setFlag      === 'function') _W.setFlag      = setFlag;
-if (typeof enforceRateLimit === 'function') _W.enforceRateLimit = enforceRateLimit;
-})(window);
+if (typeof registerHook === 'function') window.registerHook = registerHook;
+if (typeof runHooks     === 'function') window.runHooks     = runHooks;
+if (typeof HOOK_EVENTS  !== 'undefined') window.HOOK_EVENTS = HOOK_EVENTS;
+if (typeof isEnabled    === 'function') window.isEnabled    = isEnabled;
+if (typeof setFlag      === 'function') window.setFlag      = setFlag;
+if (typeof enforceRateLimit === 'function') window.enforceRateLimit = enforceRateLimit;
+
+function buildMediaPlaceholder(uid, data) {
+  if (data.type === 'file') return `<div class="msg-media loading" id="${uid}"><div class="media-decrypt-spinner"></div><div class="media-decrypt-label">${esc(data.fileName || 'File')} · Decrypting…</div></div>`;
+  return `<div class="msg-media loading" id="${uid}"><div class="media-decrypt-spinner"></div><div class="media-decrypt-label">Decrypting ${data.type}…</div></div>`;
+}
+
+function openLiveReportModal() {
+  closeSidebar();
+  _loadFeedback().then(m => m.showFeedbackModal(state.roomCode, 'live')).catch(() => {});
+}
+
+function toggleAttachTabs() {
+  const tabs = document.getElementById('attach-tabs'), btn = document.getElementById('attach-btn');
+  if (!tabs) return;
+  const opening = !tabs.classList.contains('open');
+  tabs.classList.toggle('open', opening);
+  btn?.setAttribute('aria-expanded', opening ? 'true' : 'false');
+}
+
+function closeAttachTabs() {
+  document.getElementById('attach-tabs')?.classList.remove('open');
+  document.getElementById('attach-btn')?.setAttribute('aria-expanded', 'false');
+}
+
+function _lazyModule(importer, label) {
+  let mod = null, promise = null, attempts = 0;
+  const load = () => {
+    if (!promise) {
+      promise = importer(attempts++ ? '?r=' + attempts : '')
+        .then(m => (mod = m))
+        .catch(err => {
+          promise = null;
+          toast("Couldn't load " + label, 'Check your connection and try again', 'err');
+          _log('error', '[MIUT] ' + label + ' module failed to load:', err?.message || err);
+          throw err;
+        });
+    }
+    return promise;
+  };
+  load.peek = () => mod;
+  return load;
+}
+
+const _loadFileTransfer = _lazyModule(q => import('./lazy/file-transfer.js' + q), 'file sharing');
+const _loadFeedback = _lazyModule(q => import('./lazy/feedback.js' + q), 'feedback');
+
+window.__MIUT_APP_READY__ = true;
+document.dispatchEvent(new CustomEvent('miut-app:ready'));

@@ -44,7 +44,7 @@ const fs   = require('fs');
 const path = require('path');
 
 const PATCH_CAP = 50;               // 1.0.50 is the highest patch — next bump rolls to 1.1.0
-const PKG_PATH  = path.join(__dirname, 'package.json');
+const PKG_PATH  = path.join(__dirname, '..', 'package.json');
 
 function parseVersion(v) {
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(v || '0.0.0').trim());
