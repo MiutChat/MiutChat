@@ -449,6 +449,16 @@ async function enc(text, code, senderId) {
     return out;
   } catch { return ''; }
 }
+function _primeCrypto(code, epoch, salt) {
+  if (!code) return;
+  MiutCryptoBridge.init().then(() => MiutCryptoBridge.primeKey?.(code, epoch, salt || undefined)).catch(() => {});
+}
+
+function _setLoadingLabel(btn, text) {
+  const span = btn?.querySelector('span');
+  if (span && btn.disabled) span.textContent = text;
+}
+
 export async function dec(payload, code, senderId) {
   if (!payload) return '';
   // Not an "x1:" envelope — this is a message encrypted under a format
@@ -496,7 +506,12 @@ export async function dec(payload, code, senderId) {
 const _EC_ALGO = { name: 'ECDSA', namedCurve: 'P-256' };
 const _EC_SIGN = { name: 'ECDSA', hash: 'SHA-256' };
 
-async function initSigningKey() {
+let _sigInitInFlight = null;
+function initSigningKey() {
+  if (!_sigInitInFlight) _sigInitInFlight = _initSigningKeyImpl().finally(() => { _sigInitInFlight = null; });
+  return _sigInitInFlight;
+}
+async function _initSigningKeyImpl() {
   try {
     const idb = await openIDB();
     const row = await new Promise((res, rej) => {
@@ -1014,6 +1029,8 @@ function loadSession() { try { return JSON.parse(localStorage.getItem(CONFIG.SES
 function saveRoom(c)   { localStorage.setItem(CONFIG.ROOM_KEY, c); }
 function loadRoom()    { return localStorage.getItem(CONFIG.ROOM_KEY); }
 
+const SPLASH_MIN_MS = 800;
+
 window.addEventListener('DOMContentLoaded', () => {
   _wireAllHandlers();
   _wireEntropyListeners();
@@ -1176,9 +1193,12 @@ function _showAnnouncementPopup(msg) {
   const saved = localStorage.getItem('nx_name');
   if (saved) { const el = $('input-name'); if (el) el.value = saved; }
 
-  // Splash → session restore.
-  // Always fires after 1800ms regardless of Firebase state.
-  setTimeout(() => {
+  // Splash → session restore. A resumable session starts immediately; every
+  // other route waits the short splash minimum below.
+  let _routed = false;
+  const _routeAfterSplash = () => {
+    if (_routed) return;
+    _routed = true;
     hideSplash();
     const inviteCode = _detectInviteParam();
     if (inviteCode) {
@@ -1237,7 +1257,14 @@ function _showAnnouncementPopup(msg) {
       }
     }
     showScreen('join-screen');
-  }, 1800);
+  };
+  const _resumeMe = loadSession(), _resumeRoom = loadRoom();
+  if (!window.location.search && !window.location.hash && _resumeMe?.id && _resumeRoom) {
+    _routed = true;
+    state.me = _resumeMe; state.roomCode = _resumeRoom;
+    checkApprovalAndBoot();
+  }
+  setTimeout(_routeAfterSplash, SPLASH_MIN_MS);
 });
 
 function hideSplash() { $('splash')?.classList.remove('active'); }
@@ -1356,7 +1383,6 @@ function resolveName() {
 }
 
 async function handleCreate() {
-  if (!(await checkRateLimit('create'))) return;
   const code = ($('input-create-code')?.value || '').trim();
   if (!validateRoomCode(code)) return;
 
@@ -1366,90 +1392,52 @@ async function handleCreate() {
     return;
   }
 
+  const rateLimitCheck = checkRateLimit('create');
   const btn = $('btn-create');
   setLoading(btn, true, 'Creating…');
   try {
-    // Resolve the room's SHARD first, then authenticate against THAT
-    // project — getUID() must never be called before getDb() (see
-    // ensureAuth's comment: auth is per-Firebase-project, not global).
     if (typeof getDb !== 'function') throw new Error('Database module not loaded. Please refresh.');
+    initSigningKey().catch(() => {});
     db = await getDb(code);
     const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
-    const uid = await getUID(_dbName);
+    const [uid, allowed] = await Promise.all([getUID(_dbName), rateLimitCheck]);
+    if (!allowed) { setLoading(btn, false); return; }
 
-    // Room codes are user-chosen (typed in, not randomly generated), so
-    // collisions are real: two different people can type the same
-    // memorable code, or the same person can reuse a code from a room
-    // that was supposed to have expired already. Since creation used to
-    // write with { merge: true } and never checked whether a room already
-    // existed at this path, "creating" a room whose code was already
-    // occupied silently merged into the EXISTING document instead of
-    // starting fresh — if that old room's messages/members subcollections
-    // hadn't actually been cleaned up yet (wipeRoom failing silently is a
-    // real possibility — see its own comment), the "new" room would
-    // immediately resurface someone else's old messages and members. This
-    // is very likely the cause of rooms reappearing after being "deleted."
-    // Fail closed instead: refuse to create over an existing room, rather
-    // than silently reusing whatever's there.
-    const existing = await db.collection('rooms').doc(code).get();
+    const existing = window.takeProbeSnap?.(code) || await db.collection('rooms').doc(code).get();
     if (existing.exists) {
       showError('That room code is already in use — pick a different one.');
       setLoading(btn, false);
       return;
     }
 
-    // Generate cryptographically random 16-byte salt for this room's PBKDF2
+    _setLoadingLabel(btn, 'Securing…');
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
     const roomSalt  = _b64uEnc(saltBytes.buffer);
     _roomSalt = roomSalt;
-    // autoDeleteAt = 30 min bootstrap safety net (independent of the Room
-    // Expiry preference below) — covers the case where the creator abandons
-    // the room before anyone ever properly joins. Once the room is actually
-    // used and later becomes empty, startPresenceListener takes over and
-    // reschedules autoDeleteAt based on inactivityTtlMs instead.
+    _primeCrypto(code, 0, roomSalt);
     const _autoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + 1800000);
-    // Every room document gets the FULL canonical field set at creation —
-    // no field is ever simply absent. Fields with no current value use an
-    // explicit null (or 0/[] as appropriate) rather than being left unset,
-    // so every room in the database has the identical shape and any field
-    // can be read without an `!== undefined` fallback. (null is safe here
-    // specifically for autoDeleteAt/emptyAt: Firestore's `<=` range queries,
-    // like the cleanup cron's, never match null or missing fields, so this
-    // doesn't risk the cron treating a null deadline as "already passed.")
-    // No longer { merge: true } — the existence check above already
-    // guarantees this path is empty, so a plain set() is both correct and
-    // makes it impossible to ever blend fields into pre-existing data.
+    const _selectedTtlBtn = document.querySelector('#create-ttl-selector .ttl-opt.active');
+    const _selectedTtlSec = parseInt(_selectedTtlBtn?.dataset?.ttl || '0', 10);
     await db.collection('rooms').doc(code).set({
       createdAt:        ts_now(),
       creatorId:        uid,
       epoch:            0,
       salt:             roomSalt,
       autoDeleteAt:     _autoDeleteAt,
-      inactivityTtlMs:  300000,   // 5 min — the "after everyone leaves" default
+      inactivityTtlMs:  300000,
       lastActivity:     ts_now(),
-      approvalRequired: true,     // set explicitly below too; kept here so the field always exists from creation
+      approvalRequired: true,
       emptyAt:          null,
-      msgTtlMs:         0,        // per-message expiry — off by default
-      blockedUsers:     [],       // see blockMember() — ids blocked by the admin, denied re-entry
+      msgTtlMs:         _selectedTtlSec > 0 ? _selectedTtlSec * 1000 : 0,
+      blockedUsers:     [],
     });
-    // Tell the registry this shard actually got a room — placement's
-    // load counter only counts confirmed creations, not picks (see
-    // db-manager.js's comment on _confirmRoomCreated for why that split
-    // matters). Fire-and-forget; a missed confirm is harmless.
     window.confirmRoomCreated?.(code, _dbName);
     _roomEpoch = 0;
+    if (_selectedTtlSec > 0) _roomTtlMs = _selectedTtlSec * 1000;
     state.me = await buildMe(resolveName(), _dbName); state.roomCode = code;
     saveSession(); saveRoom(code);
-    await registerPresence('admin', true);
-    // Approval gate is always on — no choice presented
-    // Apply user-selected message expiry (from create room TTL selector)
-    const _selectedTtlBtn = document.querySelector('#create-ttl-selector .ttl-opt.active');
-    const _selectedTtlSec = parseInt(_selectedTtlBtn?.dataset?.ttl || '0', 10);
-    const _createUpdates = { approvalRequired: true };
-    if (_selectedTtlSec > 0) _createUpdates.msgTtlMs = _selectedTtlSec * 1000;
-    await db.collection('rooms').doc(code).update(_createUpdates).catch(() => {});
-    if (_selectedTtlSec > 0) _roomTtlMs = _selectedTtlSec * 1000;
-    await sendSys(`${state.me.name} created this room`);
+    await registerPresence('admin', true, true);
+    sendSys(`${state.me.name} created this room`).catch(() => {});
     _ping('room_created');
     bootApp();
   } catch (e) { showSmartError(e, 'create'); }
@@ -1458,22 +1446,25 @@ async function handleCreate() {
 
 async function handleEnter() {
   if (!_checkEnterLock()) return;
-  if (!(await checkRateLimit('enter'))) return;
   const code = ($('input-room-code')?.value || '').trim();
   if (!validateRoomCode(code)) return;
+  const rateLimitCheck = checkRateLimit('enter');
 
   const btn = $('btn-enter');
   setLoading(btn, true, 'Connecting…');
   try {
-    // Resolve the room's SHARD first, then authenticate against THAT
-    // project — see ensureAuth's comment for why order matters here.
+    initSigningKey().catch(() => {});
     db = await getDb(code);
     let _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
     _log('log', `[MIUT handleEnter] room=${code} resolved shard=${_dbName}`);
-    let uid = await getUID(_dbName);
+    const [_firstUid, _allowed] = await Promise.all([getUID(_dbName), rateLimitCheck]);
+    if (!_allowed) { setLoading(btn, false); return; }
+    let uid = _firstUid;
     _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — reading room doc`);
+    let _memberRead = db.collection('rooms').doc(code).collection('members').doc(uid).get().catch(() => null);
     let roomSnap = await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
+      _memberRead = null;
       _log('warn', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc does not exist on this shard`);
       if (window.isRoomExpired?.(code)) {
         showError('This room has expired and was deleted.');
@@ -1522,14 +1513,16 @@ async function handleEnter() {
       return;
     }
     // Check if room has expired before entering
-    const _expired = await _checkRoomExpiry(code, db);
+    _setLoadingLabel(btn, 'Joining…');
+    const _expired = await _checkRoomExpiry(code, db, roomSnap);
     if (_expired) { setLoading(btn, false); return; }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     _healRoomSchema(code, roomSnap.data()).catch(() => {});
+    _primeCrypto(code, _roomEpoch, _roomSalt);
 
-    const memberSnap  = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
+    const memberSnap  = (_memberRead && await _memberRead) || await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData    = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
     _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — member doc exists=${memberSnap.exists} approved=${prevData?.approved} role=${prevData?.role} declined=${prevData?.declined}`);
@@ -1540,8 +1533,8 @@ async function handleEnter() {
     if (wasApproved) {
       // Returning approved member — skip the queue
       const role = prevData.role || 'member';
-      await registerPresence(role, true);
-      await sendSys(`${state.me.name} rejoined the room`);
+      await registerPresence(role, true, false, prevData);
+      sendSys(`${state.me.name} rejoined the room`).catch(() => {});
       bootApp();
     } else if (prevData && prevData.declined) {
       // Was explicitly declined by admin
@@ -1556,13 +1549,13 @@ async function handleEnter() {
 
       if (approvalRequired) {
         // Gate — register as pending and show waiting screen
-        await registerPresence('member', false);
+        await registerPresence('member', false, !prevData, prevData);
         _notifyRoomEvent('join-request'); // admins only — see functions/api/notify.js
         showWaitingScreen();
       } else {
         // Open room — approve immediately and boot
-        await registerPresence('member', true);
-        await sendSys(`${state.me.name} joined the room`);
+        await registerPresence('member', true, !prevData, prevData);
+        sendSys(`${state.me.name} joined the room`).catch(() => {});
         _notifyRoomEvent('member-joined'); // everyone else already in the room
         bootApp();
       }
@@ -1581,18 +1574,20 @@ async function buildMe(name, dbName) {
 // When the creator needs admin+approved=true, we do:
 //   1. .set() with role='member', approved=false  (satisfies create rule)
 //   2. .update() with role='admin', approved=true  (satisfies update rule — they are now a member)
-async function registerPresence(role = 'member', approved = false) {
+async function registerPresence(role = 'member', approved = false, knownNew = false, knownData = null) {
   await initSigningKey();
   const ref = db.collection('rooms').doc(state.roomCode)
                  .collection('members').doc(state.me.id);
 
   // Read existing doc — determines whether this is a create or update path.
   // This prevents overwriting an approved member's role/approved with defaults.
-  let existingData = null;
-  try {
-    const snap = await ref.get();
-    existingData = snap.exists ? snap.data() : null;
-  } catch (_e) { /* ignore — will attempt create below */ }
+  let existingData = knownData;
+  if (!knownNew && !knownData) {
+    try {
+      const snap = await ref.get();
+      existingData = snap.exists ? snap.data() : null;
+    } catch (_e) { /* ignore — will attempt create below */ }
+  }
 
   if (!existingData) {
     // ── First join: CREATE with role='member' / approved=false (enforced by rules) ──
@@ -1715,11 +1710,13 @@ async function checkApprovalAndBoot(_retryCount) {
       return;
     }
 
+    const _memberRead = db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id).get().catch(() => null);
     const roomSnap = await db.collection('rooms').doc(state.roomCode).get();
     _log('log', `[MIUT checkApprovalAndBoot] room=${state.roomCode} shard=${_dbName} uid=${_resumeUid} — room doc exists=${roomSnap.exists}`);
     if (roomSnap.exists) {
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
+      _primeCrypto(state.roomCode, _roomEpoch, _roomSalt);
       { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
       _healRoomSchema(state.roomCode, roomSnap.data()).catch(() => {});
     } else if (_retryCount < 2) {
@@ -1732,7 +1729,7 @@ async function checkApprovalAndBoot(_retryCount) {
       return;
     }
 
-    const snap = await db.collection('rooms').doc(state.roomCode)
+    const snap = (await _memberRead) || await db.collection('rooms').doc(state.roomCode)
       .collection('members').doc(state.me.id).get();
     _log('log', `[MIUT checkApprovalAndBoot] room=${state.roomCode} shard=${_dbName} uid=${_resumeUid} — member doc exists=${snap.exists} approved=${snap.data()?.approved} role=${snap.data()?.role}`);
 
@@ -3317,9 +3314,9 @@ async function _healRoomSchema(code, roomData) {
 }
 
 /** Check if room has expired (autoDeleteAt < now) and show expired screen */
-async function _checkRoomExpiry(code, db) {
+async function _checkRoomExpiry(code, db, knownSnap) {
   try {
-    const snap = await db.collection('rooms').doc(code).get();
+    const snap = knownSnap || await db.collection('rooms').doc(code).get();
     if (!snap.exists) return false;
     const data = snap.data() || {};
     const expiry = data.autoDeleteAt?.toMillis?.() || 0;
@@ -5468,6 +5465,7 @@ async function joinFromInvite() {
     _roomSalt  = roomSnap.data()?.salt  || null;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     _healRoomSchema(code, roomSnap.data()).catch(() => {});
+    _primeCrypto(code, _roomEpoch, _roomSalt);
     const memberSnap = await db.collection('rooms').doc(code).collection('members').doc(uid).get();
     const prevData   = memberSnap.exists ? memberSnap.data() : null;
     const wasApproved = prevData?.approved === true;
@@ -5478,18 +5476,18 @@ async function joinFromInvite() {
     window.history.replaceState({}, '', window.location.pathname);
 
     if (wasApproved) {
-      await registerPresence(prevData.role || 'member', true);
-      await sendSys(`${state.me.name} rejoined the room`);
+      await registerPresence(prevData.role || 'member', true, false, prevData);
+      sendSys(`${state.me.name} rejoined the room`).catch(() => {});
       bootApp();
     } else {
       const approvalRequired = roomSnap.data()?.approvalRequired === true;
       if (approvalRequired) {
-        await registerPresence('member', false);
+        await registerPresence('member', false, !prevData, prevData);
         _notifyRoomEvent('join-request'); // admins only — see functions/api/notify.js
         showWaitingScreen();
       } else {
-        await registerPresence('member', true);
-        await sendSys(`${state.me.name} joined the room`);
+        await registerPresence('member', true, !prevData, prevData);
+        sendSys(`${state.me.name} joined the room`).catch(() => {});
         _notifyRoomEvent('member-joined'); // everyone else already in the room
         bootApp();
       }

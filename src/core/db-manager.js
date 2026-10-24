@@ -328,6 +328,13 @@ async function _registryCall(body, timeoutMs) {
 
 const _expiredRooms = new Set();
 
+const _probeSnaps = new Map();
+window.takeProbeSnap = function (roomCode) {
+  const e = _probeSnaps.get(roomCode);
+  _probeSnaps.delete(roomCode);
+  return e && Date.now() - e.at < 4000 ? e.snap : null;
+};
+
 async function _resolveViaRegistry(roomCode) {
   // 'lookup' is strictly read-only — it returns the existing binding or
   // { found: false } when none exists. We deliberately do NOT call 'resolve'
@@ -517,7 +524,7 @@ function _handleQuotaError(roomCode, dbName, err) {
  * authed read per active shard), not something to run on every join. */
 async function findRoomAcrossShards(roomCode) {
   await _loadConfig();
-  for (const cfg of _ACTIVE_DBS) {
+  const probe = async cfg => {
     try {
       await Promise.race([
         _ensureShardAuth(cfg),
@@ -528,19 +535,31 @@ async function findRoomAcrossShards(roomCode) {
         fs.collection('rooms').doc(roomCode).get(),
         new Promise((_, r) => setTimeout(() => r(new Error('probe timeout')), 6000)),
       ]);
-      if (snap.exists) {
-        _dbg(roomCode, 'findRoomAcrossShards FOUND it on', cfg.name, '— correcting registry + local caches');
-        _roomDbCache.set(roomCode, cfg.name);
-        _setPersistedBinding(roomCode, cfg.name);
-        _bindRegistry(roomCode, cfg.name); // overwrites whatever wrong binding the registry had
-        return cfg.name;
-      }
+      return snap.exists ? cfg.name : null;
     } catch (e) {
       _dbg(roomCode, 'findRoomAcrossShards probe failed on', cfg.name, '—', e?.message || e);
+      return null;
     }
+  };
+  const foundOn = await new Promise(resolve => {
+    let pending = _ACTIVE_DBS.length;
+    if (!pending) { resolve(null); return; }
+    for (const cfg of _ACTIVE_DBS) {
+      probe(cfg).then(name => {
+        if (name) resolve(name);
+        else if (--pending === 0) resolve(null);
+      });
+    }
+  });
+  if (!foundOn) {
+    _dbg(roomCode, 'findRoomAcrossShards searched every active shard, found nothing — room genuinely does not exist');
+    return null;
   }
-  _dbg(roomCode, 'findRoomAcrossShards searched every active shard, found nothing — room genuinely does not exist');
-  return null;
+  _dbg(roomCode, 'findRoomAcrossShards FOUND it on', foundOn, '— correcting registry + local caches');
+  _roomDbCache.set(roomCode, foundOn);
+  _setPersistedBinding(roomCode, foundOn);
+  _bindRegistry(roomCode, foundOn);
+  return foundOn;
 }
 window.findRoomAcrossShards = findRoomAcrossShards;
 
@@ -639,10 +658,12 @@ async function getDb(roomCode) {
         _ensureShardAuth(cfg),
         new Promise((_, r) => setTimeout(() => r(new Error('shard auth timeout')), 8000)),
       ]);
-      await Promise.race([
+      const _probeSnap = await Promise.race([
         fs.collection('rooms').doc(roomCode).get(),
         new Promise((_, r) => setTimeout(() => r(new Error('probe timeout')), 8000)),
       ]);
+      _probeSnaps.clear();
+      _probeSnaps.set(roomCode, { snap: _probeSnap, at: Date.now() });
       _onSuccess(cfg.name);
       _roomDbCache.set(roomCode, cfg.name);
       _setPersistedBinding(roomCode, cfg.name);
