@@ -31,7 +31,7 @@
     if (!_useWorker || !_worker) {
       if (!W.MiutCrypto) throw new Error('MiutCrypto not loaded');
       const C = W.MiutCrypto;
-      const map = { encryptText: C.encryptText, decryptText: C.decryptText, encryptFile: C.encryptFile, decryptFile: C.decryptFile };
+      const map = { encryptText: C.encryptText, decryptText: C.decryptText, encryptFile: C.encryptFile, decryptFile: C.decryptFile, primeKey: C.primeKey };
       if (op === 'encryptFile') return map[op](...args.slice(0, 6), onProgress);
       return map[op](...args);
     }
@@ -61,6 +61,7 @@
     init,
     encryptText: (t, rc, sid, ep, salt) => _call('encryptText', [t, rc, sid, ep, salt]),
     decryptText: (b, rc, sid, ep, salt) => _call('decryptText', [b, rc, sid, ep, salt]),
+    primeKey: (rc, ep, salt) => _call('primeKey', [rc, ep, salt]),
     encryptFile: (f, meta, rc, sid, ep, salt, onProg) => _call('encryptFile', [f, meta, rc, sid, ep, salt], [], onProg),
     decryptFile: (chunks, rc, sid, ep, salt) => _call('decryptFile', [chunks, rc, sid, ep, salt]),
   };

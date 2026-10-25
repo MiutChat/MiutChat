@@ -354,10 +354,18 @@ function _createSemaphore(max) {
   };
 }
 
+async function primeKey(roomCode, epoch, salt) {
+  const cacheKey = `${roomCode}:${epoch}:${salt || ''}`;
+  if (_iksCache.has(cacheKey)) return true;
+  const saltBytes = salt ? _b64FastDecode(salt) : new Uint8Array(32);
+  _iksCache.set(cacheKey, await _deriveBaseKeyWithSalt(roomCode, epoch, saltBytes));
+  return true;
+}
+
 function clearKeyCache() { _iksCache.clear(); }
 
 if (typeof window !== 'undefined') {
-  window.MiutCrypto = { encryptText, decryptText, encryptFile, decryptFile, clearKeyCache, VERSION };
+  window.MiutCrypto = { encryptText, decryptText, encryptFile, decryptFile, primeKey, clearKeyCache, VERSION };
 } else if (typeof self !== 'undefined') {
-  self.MiutCrypto = { encryptText, decryptText, encryptFile, decryptFile, clearKeyCache, VERSION };
+  self.MiutCrypto = { encryptText, decryptText, encryptFile, decryptFile, primeKey, clearKeyCache, VERSION };
 }

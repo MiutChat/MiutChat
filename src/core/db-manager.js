@@ -815,7 +815,27 @@ window._dbFirebaseReady = new Promise((resolve, reject) => {
  * Without this, esbuild --platform=browser can scope them to the
  * file, making them invisible to app.js.
  * ────────────────────────────────────────────────────────────── */
+async function getDbForCreate(roomCode, replace) {
+  await _loadConfig();
+  try {
+    const data = await _registryCall({ action: 'resolve', roomCode, replace: replace === true }, 4000);
+    const cfg = _ACTIVE_DBS.find(x => x.name === data?.db);
+    if (cfg && _healthy(cfg.name)) {
+      const fs = _initDb(cfg);
+      _roomDbCache.set(roomCode, cfg.name);
+      _setPersistedBinding(roomCode, cfg.name);
+      _expiredRooms.delete(roomCode);
+      return { db: fs, name: cfg.name, isNew: data.isNew === true, viaRegistry: true };
+    }
+  } catch (e) {
+    _dbg(roomCode, 'getDbForCreate: registry resolve failed, falling back to local placement —', e?.message || e);
+  }
+  const fs = await getDb(roomCode);
+  return { db: fs, name: _roomDbCache.get(roomCode), isNew: false, viaRegistry: false };
+}
+
 window.getDb         = getDb;
+window.getDbForCreate = getDbForCreate;
 window.getDbStatus   = getDbStatus;
 window.resetDbHealth = resetDbHealth;
 /**

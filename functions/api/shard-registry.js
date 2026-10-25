@@ -83,6 +83,35 @@ function json(obj, status) {
 // relied upon: a cold isolate just signs up fresh, same as before. This is
 // purely a latency/account-proliferation optimization, not a correctness
 // dependency — nothing here assumes the cache survives.
+const PENDING_PICK_MS = 20000;
+const _pendingPicks = new Map();
+
+function pendingCount(name) {
+  const now = Date.now();
+  const live = (_pendingPicks.get(name) || []).filter(t => t > now);
+  _pendingPicks.set(name, live);
+  return live.length;
+}
+
+function reservePick(name) {
+  const token = Date.now() + PENDING_PICK_MS;
+  const list = _pendingPicks.get(name) || [];
+  list.push(token);
+  _pendingPicks.set(name, list);
+  return token;
+}
+
+function releasePick(name, token) {
+  const list = _pendingPicks.get(name) || [];
+  const i = list.indexOf(token);
+  if (i >= 0) list.splice(i, 1);
+}
+
+function settlePick(name) {
+  const list = _pendingPicks.get(name) || [];
+  list.sort((a, b) => a - b).shift();
+}
+
 let _cachedToken = null, _cachedTokenExp = 0;
 
 async function getFirebaseToken(apiKey) {
@@ -146,6 +175,21 @@ async function restSetDoc(projectId, token, path, obj) {
     }
   );
   if (!res.ok) throw new Error(`REST PATCH ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
+}
+
+async function restCreateDocIfAbsent(projectId, token, path, obj) {
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${path}?currentDocument.exists=false`,
+    {
+      method: 'PATCH',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: encodeFields(obj) }),
+    }
+  );
+  if (res.ok) return true;
+  const text = await res.text().catch(() => '');
+  if (res.status === 409 || (res.status === 400 && /ALREADY_EXISTS|FAILED_PRECONDITION/.test(text))) return false;
+  throw new Error(`REST PATCH ${path} → ${res.status}: ${text}`);
 }
 
 async function restIncrement(projectId, token, path, field) {
@@ -213,21 +257,25 @@ export async function onRequest(ctx) {
       return json({ error: 'roomCode required' }, 400);
     }
 
-    let existing = null;
-    try { existing = await restGetDoc(projectId, token, `bindings/${roomCode}`); } catch {}
+    const replace = body?.replace === true;
+
+    const [existing, scored] = await Promise.all([
+      replace ? null : restGetDoc(projectId, token, `bindings/${roomCode}`).catch(() => null),
+      Promise.all(shards.map(async s => {
+        let load = null;
+        try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
+        const count = load?.count || 0;
+        const degraded = !!(load && load.degradedUntil && load.degradedUntil > Date.now());
+        return { name: s.name, count, degraded, prevLoad: load };
+      })),
+    ]);
     if (existing?.db && names.has(existing.db)) {
       return json({ db: existing.db, isNew: false });
     }
 
-    const scored = await Promise.all(shards.map(async s => {
-      let load = null;
-      try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
-      const count = load?.count || 0;
-      const degraded = !!(load && load.degradedUntil && load.degradedUntil > Date.now());
-      return { name: s.name, count, degraded, prevLoad: load };
-    }));
-    const healthy = scored.filter(s => !s.degraded);
-    const pool = healthy.length ? healthy : scored; // every shard degraded → still answer with the least-bad option
+    const live = scored.map(s => ({ ...s, count: s.count + pendingCount(s.name) }));
+    const healthy = live.filter(s => !s.degraded);
+    const pool = healthy.length ? healthy : live; // every shard degraded → still answer with the least-bad option
     // Array.sort is stable, so a naive pool[0] after sorting always breaks
     // ties toward whichever shard appears first in `shards` — which is
     // always miut-db0. Since `confirm` (below) is fire-and-forget and not
@@ -241,10 +289,18 @@ export async function onRequest(ctx) {
     const minCount = Math.min(...pool.map(s => s.count));
     const tied = pool.filter(s => s.count === minCount);
     const chosen = tied[Math.floor(Math.random() * tied.length)];
+    const reservation = reservePick(chosen.name);
 
     try {
-      await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
+      if (replace) {
+        await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
+      } else if (!(await restCreateDocIfAbsent(projectId, token, `bindings/${roomCode}`, { db: chosen.name }))) {
+        const winner = await restGetDoc(projectId, token, `bindings/${roomCode}`).catch(() => null);
+        if (winner?.db && names.has(winner.db)) { releasePick(chosen.name, reservation); return json({ db: winner.db, isNew: false }); }
+        await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
+      }
     } catch (e) {
+      releasePick(chosen.name, reservation);
       // Do NOT return { db: chosen.name } here — that would tell the client
       // "this room is on shard X" while the registry's own record of that
       // fact doesn't exist. A later resolve() for this same room (this
@@ -285,6 +341,7 @@ export async function onRequest(ctx) {
       return json({ error: 'roomCode required' }, 400);
     }
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
+    settlePick(db);
     try {
       await restIncrement(projectId, token, `shardLoad/${db}`, 'count');
     } catch { /* best-effort — a missed confirm just slightly under-counts that shard, harmless */ }

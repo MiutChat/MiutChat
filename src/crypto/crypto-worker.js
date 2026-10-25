@@ -7,6 +7,7 @@ self.onmessage = async (e) => {
     let result;
     if (op === 'encryptText')  result = await C.encryptText(...args);
     else if (op === 'decryptText')  result = await C.decryptText(...args);
+    else if (op === 'primeKey')  result = await C.primeKey(...args);
     else if (op === 'encryptFile') {
       const [file, meta, rc, sid, ep, salt] = args;
       result = await C.encryptFile(file, meta, rc, sid, ep, salt, (pct, ci, ct) => {

@@ -1396,18 +1396,27 @@ async function handleCreate() {
   const btn = $('btn-create');
   setLoading(btn, true, 'Creating…');
   try {
-    if (typeof getDb !== 'function') throw new Error('Database module not loaded. Please refresh.');
+    if (typeof getDbForCreate !== 'function') throw new Error('Database module not loaded. Please refresh.');
     initSigningKey().catch(() => {});
-    db = await getDb(code);
-    const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
-    const [uid, allowed] = await Promise.all([getUID(_dbName), rateLimitCheck]);
+    let placement = await getDbForCreate(code);
+    db = placement.db;
+    let _dbName = placement.name || window.getCurrentDbName?.(code) || 'miut-db0';
+    let [uid, allowed] = await Promise.all([getUID(_dbName), rateLimitCheck]);
     if (!allowed) { setLoading(btn, false); return; }
 
-    const existing = window.takeProbeSnap?.(code) || await db.collection('rooms').doc(code).get();
-    if (existing.exists) {
-      showError('That room code is already in use — pick a different one.');
-      setLoading(btn, false);
-      return;
+    if (!placement.isNew) {
+      const existing = window.takeProbeSnap?.(code) || await db.collection('rooms').doc(code).get();
+      if (existing.exists || (placement.viaRegistry && await window.findRoomAcrossShards?.(code))) {
+        showError('That room code is already in use — pick a different one.');
+        setLoading(btn, false);
+        return;
+      }
+      if (placement.viaRegistry) {
+        placement = await getDbForCreate(code, true);
+        db = placement.db;
+        _dbName = placement.name || _dbName;
+        uid = await getUID(_dbName);
+      }
     }
 
     _setLoadingLabel(btn, 'Securing…');
