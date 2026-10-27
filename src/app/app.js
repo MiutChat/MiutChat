@@ -267,6 +267,13 @@ export function _lruMap(maxSize) {
 const _pubKeyCache = _lruMap(200); // LRU-capped; was unbounded Map
 let _unsubApproval   = null;
 let _isAdmin         = false;
+let _membersCanManage = false;
+let _lastMembersSnap = null;
+function _canManage() { return _isAdmin || _membersCanManage; }
+function _refreshManageUI() {
+  if (_lastMembersSnap) renderMembers(_lastMembersSnap);
+  if ($('settings-modal')?.style.display === 'flex') openSettings();
+}
 let _presenceSettled = false;
 let _roomWasEmpty    = false; // tracks whether the room-expiry countdown is currently pending (see startPresenceListener)
 
@@ -342,6 +349,32 @@ export async function idbGetBlob(id) {
   });
 }
 export async function idbSetBlob(id, bytes) { return idbPut('blobs', { id, bytes }); }
+function _createdMs(data) {
+  const c = data?.createdAt;
+  if (!c) return 0;
+  if (typeof c.toMillis === 'function') return c.toMillis();
+  if (typeof c.seconds === 'number') return c.seconds * 1000 + Math.floor((c.nanoseconds || 0) / 1e6);
+  if (typeof c._seconds === 'number') return c._seconds * 1000 + Math.floor((c._nanoseconds || 0) / 1e6);
+  return typeof c === 'number' ? c : 0;
+}
+
+export function _msgSortTs(data) {
+  return _createdMs(data) || data?.ts || Date.now();
+}
+
+export function _placeMsg(area, el, data, insertBeforeEl) {
+  const t = _msgSortTs(data);
+  el.dataset.sortTs = String(t);
+  if (insertBeforeEl && insertBeforeEl.parentNode === area) { area.insertBefore(el, insertBeforeEl); return; }
+  let ref = null;
+  for (let n = area.lastElementChild; n; n = n.previousElementSibling) {
+    const s = n.dataset ? n.dataset.sortTs : undefined;
+    if (s === undefined) continue;
+    if (+s > t) ref = n; else break;
+  }
+  if (ref) area.insertBefore(el, ref); else area.appendChild(el);
+}
+
 async function cacheMsg(docId, room, data) {
   try {
     const ts = data.createdAt?.toMillis?.() ?? data.ts ?? 0;
@@ -1527,6 +1560,7 @@ async function handleEnter() {
     if (_expired) { setLoading(btn, false); return; }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
+      _membersCanManage = roomSnap.data()?.membersCanManage === true;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     _healRoomSchema(code, roomSnap.data()).catch(() => {});
     _primeCrypto(code, _roomEpoch, _roomSalt);
@@ -1539,7 +1573,12 @@ async function handleEnter() {
     state.me = await buildMe(resolveName(), _dbName); state.roomCode = code;
     saveSession(); saveRoom(code);
 
-    if (wasApproved) {
+    const isCreator = roomSnap.data()?.creatorId === uid;
+    if (isCreator && !prevData?.blocked && !(prevData?.role === 'admin' && prevData?.approved === true)) {
+      await registerPresence('admin', true, !prevData, prevData);
+      sendSys(`${state.me.name} rejoined the room`).catch(() => {});
+      bootApp();
+    } else if (wasApproved) {
       // Returning approved member — skip the queue
       const role = prevData.role || 'member';
       await registerPresence(role, true, false, prevData);
@@ -1725,6 +1764,7 @@ async function checkApprovalAndBoot(_retryCount) {
     if (roomSnap.exists) {
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
+      _membersCanManage = roomSnap.data()?.membersCanManage === true;
       _primeCrypto(state.roomCode, _roomEpoch, _roomSalt);
       { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
       _healRoomSchema(state.roomCode, roomSnap.data()).catch(() => {});
@@ -1846,7 +1886,7 @@ function handleBlocked() {
   clearCacheForRoom(code).catch(() => {});
   localStorage.removeItem(CONFIG.SESSION_KEY);
   localStorage.removeItem(CONFIG.ROOM_KEY);
-  state.me = null; state.roomCode = null; _isAdmin = false;
+  state.me = null; state.roomCode = null; _isAdmin = false; _membersCanManage = false; _lastMembersSnap = null;
   showScreen('join-screen');
   setTimeout(() => showError('You have been blocked from this room by an admin.'), 300);
   toast('Removed from room', 'An admin blocked you. You can no longer join this room.', 'err');
@@ -1878,7 +1918,7 @@ async function cancelJoinRequest() {
 }
 
 async function approveUser(uid, name) {
-  if (!_isAdmin || !state.roomCode) return;
+  if (!_canManage() || !state.roomCode) return;
   try {
     await db.collection('rooms').doc(state.roomCode)
       .collection('members').doc(uid)
@@ -1895,7 +1935,7 @@ async function approveUser(uid, name) {
 }
 
 async function declineUser(uid, name) {
-  if (!_isAdmin || !state.roomCode) return;
+  if (!_canManage() || !state.roomCode) return;
   const ok = await showConfirm(`Decline ${name}?`, 'They will be removed from the room.', 'DECLINE');
   if (!ok) return;
   try {
@@ -1973,7 +2013,7 @@ async function demoteMember(uid, name) {
  * an old snapshot of the key.
  */
 async function blockMember(uid, name) {
-  if (!_isAdmin || !state.roomCode || !uid) return;
+  if (!_canManage() || !state.roomCode || !uid) return;
   if (uid === state.me?.id) { toast("Can't block yourself", '', 'err'); return; }
   const ok = await showConfirm(
     `Block ${name}?`,
@@ -1989,7 +2029,7 @@ async function blockMember(uid, name) {
     await roomRef.collection('members').doc(uid).update({
       online: false, approved: false, blocked: true,
     }).catch(() => {}); // best-effort — the block list above is what actually matters for re-entry
-    await sendSys(`${name} was blocked by an admin`);
+    await sendSys(`${name} was blocked by ${_isAdmin ? 'an admin' : 'a member'}`);
     // Force-rotate now rather than waiting for the reactive "member left"
     // trigger — that path depends on a live presence listener noticing the
     // departure, which (per a real bug already fixed once) doesn't
@@ -2094,17 +2134,17 @@ async function openMemberDetail(uid, m) {
   // Actions — admin viewers only, never shown for your own row
   const actions = $('md-actions');
   actions.innerHTML = '';
-  if (_isAdmin && !isMe) {
+  if (_canManage() && !isMe) {
     if (!m.approved && !m.declined) {
       actions.appendChild(_mdBtn('APPROVE', () => { approveUser(uid, m.name); closeMemberDetail(); }));
       actions.appendChild(_mdBtn('DECLINE', () => { declineUser(uid, m.name); closeMemberDetail(); }, true));
-    } else {
+    } else if (_isAdmin) {
       actions.appendChild(_mdBtn(
         m.role === 'admin' ? 'DEMOTE TO MEMBER' : 'PROMOTE TO ADMIN',
         () => { (m.role === 'admin' ? demoteMember : promoteToAdmin)(uid, m.name); closeMemberDetail(); }
       ));
     }
-    if (!m.blocked) {
+    if (!m.blocked && (_isAdmin || m.role !== 'admin')) {
       actions.appendChild(_mdBtn('BLOCK USER', () => { blockMember(uid, m.name); closeMemberDetail(); }, true));
     }
   }
@@ -2153,6 +2193,8 @@ function startRoomListener() {
         return;
       }
       const d = snap.data() || {};
+      const _mgr = d.membersCanManage === true;
+      if (_mgr !== _membersCanManage) { _membersCanManage = _mgr; _refreshManageUI(); }
       if (state.me?.id && Array.isArray(d.blockedUsers) && d.blockedUsers.includes(state.me.id)) {
         handleBlocked();
         return;
@@ -2386,7 +2428,7 @@ function _fmtTtl(ms) {
 
 /** Admin sets room-level message TTL and writes to Firestore */
 async function setRoomTtl(ms) {
-  if (!_isAdmin || !state.roomCode) return;
+  if (!_canManage() || !state.roomCode) return;
   try {
     await db.collection('rooms').doc(state.roomCode).update({ msgTtlMs: ms });
     _roomTtlMs = ms;
@@ -2434,7 +2476,7 @@ function _fmtRoomExpirySentence(ms) {
  * as empty; see startPresenceListener.
  */
 async function setRoomExpiry(ms) {
-  if (!_isAdmin || !state.roomCode) return;
+  if (!_canManage() || !state.roomCode) return;
   try {
     await db.collection('rooms').doc(state.roomCode).update({ inactivityTtlMs: ms });
     _roomExpiryMs = ms;
@@ -2457,7 +2499,7 @@ async function setRoomExpiry(ms) {
 // original creator.
 //   }
 async function _autoRotateEpoch(reason) {
-  if (!_isAdmin || !state.roomCode || !db) return;
+  if (!_canManage() || !state.roomCode || !db) return;
   try {
     const newEpoch = _roomEpoch + 1;
     await db.collection('rooms').doc(state.roomCode).update({ epoch: newEpoch });
@@ -2484,7 +2526,7 @@ async function _autoRotateEpoch(reason) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function rotateKey() {
-  if (!_isAdmin || !state.roomCode) return;
+  if (!_canManage() || !state.roomCode) return;
   const ok = await showConfirm(
     'Rotate Encryption Key?',
     'Future messages will use a freshly derived key. Old messages remain readable with their original key. All members will be notified.',
@@ -2504,6 +2546,7 @@ async function loadCachedMessages() {
   _historyOldestDoc  = null;
   _historyExhausted  = false;
 
+  let cachedHigh = 0;
   // ── Phase 1: render from IDB instantly ──────────
   // IMPORTANT: renderMsg is async (it awaits MiutCryptoBridge.init() and
   // decryption). Calling it inside a non-async forEach fires all decryptions
@@ -2520,13 +2563,13 @@ async function loadCachedMessages() {
         _renderedIds.add(row.id);
         await renderMsg(row.data, row.id);
       }
-      _lastCachedTs = cached.reduce((m, r) => Math.max(m, r.ts || 0), 0);
+      cachedHigh = cached.reduce((m, r) => Math.max(m, r.ts || 0), 0);
+      _lastCachedTs = Math.max(_lastCachedTs, cachedHigh);
       scrollBottom();
     }
   } catch (e) {}
 
-  // ── Phase 2: fetch only messages newer than IDB high-water mark ──
-  await fetchHistoryOnce(code);
+  await fetchHistoryOnce(code, cachedHigh);
 
   // After fetch, skeleton always goes away; welcome shows only if truly empty
   $('msg-skeleton') && ($('msg-skeleton').style.display = 'none');
@@ -2538,28 +2581,28 @@ const _HISTORY_PAGE = 100;
 let _historyOldestDoc = null;   // cursor for "load earlier" pagination
 let _historyExhausted = false;  // true once we've fetched back to the beginning
 
-async function fetchHistoryOnce(code) {
+async function fetchHistoryOnce(code, cachedHigh = 0) {
   try {
     let q = db.collection('rooms').doc(code)
               .collection('messages')
               .orderBy('createdAt', 'desc')   // newest first so limit(100) gets latest
               .limit(_HISTORY_PAGE);
 
-    if (_lastCachedTs > 0) {
+    if (cachedHigh > 0) {
       q = db.collection('rooms').doc(code)
             .collection('messages')
             .orderBy('createdAt', 'asc')
-            .where('createdAt', '>', firebase.firestore.Timestamp.fromMillis(_lastCachedTs));
+            .where('createdAt', '>', firebase.firestore.Timestamp.fromMillis(cachedHigh));
     }
 
     const snap = await q.get();
-    if (snap.empty) { _historyExhausted = true; return; }
+    if (snap.empty) { _historyExhausted = true; _healChunksSoon(); return; }
 
     // Re-sort ascending for rendering (query returned desc for new users)
-    const docs = _lastCachedTs > 0 ? snap.docs : [...snap.docs].reverse();
+    const docs = cachedHigh > 0 ? snap.docs : [...snap.docs].reverse();
 
     // Track oldest doc for "load earlier" pagination cursor
-    if (!_lastCachedTs && docs.length > 0) {
+    if (!cachedHigh && docs.length > 0) {
       _historyOldestDoc = docs[0];
       _historyExhausted = docs.length < _HISTORY_PAGE;
     }
@@ -2598,17 +2641,22 @@ async function fetchHistoryOnce(code) {
       hasNew = true;
       // Defer IDB write to idle time — doesn't block rendering
       (window.requestIdleCallback || setTimeout)(() => cacheMsg(doc.id, code, data).catch(() => {}));
-      const docTs = data.createdAt?.toMillis?.() ?? data.ts ?? 0;
+      const docTs = _createdMs(data);
       if (docTs > _lastCachedTs) _lastCachedTs = docTs;
     }
 
+    _healChunksSoon();
     if (hasNew) scrollBottom();
 
     // Show "load earlier" button if there are more messages
-    if (!_lastCachedTs) _updateLoadEarlierBtn();
+    if (!cachedHigh) _updateLoadEarlierBtn();
 
   } catch (e) {
   }
+}
+
+function _healChunksSoon() {
+  if (_loadFileTransfer.peek()) _loadFileTransfer.peek().healChunkGroupsNow().catch(() => {});
 }
 
 // "Load earlier messages" — fetches the page before the current oldest message
@@ -2682,7 +2730,7 @@ function startPresenceListener() {
       _onlineCount = snap.size;
 
       // Notify admin of new pending users
-      if (_isAdmin) {
+      if (_canManage()) {
         snap.docChanges().forEach(ch => {
           if (ch.type === 'added') {
             const d = ch.doc.data();
@@ -2724,6 +2772,7 @@ function startPresenceListener() {
       });
 
       updateOnlineUI();   // updateOnlineUI also called inside renderMembers with correct approved count
+      _lastMembersSnap = snap;
       renderMembers(snap);
 
       // Wipe empty room when last member leaves.
@@ -2963,7 +3012,7 @@ export function startChatListeners() {
           } // end validateMessageTimestamp
           hasNew = true;
         }
-        const docTs = data.ts || 0;
+        const docTs = _createdMs(data);
         if (docTs > _lastCachedTs) _lastCachedTs = docTs;
         cacheMsg(id, code, data).catch(() => {});
         // Message-count-based epoch rotation (admin only). This counts
@@ -3106,14 +3155,14 @@ function renderMembers(snap) {
         </div>
         <div class="member-activity">● Online</div>
       </div>
-      ${_isAdmin && !isMe && m.role !== 'admin' ? `
-        <button class="member-promote-btn" title="Promote to Admin"
+      ${_canManage() && !isMe && m.role !== 'admin' ? `
+        ${_isAdmin ? `<button class="member-promote-btn" title="Promote to Admin"
                 data-uid="${esc(m.uid)}" data-name="${esc(m.name)}">
           <svg viewBox="0 0 20 20" fill="none" width="11" height="11">
             <path d="M10 3l1.8 5.5H17l-4.7 3.4 1.8 5.5L10 14l-4.1 3.4 1.8-5.5L3 8.5h5.2z"
                   stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
           </svg>
-        </button>
+        </button>` : ''}
         <button class="member-block-btn" title="Block"
                 data-uid="${esc(m.uid)}" data-name="${esc(m.name)}">
           <svg viewBox="0 0 20 20" fill="none" width="11" height="11">
@@ -3140,7 +3189,7 @@ function renderMembers(snap) {
   });
 
   // ── Pending section (admins only) ──────────────
-  if (_isAdmin && pending.length > 0) {
+  if (_canManage() && pending.length > 0) {
     const sep = document.createElement('div');
     sep.className = 'section-label pending-section-label';
     sep.innerHTML = `PENDING <span class="count-badge pending-badge">${pending.length}</span>`;
@@ -3842,18 +3891,27 @@ async function _flushReadAcks() {
 }
 
 // Mark all visible messages in the viewport as read
+let _readScanTimer = null;
 function _markVisibleAsRead() {
+  if (_readScanTimer) return;
+  _readScanTimer = setTimeout(() => { _readScanTimer = null; _scanVisibleForReads(); }, 150);
+}
+
+function _scanVisibleForReads() {
   if (!state.roomCode || !state.me || document.hidden) return;
   const area = $('messages-area');
   if (!area) return;
   const areaRect = area.getBoundingClientRect();
-  document.querySelectorAll('.msg-wrapper[data-doc-id]').forEach(w => {
-    if (w.dataset.senderId === state.me.id) return; // don't ack own
+  const kids = area.children;
+  for (let i = kids.length - 1; i >= 0; i--) {
+    const w = kids[i];
+    if (!w.dataset.docId || !w.classList.contains('msg-wrapper')) continue;
     const rect = w.getBoundingClientRect();
-    if (rect.top < areaRect.bottom && rect.bottom > areaRect.top) {
-      _queueReadAck(w.dataset.docId);
-    }
-  });
+    if (rect.height === 0) continue;
+    if (rect.bottom <= areaRect.top) break;
+    if (w.dataset.senderId === state.me.id) continue;
+    if (rect.top < areaRect.bottom) _queueReadAck(w.dataset.docId);
+  }
 }
 
 // Render read-receipt badge on a sent message
@@ -4091,7 +4149,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
     // AES-GCM auth tag verification and render as '[encrypted]'.
     const text = await dec(data.enc, state.roomCode, data.senderId);
     div.innerHTML = `<span>${esc(text)}</span>`;
-    (insertBeforeEl && insertBeforeEl.parentNode === area) ? area.insertBefore(div, insertBeforeEl) : area.appendChild(div);
+    _placeMsg(area, div, data, insertBeforeEl);
     return;
   }
 
@@ -4117,7 +4175,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
       <div class="msg-bubble-wrap">
         <div class="msg-bubble"><span class="msg-deleted-text">This message was deleted</span></div>
       </div>`;
-    (insertBeforeEl && insertBeforeEl.parentNode === area) ? area.insertBefore(wrap, insertBeforeEl) : area.appendChild(wrap);
+    _placeMsg(area, wrap, data, insertBeforeEl);
     return;
   }
 
@@ -4280,7 +4338,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
   // Swipe-left-to-reply gesture on the bubble
   addSwipeReply(wrap, data, plainText);
 
-  (insertBeforeEl && insertBeforeEl.parentNode === area) ? area.insertBefore(wrap, insertBeforeEl) : area.appendChild(wrap);
+  _placeMsg(area, wrap, data, insertBeforeEl);
   if (data.sig && data.type === 'text') {
     // D3: verify signature after DOM paint (async, non-blocking)
     requestAnimationFrame(() => verifyAndBadge(data, docId));
@@ -5297,17 +5355,21 @@ function initScrollFab() {
   const area = $('messages-area');
   const fab  = $('scroll-fab');
   if (!area || !fab) return;
+  let _scrollFrame = 0;
   area.addEventListener('scroll', () => {
-    const fromBottom = area.scrollHeight - area.scrollTop - area.clientHeight;
-    if (fromBottom < 60) {
-      hideScrollFab();
-      _unreadCount = 0;
-      document.title = 'MIUT';
-      _markVisibleAsRead();
-    } else if (fromBottom > 120) {
-      // User scrolled up — show the FAB so they can jump back to latest
-      showScrollFab();
-    }
+    if (_scrollFrame) return;
+    _scrollFrame = requestAnimationFrame(() => {
+      _scrollFrame = 0;
+      const fromBottom = area.scrollHeight - area.scrollTop - area.clientHeight;
+      if (fromBottom < 60) {
+        hideScrollFab();
+        _unreadCount = 0;
+        document.title = 'MIUT';
+        _markVisibleAsRead();
+      } else if (fromBottom > 120) {
+        showScrollFab();
+      }
+    });
   }, { passive: true });
   fab.addEventListener('click', () => { scrollBottom(); hideScrollFab(); });
 }
@@ -5321,7 +5383,9 @@ export function scrollBottom() {
     _scrollDebounce = null;
     const a = $('messages-area');
     if (!a) return;
-    a.scrollTop = a.scrollHeight;
+    const dist = a.scrollHeight - a.scrollTop - a.clientHeight;
+    const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches || dist > a.clientHeight * 1.5;
+    a.scrollTo({ top: a.scrollHeight, behavior: calm ? 'auto' : 'smooth' });
     hideScrollFab();
     _unreadCount = 0;
     document.title = 'MIUT';
@@ -5472,6 +5536,7 @@ async function joinFromInvite() {
     }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
+      _membersCanManage = roomSnap.data()?.membersCanManage === true;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     _healRoomSchema(code, roomSnap.data()).catch(() => {});
     _primeCrypto(code, _roomEpoch, _roomSalt);
@@ -5599,6 +5664,8 @@ async function handleLogout() {
   // D7: stop approval listener if pending
   if (_unsubApproval) { try { _unsubApproval(); } catch {} _unsubApproval = null; }
   _isAdmin = false;
+  _membersCanManage = false;
+  _lastMembersSnap = null;
 
   // ── Instant local close ────────────────────────────────────────────────
   // Everything below is local-only (no network waits), so the room view
@@ -5702,11 +5769,17 @@ function openSettings() {
   }
 
   const rotateRow = $('rotate-key-row');
-  if (approvalRow) approvalRow.style.display = _isAdmin ? 'flex' : 'none';
-  if (rotateRow)   rotateRow.style.display   = _isAdmin ? 'flex' : 'none';
+  if (approvalRow) approvalRow.style.display = _canManage() ? 'flex' : 'none';
+  if (rotateRow)   rotateRow.style.display   = _canManage() ? 'flex' : 'none';
+  const manageRow = $('members-manage-row');
+  if (manageRow) {
+    manageRow.style.display = _isAdmin ? 'flex' : 'none';
+    const mt = $('members-manage-toggle');
+    if (mt) mt.checked = _membersCanManage;
+  }
   const ttlRow = $('ttl-row');
   if (ttlRow) {
-    ttlRow.style.display = _isAdmin ? 'flex' : 'none';
+    ttlRow.style.display = _canManage() ? 'flex' : 'none';
     const sel = $('ttl-select');
     if (sel) {
       const opts = [...sel.options].map(o => +o.value);
@@ -5717,7 +5790,7 @@ function openSettings() {
   }
   const roomTtlRow = $('room-ttl-row');
   if (roomTtlRow) {
-    roomTtlRow.style.display = _isAdmin ? 'flex' : 'none';
+    roomTtlRow.style.display = _canManage() ? 'flex' : 'none';
     const rSel = $('room-ttl-select');
     if (rSel) rSel.value = String(_roomExpiryMs);
     const rTtlEl = $('room-ttl-sublabel'); if (rTtlEl) rTtlEl.textContent = _fmtRoomExpirySentence(_roomExpiryMs);
@@ -5725,7 +5798,7 @@ function openSettings() {
   const epochEl = $('epoch-display');
   if (epochEl) epochEl.textContent = String(_roomEpoch);
 
-  if (ap && _isAdmin && state.roomCode) {
+  if (ap && _canManage() && state.roomCode) {
     ap.checked = false;
     db.collection('rooms').doc(state.roomCode).get()
       .then(s => { if (ap) ap.checked = s.data()?.approvalRequired === true; })
@@ -5787,8 +5860,24 @@ async function togglePushNotifications() {
 }
 function toggleEnterToSend()   { state.prefs.enterToSend   = $('enter-to-send-toggle').checked; }
 
-function toggleApprovalGate() {
+function toggleMembersManage() {
   if (!_isAdmin || !state.roomCode) return;
+  const on = $('members-manage-toggle')?.checked ?? false;
+  db.collection('rooms').doc(state.roomCode)
+    .update({ membersCanManage: on })
+    .then(() => {
+      toast(
+        on ? 'Member controls ON' : 'Member controls OFF',
+        on ? 'Every member can now remove users and edit settings' : 'Only admins can manage the room',
+        on ? 'lock' : '🔓'
+      );
+      sendSys(on ? `${state.me.name} let every member manage the room` : `${state.me.name} limited room management to admins`).catch(() => {});
+    })
+    .catch(() => { const t = $('members-manage-toggle'); if (t) t.checked = !on; });
+}
+
+function toggleApprovalGate() {
+  if (!_canManage() || !state.roomCode) return;
   const on = $('approval-toggle')?.checked ?? false;
   db.collection('rooms').doc(state.roomCode)
     .update({ approvalRequired: on })
@@ -6241,6 +6330,7 @@ function _wireAllHandlers() {
   on('enter-to-send-toggle', 'change', () => toggleEnterToSend());
   on('push-toggle',          'change', () => togglePushNotifications());
   on('approval-toggle', 'change', () => toggleApprovalGate());
+  on('members-manage-toggle', 'change', () => toggleMembersManage());
   on('ttl-select',      'change', e => setRoomTtl(+e.target.value));
   on('room-ttl-select', 'change', e => setRoomExpiry(+e.target.value));
 

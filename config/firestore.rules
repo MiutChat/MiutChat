@@ -32,6 +32,14 @@ service cloud.firestore {
       return isRoomMember(roomCode) && myMember(roomCode).get('role', 'member') == 'admin';
     }
 
+    function membersCanManage(roomCode) {
+      return roomData(roomCode).get('membersCanManage', false) == true;
+    }
+
+    function isRoomManager(roomCode) {
+      return isRoomAdmin(roomCode) || (isApprovedMember(roomCode) && membersCanManage(roomCode));
+    }
+
     function isRoomCreator(roomCode) {
       return isSignedIn() && roomData(roomCode).creatorId == request.auth.uid;
     }
@@ -101,6 +109,10 @@ service cloud.firestore {
           || (
             isApprovedMember(roomCode)
             && changedKeys().hasOnly(['emptyAt', 'autoDeleteAt', 'lastActivity'])
+          )
+          || (
+            isRoomManager(roomCode)
+            && changedKeys().hasOnly(['approvalRequired', 'inactivityTtlMs', 'msgTtlMs', 'epoch', 'blockedUsers', 'emptyAt', 'autoDeleteAt', 'lastActivity'])
           )
         );
 
@@ -196,6 +208,12 @@ service cloud.firestore {
             || (
               isRoomAdmin(roomCode)
               && changedKeys().hasOnly(['approved','role','declined','blocked','online'])
+            )
+            || (
+              isRoomManager(roomCode)
+              && request.auth.uid != memberId
+              && resource.data.get('role', 'member') != 'admin'
+              && changedKeys().hasOnly(['approved','declined','blocked','online'])
             )
           );
 

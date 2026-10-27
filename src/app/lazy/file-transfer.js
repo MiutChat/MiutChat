@@ -26,12 +26,19 @@
 import {
   CONFIG, state, db, toast, scrollBottom, renderMsg, signMsg, ts_now, _log,
   esc, playSound, _testCompression, _b64uDec, idbGetBlob, idbSetBlob,
-  showScrollFab, _notifyRoomOfNewMessage,
+  showScrollFab, _placeMsg, _notifyRoomOfNewMessage,
   _roomEpoch, _roomSalt, setRoomSalt, _lazyDataMap, _lruMap,
 } from '../app.js';
 
-const CHUNK_STALL_MS = 45_000;
-const STALE_CHUNK_GROUP_MS = 10 * 60 * 1000;
+export const CHUNK_TIMING = {
+  healDelaysMs: [2500, 7000, 15000],
+  stallMs: 20000,
+  waitingLabelMs: 4000,
+  giveUpMs: 10 * 60 * 1000,
+};
+
+const _doneGroups = new Set();
+const _failedGroups = new Map();
 
 let _chunkGroups = {};
 const _epochKeys = _lruMap(50);
@@ -88,14 +95,14 @@ async function _collectStream(readable) {
   return out;
 }
 
-export async function encBytes(file, code) {
+export async function encBytes(file, code, opts = {}) {
   try {
     const epoch = _roomEpoch;
     const key   = await _getEpochKey(code, epoch);
     const iv    = crypto.getRandomValues(new Uint8Array(12));
     let fileBuf = new Uint8Array(await file.arrayBuffer());
     let compressed = false;
-    if (await _testCompression() && file.size > 1024) {
+    if (opts.compress !== false && await _testCompression() && file.size > 1024) {
       try {
         const cs = new CompressionStream('deflate-raw');
         const w  = cs.writable.getWriter();
@@ -125,12 +132,42 @@ export async function encBytes(file, code) {
   } catch (e) { throw e; }
 }
 
-export async function decBytes(b64full, mime, code) {
-  if (b64full.startsWith('b:')) {
-    const raw   = Uint8Array.from(atob(b64full.slice(2)), c => c.charCodeAt(0));
-    const epoch = new DataView(raw.buffer, 0, 4).getUint32(0, false);
-    const iv    = raw.slice(4, 16);
-    const ct    = raw.slice(16);
+async function _yieldToMain() {
+  if (globalThis.scheduler?.yield) return globalThis.scheduler.yield();
+  return new Promise(r => setTimeout(r, 0));
+}
+
+async function _b64ToBytes(input) {
+  const parts = Array.isArray(input) ? input : [input];
+  let chars = 0;
+  for (const p of parts) chars += p.length;
+  chars -= 2;
+  const last = parts[parts.length - 1];
+  const pad = last.endsWith('==') ? 2 : last.endsWith('=') ? 1 : 0;
+  if (chars % 4 !== 0) return Uint8Array.from(atob(parts.join('').slice(2)), c => c.charCodeAt(0));
+  const out = new Uint8Array((chars / 4) * 3 - pad);
+  let o = 0, carry = '';
+  for (let i = 0; i < parts.length; i++) {
+    let str = carry + (i === 0 ? parts[i].slice(2) : parts[i]);
+    const cut = i === parts.length - 1 ? str.length : str.length - (str.length % 4);
+    carry = str.slice(cut);
+    str = str.slice(0, cut);
+    for (let k = 0; k < str.length; k += 196608) {
+      const bin = atob(str.slice(k, k + 196608));
+      for (let n = 0; n < bin.length; n++) out[o++] = bin.charCodeAt(n);
+    }
+    if (parts.length > 1 || str.length > 262144) await _yieldToMain();
+  }
+  return o === out.length ? out : out.subarray(0, o);
+}
+
+export async function decBytes(input, mime, code) {
+  const first = Array.isArray(input) ? input[0] : input;
+  if (typeof first === 'string' && first.startsWith('b:')) {
+    const raw   = await _b64ToBytes(input);
+    const epoch = new DataView(raw.buffer, raw.byteOffset, 4).getUint32(0, false);
+    const iv    = raw.subarray(4, 16);
+    const ct    = raw.subarray(16);
     let key     = await _getEpochKey(code, epoch);
     let pt;
     try {
@@ -153,15 +190,46 @@ export async function decBytes(b64full, mime, code) {
       try {
         const ds = new DecompressionStream('deflate-raw');
         const w  = ds.writable.getWriter();
-        w.write(pt.slice(1)); w.close();
+        w.write(pt.subarray(1)); w.close();
         pt = await _collectStream(ds.readable);
-      } catch {}
+      } catch (e) {
+        throw new Error('decompress failed: ' + (e?.message || e));
+      }
     } else if (pt.length > 1 && pt[0] === 0x00) {
-      pt = pt.slice(1);
+      pt = pt.subarray(1);
     }
     return new Blob([pt], { type: mime });
   }
   throw new Error('Unsupported legacy media format');
+}
+
+export async function prepareImageForUpload(file, opts = {}) {
+  const maxEdge = opts.maxEdge || 1600, quality = opts.quality || 0.82, keepBelow = opts.keepBelow || 700 * 1024;
+  const looksImage = /^image\/(jpeg|png|webp|heic|heif|avif|bmp)$/.test(file.type) || (!file.type && /\.(heic|heif|avif|bmp|jpe?g|png|webp)$/i.test(file.name));
+  if (!looksImage) return file;
+  let bmp = null;
+  try {
+    bmp = await createImageBitmap(file);
+    const w = bmp.width, h = bmp.height;
+    const scale = Math.min(1, maxEdge / Math.max(w, h));
+    if (scale === 1 && file.size <= keepBelow) return file;
+    const tw = Math.max(1, Math.round(w * scale)), th = Math.max(1, Math.round(h * scale));
+    const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(tw, th) : Object.assign(document.createElement('canvas'), { width: tw, height: th });
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, tw, th);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(bmp, 0, 0, tw, th);
+    const blob = canvas.convertToBlob
+      ? await canvas.convertToBlob({ type: 'image/jpeg', quality })
+      : await new Promise(r => canvas.toBlob(r, 'image/jpeg', quality));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg', lastModified: file.lastModified });
+  } catch {
+    return file;
+  } finally {
+    bmp?.close?.();
+  }
 }
 
 export async function handleFileAttach(e) {
@@ -213,15 +281,16 @@ export async function handleFileAttach(e) {
   }
 
   try {
-    const encrypted = await encBytes(file, state.roomCode);
+    const sendFile = isImg ? await prepareImageForUpload(file) : file;
+    const encrypted = await encBytes(sendFile, state.roomCode, { compress: !isImg && !isVid });
     const totalSize = encrypted.length;
 
     if (totalSize <= CONFIG.CHUNK_BYTES) {
       const fts  = Date.now();
       const fsig = await signMsg(state.me.id, fts, encrypted.slice(0, 64));
       await db.collection('rooms').doc(state.roomCode).collection('messages').add({
-        type: msgType, encData: encrypted, mime: file.type,
-        fileName: file.name, fileSize: file.size, chunks: 1, chunkOf: 1,
+        type: msgType, encData: encrypted, mime: sendFile.type,
+        fileName: sendFile.name, fileSize: sendFile.size, chunks: 1, chunkOf: 1,
         senderId: state.me.id, senderName: state.me.name, senderColor: state.me.color,
         sig: fsig, ts: fts, createdAt: ts_now(),
       });
@@ -241,7 +310,7 @@ export async function handleFileAttach(e) {
             const idx = b + li;
             return db.collection('rooms').doc(state.roomCode).collection('messages').add({
               type: idx === 0 ? msgType : 'chunk', encData: part,
-              mime: file.type, fileName: file.name, fileSize: file.size,
+              mime: sendFile.type, fileName: sendFile.name, fileSize: sendFile.size,
               groupId, chunkIdx: idx, chunkOf: parts.length,
               senderId: state.me.id, senderName: state.me.name, senderColor: state.me.color,
               createdAt: ts_now(), ts: idx === 0 ? now : Date.now(),
@@ -271,84 +340,180 @@ export async function handleFileAttach(e) {
   }
 }
 
+function _groupMissing(g) {
+  const out = [];
+  for (let i = 0; i < g.total; i++) if (g.parts[i] === undefined) out.push(i);
+  return out;
+}
+
+function _addPart(g, d, docId) {
+  if (g.parts[d.chunkIdx] !== undefined) return false;
+  g.parts[d.chunkIdx] = d.encData;
+  g.lastProgressAt = Date.now();
+  g.healStep = 0;
+  g.stalled = false;
+  if (d.chunkIdx === 0) { g.meta = d; g.docId = docId; }
+  return true;
+}
+
+function _newGroup(data, docId) {
+  const now = Date.now();
+  return { parts: {}, total: data.chunkOf, meta: data, docId, firstSeenAt: now, lastProgressAt: now, healStep: 0, healing: false, stalled: false, timer: null, roomCode: state.roomCode };
+}
+
 export function assembleChunk(data, docId) {
   const gid = data.groupId;
   if (!gid) { _log('warn', '[MIUT media] chunk doc has no groupId, cannot assemble:', docId, data); return; }
-  const isNewGroup = !_chunkGroups[gid];
-  if (isNewGroup) {
-    _chunkGroups[gid] = { parts: {}, total: data.chunkOf, meta: data, docId, firstSeenAt: Date.now(), roomCode: state.roomCode };
-    setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 8000);
-    setTimeout(() => _healIncompleteChunkGroups().catch(() => {}), 30000);
-    setTimeout(() => {
-      const g = _chunkGroups[gid];
-      if (g && Object.keys(g.parts).length < g.total) _markChunkGroupFailed(gid);
-    }, CHUNK_STALL_MS);
-  }
-  _chunkGroups[gid].parts[data.chunkIdx] = data.encData;
-  if (data.chunkIdx === 0) { _chunkGroups[gid].meta = data; _chunkGroups[gid].docId = docId; }
-  const g = _chunkGroups[gid];
-  const have = Object.keys(g.parts).length;
-  _log('debug', `[MIUT media] chunk ${data.chunkIdx}/${g.total - 1} received for group ${gid} (${have}/${g.total} so far)`);
-
-  if (isNewGroup) _renderChunkProgressBubble(gid, data, docId);
-  else _updateChunkProgressBubble(gid, have, g.total);
-
-  if (have === g.total) {
-    const missing = [];
-    for (let i = 0; i < g.total; i++) if (!g.parts[i]) missing.push(i);
-    if (missing.length) {
-      _log('error', `[MIUT media] group ${gid} reports complete (${have}/${g.total}) but part(s) are empty:`, missing, '— assembling anyway, but decryption will likely fail');
-    }
-    const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
-    delete _chunkGroups[gid];
-    _log('debug', `[MIUT media] group ${gid} complete, assembled ${assembled.length} chars, rendering now`);
-    _removeChunkProgressBubble(gid);
-    const _existingWrap = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(g.docId)}"]`);
-    if (_existingWrap) _existingWrap.remove();
-    renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
-  }
+  if (_doneGroups.has(gid)) return;
+  let g = _chunkGroups[gid];
+  const isNew = !g;
+  if (isNew) g = _chunkGroups[gid] = _newGroup(data, docId);
+  _addPart(g, data, docId);
+  if (isNew) _renderChunkProgressBubble(gid, data, docId);
+  _paintGroup(gid);
+  if (_groupMissing(g).length === 0) { _finishGroup(gid); return; }
+  _armWatch(gid);
 }
 
-async function _healIncompleteChunkGroups() {
-  const gids = Object.keys(_chunkGroups);
-  if (!gids.length || !state.roomCode) return;
-  for (const gid of gids) {
-    const g = _chunkGroups[gid];
-    if (!g || Object.keys(g.parts).length >= g.total) continue;
-    try {
-      const snap = await db.collection('rooms').doc(state.roomCode)
-        .collection('messages').where('groupId', '==', gid).get();
-      snap.forEach(doc => {
-        const d = doc.data();
-        if (g.parts[d.chunkIdx] === undefined) {
-          g.parts[d.chunkIdx] = d.encData;
-          if (d.chunkIdx === 0) { g.meta = d; g.docId = doc.id; }
-        }
-      });
-      if (_chunkGroups[gid] && Object.keys(g.parts).length === g.total) {
-        const assembled = Array.from({ length: g.total }, (_, i) => g.parts[i]).join('');
-        delete _chunkGroups[gid];
-        await renderMsg({ ...g.meta, encData: assembled, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
-      }
-    } catch (e) { _log('warn', '[MIUT] Could not heal chunk group', gid, e); }
+function _groupEl(gid) {
+  return document.querySelector(`.msg-media[data-group-id="${CSS.escape(gid)}"]`);
+}
+
+function _paintError(el, gid, have, total) {
+  el.classList.remove('loading');
+  el.innerHTML = `<div class="msg-media-err">Missing ${total - have} of ${total} parts — the sender may have lost connection.<button type="button" class="chunk-retry">Retry</button></div>`;
+  el.querySelector('.chunk-retry').addEventListener('click', () => _retryGroup(gid));
+}
+
+function _paintGroup(gid) {
+  const g = _chunkGroups[gid];
+  const el = g && _groupEl(gid);
+  if (!el) return;
+  const have = Object.keys(g.parts).length;
+  if (g.stalled) { _paintError(el, gid, have, g.total); return; }
+  el.classList.add('loading');
+  let lab = el.querySelector('.media-decrypt-label');
+  if (!lab) {
+    el.innerHTML = '<div class="media-decrypt-spinner"></div><div class="media-decrypt-label"></div>';
+    lab = el.querySelector('.media-decrypt-label');
   }
+  const isMine = el.closest('.msg-wrapper')?.classList.contains('sent');
+  const waiting = Date.now() - g.lastProgressAt > CHUNK_TIMING.waitingLabelMs;
+  lab.textContent = waiting ? `Waiting for the remaining parts… ${have}/${g.total}` : _chunkProgressLabel(have, g.total, isMine);
+}
+
+function _armWatch(gid) {
+  const g = _chunkGroups[gid];
+  if (!g) return;
+  clearTimeout(g.timer);
+  g.timer = setTimeout(() => _tickGroup(gid), g.stalled ? 2000 : 400);
+}
+
+async function _tickGroup(gid) {
+  const g = _chunkGroups[gid];
+  if (!g) return;
+  const T = CHUNK_TIMING;
+  if (Date.now() - g.firstSeenAt > T.giveUpMs) { _failGroup(gid); return; }
+  if (!g.stalled && !g.healing && g.healStep < T.healDelaysMs.length && Date.now() - g.lastProgressAt >= T.healDelaysMs[g.healStep]) {
+    await _healGroup(gid);
+  }
+  const cur = _chunkGroups[gid];
+  if (!cur) return;
+  if (!cur.stalled && cur.healStep >= T.healDelaysMs.length && Date.now() - cur.lastProgressAt >= T.stallMs) cur.stalled = true;
+  _paintGroup(gid);
+  _armWatch(gid);
+}
+
+async function _healGroup(gid) {
+  const g = _chunkGroups[gid];
+  if (!g || g.healing || !state.roomCode || !db) return 0;
+  g.healing = true;
+  let added = 0;
+  try {
+    const missing = _groupMissing(g);
+    const col = db.collection('rooms').doc(state.roomCode).collection('messages');
+    const docs = [];
+    try {
+      for (let i = 0; i < missing.length; i += 10) {
+        const snap = await col.where('groupId', '==', gid).where('chunkIdx', 'in', missing.slice(i, i + 10)).get();
+        snap.forEach(d => docs.push(d));
+      }
+    } catch {
+      docs.length = 0;
+      const snap = await col.where('groupId', '==', gid).get();
+      snap.forEach(d => docs.push(d));
+    }
+    for (const d of docs) if (_addPart(g, d.data(), d.id)) added++;
+  } catch (e) {
+    _log('warn', '[MIUT media] could not look up missing parts for', gid, e);
+  } finally {
+    g.healing = false;
+  }
+  const cur = _chunkGroups[gid];
+  if (cur) {
+    if (!added) cur.healStep++;
+    if (_groupMissing(cur).length === 0) _finishGroup(gid); else _paintGroup(gid);
+  }
+  return added;
+}
+
+export async function healChunkGroupsNow() {
+  await Promise.all(Object.keys(_chunkGroups).map(gid => _healGroup(gid)));
+}
+
+function _retryGroup(gid) {
+  const g = _chunkGroups[gid];
+  if (g) {
+    g.stalled = false; g.healStep = 0; g.lastProgressAt = Date.now();
+    _paintGroup(gid);
+    _healGroup(gid).then(() => _armWatch(gid));
+    return;
+  }
+  const f = _failedGroups.get(gid);
+  if (!f) return;
+  _failedGroups.delete(gid);
+  _chunkGroups[gid] = _newGroup(f.meta, f.docId);
+  _chunkGroups[gid].total = f.total;
+  _paintGroup(gid);
+  _healGroup(gid).then(() => { if (_chunkGroups[gid]) _armWatch(gid); });
+}
+
+function _failGroup(gid) {
+  const g = _chunkGroups[gid];
+  if (!g) return;
+  clearTimeout(g.timer);
+  const have = Object.keys(g.parts).length;
+  _failedGroups.set(gid, { total: g.total, meta: g.meta, docId: g.docId });
+  delete _chunkGroups[gid];
+  const el = _groupEl(gid);
+  if (el) _paintError(el, gid, have, g.total);
+  _log('warn', `[MIUT media] gave up on chunk group ${gid} at ${have}/${g.total} parts`);
+}
+
+function _finishGroup(gid) {
+  const g = _chunkGroups[gid];
+  if (!g) return;
+  clearTimeout(g.timer);
+  delete _chunkGroups[gid];
+  _doneGroups.add(gid);
+  if (_doneGroups.size > 300) _doneGroups.delete(_doneGroups.values().next().value);
+  const parts = Array.from({ length: g.total }, (_, i) => g.parts[i]);
+  _log('debug', `[MIUT media] group ${gid} complete (${g.total} parts), rendering`);
+  _removeChunkProgressBubble(gid);
+  const existing = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(g.docId)}"]`);
+  if (existing) existing.remove();
+  return renderMsg({ ...g.meta, encData: parts, type: g.meta.type === 'chunk' ? 'file' : g.meta.type, _assembled: true }, g.docId);
 }
 
 function _sweepStaleChunkGroups() {
-  const cutoff = Date.now() - STALE_CHUNK_GROUP_MS;
   for (const gid of Object.keys(_chunkGroups)) {
     const g = _chunkGroups[gid];
     if (!g) continue;
-    // A group left behind by a room the user is no longer in has no one
-    // watching its UI bubble any more — treat it as stale immediately
-    // rather than waiting out the time-based cutoff below. This replaces
-    // app.js's old bootApp()-time reset, which this module can no longer
-    // participate in now that it loads lazily, possibly well after
-    // bootApp() already ran for the current room.
-    const roomChanged = g.roomCode !== undefined && g.roomCode !== state.roomCode;
-    if (roomChanged || (g.firstSeenAt && g.firstSeenAt < cutoff)) {
-      _log('debug', `[MIUT media] evicting ${roomChanged ? 'orphaned (room changed)' : 'stale'} incomplete chunk group ${gid} (${Object.keys(g.parts).length}/${g.total} chunks, never completed)`);
-      _markChunkGroupFailed(gid);
+    if (g.roomCode !== undefined && g.roomCode !== state.roomCode) {
+      clearTimeout(g.timer);
+      delete _chunkGroups[gid];
+    } else if (Date.now() - g.firstSeenAt > CHUNK_TIMING.giveUpMs) {
+      _failGroup(gid);
     }
   }
   for (const uid of _lazyDataMap.keys()) {
@@ -356,22 +521,8 @@ function _sweepStaleChunkGroups() {
   }
 }
 
-function _markChunkGroupFailed(gid) {
-  const g = _chunkGroups[gid];
-  if (!g) return;
-  const have = Object.keys(g.parts).length;
-  const total = g.total;
-  delete _chunkGroups[gid];
-  const el = document.querySelector(`[data-group-id="${CSS.escape(gid)}"]`);
-  if (el) {
-    el.classList.remove('loading');
-    el.innerHTML = `<div class="msg-media-err">File didn't finish uploading — only ${have} of ${total} parts arrived. Ask the sender to resend.</div>`;
-  }
-  _log('warn', `[MIUT media] chunk group ${gid} marked failed after stalling at ${have}/${total} parts`);
-}
-
 function _renderChunkProgressBubble(gid, data, docId) {
-  if (document.querySelector(`[data-group-id="${CSS.escape(gid)}"]`)) return;
+  if (_groupEl(gid)) return;
   const area = document.getElementById('messages-area');
   if (!area) return;
   document.getElementById('msg-skeleton') && (document.getElementById('msg-skeleton').style.display = 'none');
@@ -391,16 +542,9 @@ function _renderChunkProgressBubble(gid, data, docId) {
     </div>
   </div></div></div>`;
   const _wasNearBottom = (area.scrollHeight - area.scrollTop - area.clientHeight) < 120;
-  area.appendChild(wrap);
+  _placeMsg(area, wrap, data);
   if (isMine || _wasNearBottom) scrollBottom();
   else showScrollFab();
-}
-
-function _updateChunkProgressBubble(gid, have, total) {
-  const el = document.querySelector(`[data-group-id="${CSS.escape(gid)}"] .media-decrypt-label`);
-  if (!el) return;
-  const isMine = el.closest('.msg-wrapper')?.classList.contains('sent');
-  el.textContent = _chunkProgressLabel(have, total, isMine);
 }
 
 function _removeChunkProgressBubble(gid) {
@@ -430,13 +574,13 @@ export function closeMediaViewer() {
 }
 
 export async function decryptAndShow(encData, mime, type, fileName, domId) {
-  if (!encData) {
+  if (!encData || (Array.isArray(encData) && !encData.length)) {
     _log('warn', '[MIUT media] decryptAndShow called with empty/missing encData — nothing to decrypt:', domId, { type, fileName });
     const el0 = document.getElementById(domId);
     if (el0) el0.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">Media unavailable</div>`;
     return;
   }
-  const cacheKey = 'blob_' + btoa(encData.slice(0, 32).replace(/[^a-zA-Z0-9]/g, '').padEnd(8, '0')).slice(0, 16);
+  const cacheKey = 'blob_' + btoa((Array.isArray(encData) ? encData[0] : encData).slice(0, 32).replace(/[^a-zA-Z0-9]/g, '').padEnd(8, '0')).slice(0, 16);
 
   let url = null;
 
@@ -453,13 +597,13 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
     try {
       const blob  = await decBytes(encData, mime, state.roomCode);
       url = URL.createObjectURL(blob);
-      const arrBuf = await blob.arrayBuffer();
-      await idbSetBlob(cacheKey, new Uint8Array(arrBuf));
-      _log('debug', '[MIUT media] decrypted fresh and cached:', domId, { bytes: arrBuf.byteLength });
+      (window.requestIdleCallback || setTimeout)(() => idbSetBlob(cacheKey, blob).catch(() => {}));
+      _log('debug', '[MIUT media] decrypted fresh:', domId, { bytes: blob.size });
     } catch (e) {
       _log('error', '[MIUT media] decryption FAILED — this is why the media never rendered:', domId, { type, mime, encDataLength: encData?.length }, e);
       const el = document.getElementById(domId);
-      if (el) el.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">This message could not be decrypted</div>`;
+      const why = String(e?.message || '').startsWith('decompress failed') ? "This file uses compression this browser can't open" : 'This message could not be decrypted';
+      if (el) el.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">${why}</div>`;
       return;
     }
   }
@@ -474,6 +618,16 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
     const img = document.createElement('img');
     img.src = url; img.alt = 'image'; img.loading = 'lazy'; img.style.cursor = 'pointer';
     img.addEventListener('click', () => openViewer('img', url));
+    img.addEventListener('error', () => {
+      el.classList.remove('loading');
+      el.innerHTML = `<div class="media-fallback"><div class="media-fallback-msg">This image can't be displayed on this device (unsupported format or too large).</div><div class="media-fallback-actions"><a class="media-fallback-dl" href="${esc(url)}" download="${esc(fileName || 'image')}">Download</a><button type="button" class="media-fallback-retry">Retry</button></div></div>`;
+      el.querySelector('.media-fallback-retry').addEventListener('click', async () => {
+        try { await idbSetBlob(cacheKey, null); } catch {}
+        el.classList.add('loading');
+        el.innerHTML = '<div class="media-decrypt-spinner"></div><div class="media-decrypt-label">Decrypting…</div>';
+        decryptAndShow(encData, mime, type, fileName, domId);
+      });
+    }, { once: true });
     const hint = document.createElement('div');
     hint.className = 'media-tap-hint'; hint.textContent = 'Tap to expand';
     el.innerHTML = ''; el.appendChild(img); el.appendChild(hint);
