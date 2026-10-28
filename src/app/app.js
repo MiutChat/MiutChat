@@ -1167,11 +1167,28 @@ async function _checkAnnouncement() {
 
   for (const dbName of candidates) {
     try {
-      const snap = await firebase.firestore(firebase.app(dbName))
-        .collection('config').doc('announcement').get();
+      // The config collection is readable only by a signed-in user ON THAT SHARD. ensureAuth is a cached per-shard
+      // anonymous sign-in, so this is free for shards the user already uses — but without it a fallback
+      // shard (e.g. db1 when db0's quota is exhausted) answers permission-denied and the announcement
+      // is silently skipped. Time-boxed so a shard stuck in quota backoff can't stall the fallback.
+      let _annTimer;
+      const _annTimeout = new Promise((_, rej) => { _annTimer = setTimeout(() => rej(new Error('announcement read timed out')), 8000); });
+      let snap;
+      try {
+        snap = await Promise.race([
+          (async () => {
+            await ensureAuth(dbName);
+            return firebase.firestore(firebase.app(dbName)).collection('config').doc('announcement').get();
+          })(),
+          _annTimeout,
+        ]);
+      } finally { clearTimeout(_annTimer); }
       const data = snap.exists ? (snap.data() || {}) : {};
       const msg = String(data.message || '').trim();
-      const structured = Array.isArray(data.blocks) && data.blocks.length > 0;
+      // Components come either as typed `blocks`, or as ONE plain string in `message` using the
+      // line syntax (![alt](id =WxH), [!poll …], [!notice …] …) — see lazy/announcement.js.
+      const dsl = !(Array.isArray(data.blocks) && data.blocks.length) && /^[ \t]*(?:\[!|!\[)/m.test(msg);
+      const structured = dsl || (Array.isArray(data.blocks) && data.blocks.length > 0);
       if (!msg && !structured) return; // doc exists on this shard but is empty — don't fall through to others
 
       let seen = '';
@@ -1188,7 +1205,7 @@ async function _checkAnnouncement() {
         } catch (e) {
           _sysConsole?.warn?.('[MIUT] Structured announcement failed, falling back to message:', e?.message);
         }
-        if (!msg) return;
+        if (!msg || dsl) return;   // never dump raw [!tags] as text
       }
       if (seen === msg) return;
       _showAnnouncementPopup(msg);

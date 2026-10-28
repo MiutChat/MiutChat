@@ -10,10 +10,9 @@
  * client) are skipped, so the format can grow without breaking old clients.
  *
  *   config/announcement = {
- *     id:     "oct-launch",        // required for polls; change it to re-show to everyone
- *     rev:    2,                   // optional: bump to re-show after an edit, keeping the same poll
- *     title:  "WHAT'S NEW",        // optional, default "ANNOUNCEMENT"
- *     blocks: [ { type: "...", ... }, ... ]      // see COMPONENTS below
+ *     message: "<one plain string, one component per line — see parseAnnouncementText>",   // simplest
+ *     // or, for full control, typed blocks:
+ *     id: "oct-launch", rev: 2, title: "WHAT'S NEW", blocks: [ { type: "...", ... }, ... ]
  *   }
  *
  * Adding a new component = add one entry to COMPONENTS ({ normalize, render }).
@@ -365,32 +364,132 @@ export const COMPONENTS = {
   },
 };
 
+
+/* ── plain-string format ──────────────────────────────────────────────
+ * Admins can write the whole announcement as ONE string (the `message` field), one component per line:
+ *
+ *   ![Banner](waRt =320x)                       image: StoreGit id or URL, optional =WxH / =Wx / =xH
+ *   [![Banner](waRt =320x)](https://site.com)   clickable image
+ *   [!title WHAT'S NEW]                         modal title            ([!id oct] / [!rev 2] also exist)
+ *   [!notice warn | Maintenance | Sunday 02:00] level (info|success|warn|danger) | title | text
+ *   [!countdown 2026-11-01T02:00:00Z | MAINTENANCE IN | In progress]
+ *   [!poll next | What next? | Voice notes | Themes | Threads]     add  multi=2  or  closes=2026-11-01T00:00:00Z
+ *   [!results next]                             add  show=after-vote  or  live=false
+ *   [!link Release notes | https://example.com | optional description]
+ *   [!button dismiss | GOT IT]                  [!button open-url | Open | https://…]  [!button copy | Copy | CODE]
+ *   anything else                               normal text (Markdown-style), consecutive lines = one text block
+ *
+ * Use \| for a literal pipe. Everything still goes through the same validators as typed blocks.
+ */
+const OPT_KEYS = new Set(['w', 'h', 'style', 'multi', 'closes', 'live', 'show', 'caption', 'href', 'alt']);
+const LEVELS = ['info', 'success', 'warn', 'danger'];
+const TAG_RE = /^\[!([a-z]+)(?:[ \t]+(.*))?\]$/i;
+const IMG_RE = /^(\[)?!\[([^\]]*)\]\(([^\s)]+)(?:[ \t]+=(\d*)x(\d*))?\)(?:\]\(([^\s)]+)\))?$/;
+const COMPONENT_LINE = /^[ \t]*(?:\[!|!\[|\[!\[)/m;
+
+export function looksLikeComponentText(s) { return COMPONENT_LINE.test(String(s || '')); }
+
+function _pipes(s) {
+  const out = []; let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' && s[i + 1] === '|') { cur += '|'; i++; }
+    else if (c === '|') { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out.map(x => x.trim());
+}
+function _split(rest) {
+  const opts = {}, pos = [];
+  for (const part of _pipes(rest || '')) {
+    const m = /^([a-z]+)=(.*)$/i.exec(part);
+    if (m && OPT_KEYS.has(m[1].toLowerCase())) opts[m[1].toLowerCase()] = m[2].trim(); else pos.push(part);
+  }
+  return { opts, pos };
+}
+
+export function parseAnnouncementText(text) {
+  const meta = {}, blocks = [];
+  let buf = [];
+  const flush = () => { const t = buf.join('\n').trim(); buf = []; if (t) blocks.push({ type: 'text', text: t }); };
+  for (const raw of String(text || '').replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.trim();
+    const im = IMG_RE.exec(line);
+    if (im && !!im[1] === !!im[6]) {
+      flush(); blocks.push({ type: 'image', alt: im[2], src: im[3], w: im[4], h: im[5], href: im[6] || undefined }); continue;
+    }
+    const tm = TAG_RE.exec(line);
+    if (!tm) { buf.push(raw); continue; }
+    const tag = tm[1].toLowerCase(), rest = tm[2] || '';
+    if (tag === 'id' || tag === 'rev' || tag === 'title') { meta[tag] = rest.trim(); continue; }
+    const { opts, pos } = _split(rest);
+    let b = null;
+    switch (tag) {
+      case 'image':     b = { type: 'image', src: pos[0], alt: opts.alt ?? pos[1], caption: opts.caption ?? pos[2], w: opts.w, h: opts.h, href: opts.href }; break;
+      case 'notice': {
+        const level = LEVELS.includes((pos[0] || '').toLowerCase()) ? pos.shift().toLowerCase() : 'info';
+        b = pos.length > 1 ? { type: 'notice', level, title: pos[0], text: pos.slice(1).join(' | ') } : { type: 'notice', level, text: pos[0] }; break;
+      }
+      case 'link':      b = { type: 'link', label: pos[0], url: pos[1], desc: pos[2] }; break;
+      case 'button':    b = { type: 'button', action: (pos[0] || '').toLowerCase(), label: pos[1], value: pos[2], style: opts.style }; break;
+      case 'countdown': b = { type: 'countdown', to: pos[0], label: pos[1], doneText: pos[2] }; break;
+      case 'poll':      b = { type: 'poll', id: pos[0], question: pos[1], options: pos.slice(2), multi: opts.multi != null, max: opts.multi, closesAt: opts.closes }; break;
+      case 'results': {                                                // "[!results next]" or "[!results next show=after-vote live=false]"
+        const toks = (pos[0] || '').split(/\s+/), o = { ...opts };
+        for (const t of toks.slice(1)) { const m = /^([a-z]+)=(.*)$/i.exec(t); if (m) o[m[1].toLowerCase()] = m[2]; }
+        b = { type: 'results', pollId: toks[0], live: o.live !== 'false', visibility: o.show === 'after-vote' ? 'after-vote' : 'always' }; break;
+      }
+      default:          buf.push(raw); continue;                      // unknown tag → show as plain text
+    }
+    flush(); blocks.push(b);
+  }
+  flush();
+  return { meta, blocks };
+}
+
+function _hash(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
+
+/** Source of truth for "what is this announcement": typed `blocks` win; otherwise a component-string `message`. */
+function _expand(data) {
+  let blocks = Array.isArray(data?.blocks) ? data.blocks : [];
+  let id = data?.id, rev = data?.rev, title = data?.title;
+  if (!blocks.length && typeof data?.message === 'string' && looksLikeComponentText(data.message)) {
+    const p = parseAnnouncementText(data.message);
+    blocks = p.blocks; id = id || p.meta.id; rev = rev ?? p.meta.rev; title = title || p.meta.title;
+  }
+  const explicit = ID_RE.test(String(id || ''));
+  if (!explicit) {                                   // polls need an id: derive it from the poll definitions only,
+    const polls = blocks.filter(b => b?.type === 'poll');   // so editing the text around a poll never resets its votes
+    id = polls.length ? 'p' + _hash(JSON.stringify(polls.map(b => [b.id, b.question, b.options]))) : '';
+  }
+  return { id: String(id || ''), explicit, rev, title, blocks };
+}
+
 /* ── normalise + render ───────────────────────────────────────────── */
 export function normalizeAnnouncement(data, cfg = _cfg()) {
-  const annId = ID_RE.test(String(data?.id || '')) ? String(data.id) : '';
-  const ctx = { cfg, annId };
-  const raw = Array.isArray(data?.blocks) ? data.blocks.slice(0, LIMITS.blocks) : [];
+  const x = _expand(data);
+  const ctx = { cfg, annId: x.id };
+  const raw = x.blocks.slice(0, LIMITS.blocks);
   const out = [], polls = new Set();
   for (const r of raw) {
     const comp = r && Object.prototype.hasOwnProperty.call(COMPONENTS, r.type) ? COMPONENTS[r.type] : null;
     if (!comp) { _log('warn', '[ann] skipping unknown block type:', String(r?.type).slice(0, 30)); continue; }
     let b = null;
     try { b = comp.normalize(r, ctx); } catch (e) { _log('warn', '[ann] bad block', e?.message); }
-    if (!b) continue;
+    if (!b) { _log('warn', '[ann] dropped invalid', r.type, 'block'); continue; }
     if (b.type === 'poll') { if (polls.has(b.id)) continue; polls.add(b.id); }
     out.push(b);
   }
   const blocks = out.filter(b => b.type !== 'results' || polls.has(b.pollId));
-  return { id: annId, rev: data?.rev != null ? String(data.rev).slice(0, 20) : '', title: str(data?.title, 60) || 'ANNOUNCEMENT', blocks };
+  return { id: x.id, keyId: x.explicit ? x.id : '', rev: x.rev != null ? String(x.rev).slice(0, 20) : '', title: str(x.title, 60) || 'ANNOUNCEMENT', blocks };
 }
 
-/** Identity used to remember "already seen". id(+rev) when given; otherwise a hash of the normalised content. */
+/** Identity used to remember "already seen": explicit id(+rev) when given, otherwise a hash of the content. */
 export function announcementKey(data, cfg) {
   const a = normalizeAnnouncement(data, cfg);
-  if (a.id) return 'ann:' + a.id + (a.rev ? '@' + a.rev : '');
-  let h = 5381; const s = JSON.stringify(a.blocks);
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-  return 'ann:h' + (h >>> 0).toString(36);
+  if (a.keyId) return 'ann:' + a.keyId + (a.rev ? '@' + a.rev : '');
+  return 'ann:h' + _hash(JSON.stringify(a.blocks));
 }
 
 export function renderAnnouncement(data, { dbName = 'miut-db0', close = () => {}, cfg } = {}) {
