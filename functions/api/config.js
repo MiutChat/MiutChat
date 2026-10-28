@@ -81,6 +81,21 @@ function discoverShards(env) {
   return shards;
 }
 
+/**
+ * Announcement components config (all optional):
+ *   ANNOUNCE_IMG_HOSTS  comma-separated hostnames allowed to serve announcement images
+ *                       ("*.example.com" wildcards ok). Default: the StoreGit host.
+ *   STOREGIT_BASE       StoreGit origin used to turn short ids into /api/raw/<id> URLs.
+ */
+function announceConfig(env) {
+  const HOST_RE = /^(?:\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
+  let base = 'https://storegit.pages.dev';
+  try { const u = new URL(String(env.STOREGIT_BASE || base)); if (u.protocol === 'https:') base = u.origin; } catch {}
+  const hosts = String(env.ANNOUNCE_IMG_HOSTS || '')
+    .split(',').map(h => h.trim().toLowerCase()).filter(h => HOST_RE.test(h)).slice(0, 20);
+  return { storegitBase: base, imgHosts: hosts };
+}
+
 export async function onRequest(ctx) {
   const { request, env } = ctx;
 
@@ -90,7 +105,7 @@ export async function onRequest(ctx) {
 
   const databases = discoverShards(env);
 
-  return new Response(JSON.stringify({ databases }), {
+  return new Response(JSON.stringify({ databases, announce: announceConfig(env) }), {
     status: 200,
     headers: {
       'Content-Type':  'application/json;charset=UTF-8',

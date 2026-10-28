@@ -113,6 +113,7 @@ async function _loadConfig() {
       }
       if (!res.ok) throw new Error('Config fetch HTTP ' + res.status);
       const data = await res.json();
+      if (data.announce && typeof data.announce === 'object') window.__MIUT_ANNOUNCE__ = data.announce; // image hosts + StoreGit base for announcements
       if (Array.isArray(data.databases) && data.databases.length) {
         const active = data.databases.filter(d =>
           d.active && d.config?.apiKey && d.config.apiKey.length > 10

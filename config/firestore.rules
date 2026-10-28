@@ -74,6 +74,44 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // ── Announcement polls (see src/app/lazy/announcement.js) ──────────────
+    // votes/{uid}: one create-only ballot per auth uid. tally/{optId}: counters that may only be
+    // bumped by exactly +1, in the SAME batch that creates the caller's vote doc, for an option
+    // that vote actually contains ('_total' = voter count). Replaying a tally write fails because
+    // the vote doc already exists by then; re-voting fails because votes are create-only.
+    function pollVotePath(pollKey) {
+      return /databases/$(database)/documents/announcementPolls/$(pollKey)/votes/$(request.auth.uid);
+    }
+    function tallyBumpOk(pollKey, optId) {
+      let v = getAfter(pollVotePath(pollKey)).data;
+      return !exists(pollVotePath(pollKey))
+        && (optId == '_total' || optId in v.choices);
+    }
+
+    match /announcementPolls/{pollKey}/votes/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow create: if isSignedIn()
+        && request.auth.uid == uid
+        && pollKey.size() <= 70
+        && request.resource.data.keys().hasOnly(['choices', 'ts'])
+        && request.resource.data.choices is list
+        && request.resource.data.choices.size() >= 1
+        && request.resource.data.choices.size() <= 8
+        && request.resource.data.ts == request.time;
+      allow update, delete: if false;
+    }
+
+    match /announcementPolls/{pollKey}/tally/{optId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn()
+        && optId.size() <= 32
+        && request.resource.data.keys().hasOnly(['n'])
+        && request.resource.data.n is int
+        && request.resource.data.n == (resource == null ? 1 : resource.data.n + 1)
+        && tallyBumpOk(pollKey, optId);
+      allow delete: if false;
+    }
+
     match /feedback/{feedbackId} {
       allow create: if isSignedIn()
         && request.resource.data.keys().hasOnly(['roomCode','rating','tags','comment','appVersion','createdAt'])

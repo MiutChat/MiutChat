@@ -1169,13 +1169,28 @@ async function _checkAnnouncement() {
     try {
       const snap = await firebase.firestore(firebase.app(dbName))
         .collection('config').doc('announcement').get();
-      const msg = (snap.exists ? (snap.data()?.message || '') : '').trim();
-      if (!msg) return; // doc exists on this shard but is empty — don't fall through to others
+      const data = snap.exists ? (snap.data() || {}) : {};
+      const msg = String(data.message || '').trim();
+      const structured = Array.isArray(data.blocks) && data.blocks.length > 0;
+      if (!msg && !structured) return; // doc exists on this shard but is empty — don't fall through to others
 
       let seen = '';
       try { seen = localStorage.getItem('miut_announcement_seen') || ''; } catch {}
-      if (seen === msg) return;
 
+      // Structured announcement (components) takes priority; `message` is the legacy plain-text form
+      // and stays as the fallback if the components module can't load or yields nothing renderable.
+      if (structured) {
+        try {
+          const m = await _loadAnnouncement();
+          const key = m.announcementKey(data);
+          if (seen === key) return;
+          if (_showStructuredAnnouncement(m, data, dbName, key)) return;
+        } catch (e) {
+          _sysConsole?.warn?.('[MIUT] Structured announcement failed, falling back to message:', e?.message);
+        }
+        if (!msg) return;
+      }
+      if (seen === msg) return;
       _showAnnouncementPopup(msg);
       return;
     } catch (e) {
@@ -1185,12 +1200,37 @@ async function _checkAnnouncement() {
   }
 }
 
+function _showStructuredAnnouncement(m, data, dbName, key) {
+  const overlay = $('announcement-modal');
+  const body    = $('announcement-body');
+  if (!overlay || !body) return false;
+  let view = null;
+  const close = () => {
+    overlay.style.display = 'none';
+    try { localStorage.setItem('miut_announcement_seen', key); } catch {}
+    view?.destroy();          // stops countdown timers + live poll listeners
+    body.replaceChildren();
+  };
+  view = m.renderAnnouncement(data, { dbName, close });
+  if (!view.hasBlocks) { view.destroy(); return false; }
+  const title = $('announcement-title');
+  if (title) title.textContent = view.title;
+  body.classList.add('ann-structured');
+  body.replaceChildren(view.root);
+  overlay.style.display = 'flex';
+  $('announcement-close-btn')?.addEventListener('click', close, { once: true });
+  $('announcement-ok-btn')?.addEventListener('click', close, { once: true });
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); }, { once: true });
+  return true;
+}
+
 function _showAnnouncementPopup(msg) {
   const overlay = $('announcement-modal');
   const body    = $('announcement-body');
   if (!overlay || !body) return;
   // true = allow "#"/"##" to render as headings here — announcements are
   // admin-authored, unlike regular chat messages where "#" is just prose.
+  body.classList.remove('ann-structured');
   body.innerHTML = renderTextContent(msg, true);
   overlay.style.display = 'flex';
 
@@ -4695,7 +4735,7 @@ function _renderBlocks(escapedText, allowHeadings) {
   return out.join('\n');
 }
 
-function renderTextContent(text, allowHeadings) {
+export function renderTextContent(text, allowHeadings) {
   // Multi-line code blocks (```like this```) are pulled out and stashed
   // FIRST, before esc()/_renderBlocks() even run — their content must
   // never be treated as list/blockquote lines, never have other inline
@@ -6423,6 +6463,7 @@ function _lazyModule(importer, label) {
 
 const _loadFileTransfer = _lazyModule(q => import('./lazy/file-transfer.js' + q), 'file sharing');
 const _loadFeedback = _lazyModule(q => import('./lazy/feedback.js' + q), 'feedback');
+const _loadAnnouncement = _lazyModule(q => import('./lazy/announcement.js' + q), 'announcement');
 
 window.__MIUT_APP_READY__ = true;
 document.dispatchEvent(new CustomEvent('miut-app:ready'));
