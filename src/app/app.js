@@ -1617,6 +1617,7 @@ async function handleEnter() {
     if (_expired) { setLoading(btn, false); return; }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
+    _roomTtlMs = Number(roomSnap.data()?.msgTtlMs) > 0 ? Number(roomSnap.data().msgTtlMs) : 0;
       _membersCanManage = roomSnap.data()?.membersCanManage === true;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     _healRoomSchema(code, roomSnap.data()).catch(() => {});
@@ -1821,6 +1822,7 @@ async function checkApprovalAndBoot(_retryCount) {
     if (roomSnap.exists) {
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
+      _roomTtlMs = Number(roomSnap.data()?.msgTtlMs) > 0 ? Number(roomSnap.data().msgTtlMs) : 0;
       _membersCanManage = roomSnap.data()?.membersCanManage === true;
       _primeCrypto(state.roomCode, _roomEpoch, _roomSalt);
       { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
@@ -2265,6 +2267,7 @@ function startRoomListener() {
       const newTtl = (d.msgTtlMs || 0);
       if (newTtl !== _roomTtlMs) {
         _roomTtlMs = newTtl;
+        try { _runExpirySweep(); } catch {}
         const ttlEl = $('ttl-display');
         if (ttlEl) ttlEl.textContent = _fmtTtl(_roomTtlMs);
       }
@@ -2379,6 +2382,38 @@ let _roomTtlMs = 0; // 0 = no expiry
 //     // (combine with your existing sender/admin-based delete rule for
 //     // manual "Delete Message" — this is strictly additive, not a replacement)
 //   }
+// Single source of truth for "is this message past the room's TTL?".
+// Uses the server createdAt (what the Firestore rules enforce) and only falls
+// back to the client `ts`. The old checks used data.ts alone, which is
+// missing/zero on some docs, so expiry silently never fired for them.
+function _isMsgExpired(data, ttlMs = _roomTtlMs) {
+  if (!ttlMs || ttlMs <= 0 || !data) return false;
+  const t = _createdMs(data) || data.ts || 0;
+  return t > 0 && (Date.now() - t) >= ttlMs;
+}
+
+// Delete an already-expired message (all chunks if it is a chunked file) from
+// Firestore and the local IDB cache. Never renders it.
+function _purgeExpiredDoc(code, docId, data) {
+  try {
+    const col = db.collection('rooms').doc(code).collection('messages');
+    const gid = data && data.groupId;
+    const p = gid
+      ? col.where('groupId', '==', gid).get().then(snap => {
+          if (snap.empty) return;
+          const b = db.batch(); snap.forEach(d => b.delete(d.ref)); return b.commit();
+        })
+      : col.doc(docId).delete();
+    p.then(() => _log('debug', '[MIUT ttl] purged expired message:', docId))
+     .catch(e => _log('warn', '[MIUT ttl] expired purge rejected (check Firestore rules):', docId, e));
+  } catch (e) {}
+  openIDB().then(db2 => new Promise(res => {
+    const tx = db2.transaction('msgs', 'readwrite');
+    tx.objectStore('msgs').delete(docId);
+    tx.oncomplete = res; tx.onerror = res;
+  })).catch(() => {});
+}
+
 function _startExpirySweep() {
   if (_expiryTimer) clearInterval(_expiryTimer);
   _expiryTimer = setInterval(() => { _runExpirySweep(); }, 5000); // check every 5s for accurate countdowns — chunk-group sweeping now lives entirely inside file-transfer.js's own timer, started once that module loads
@@ -2618,6 +2653,7 @@ async function loadCachedMessages() {
       $('room-welcome')  && ($('room-welcome').style.display  = 'none');
       for (const row of cached) {
         _renderedIds.add(row.id);
+        if (_isMsgExpired(row.data)) { _purgeExpiredDoc(code, row.id, row.data); continue; }
         await renderMsg(row.data, row.id);
       }
       cachedHigh = cached.reduce((m, r) => Math.max(m, r.ts || 0), 0);
@@ -2681,11 +2717,9 @@ async function fetchHistoryOnce(code, cachedHigh = 0) {
       // rule rejecting it). Catch it here too: skip rendering AND delete it
       // right away, so history load itself is a second, independent
       // enforcement point, not just the interval sweep.
-      if (_roomTtlMs && data.ts && (Date.now() - data.ts) >= _roomTtlMs) {
+      if (_isMsgExpired(data)) {
         _renderedIds.add(doc.id); // prevent any other path from rendering it either
-        db.collection('rooms').doc(code).collection('messages').doc(doc.id).delete()
-          .then(() => _log('debug', '[MIUT ttl] purged already-expired message found at history load:', doc.id))
-          .catch(e => _log('warn', '[MIUT ttl] failed to delete an already-expired message — it will keep reappearing until this succeeds:', doc.id, e));
+        _purgeExpiredDoc(code, doc.id, data);
         continue;
       }
       _renderedIds.add(doc.id);
@@ -2748,6 +2782,7 @@ async function loadEarlierMessages() {
       if (_renderedIds.has(doc.id)) continue;
       const data = doc.data();
       _renderedIds.add(doc.id);
+      if (_isMsgExpired(data)) { _purgeExpiredDoc(state.roomCode, doc.id, data); continue; }
       await renderMsg(data, doc.id, boundaryEl); // sequential — see fetchHistoryOnce note
       cacheMsg(doc.id, state.roomCode, data).catch(() => {});
     }
@@ -3052,6 +3087,7 @@ export function startChatListeners() {
           // Canary check — detect replay/injection (async, non-blocking)
           _registerCanary(id, data.enc || data.encData || '').catch(() => {});
           _renderedIds.add(id);
+          if (_isMsgExpired(data)) { _purgeExpiredDoc(code, id, data); continue; }
           // PART 8: replay protection — reject stale or duplicate messages
           const _msgTs = data.ts || 0;
           if (_msgTs && typeof validateMessageTimestamp === 'function' && !validateMessageTimestamp(_msgTs)) {
@@ -4199,7 +4235,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
     // never got cleaned up even after every regular message had vanished
     // under the same TTL, silently outliving the "vanish" promise.
     div.dataset.docId = docId || '';
-    div.dataset.ts    = data.ts || '';
+    div.dataset.ts    = String(_createdMs(data) || data.ts || '');
     // Always decrypt — never render the raw enc field as plaintext.
     // This blocks injected system messages via direct Firestore REST writes
     // (Attack 4): an injected message without the room code will fail
@@ -4214,7 +4250,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
   wrap.className    = `msg-wrapper ${isMine ? 'sent' : 'received'}`;
   wrap.dataset.docId    = docId || '';
   wrap.dataset.senderId = data.senderId || '';
-  wrap.dataset.ts       = data.ts || '';
+  wrap.dataset.ts       = String(_createdMs(data) || data.ts || '');
   wrap.dataset.type     = data.type || 'text';
   wrap.dataset.fileName = data.fileName || '';
   wrap.dataset.groupId  = data.groupId || ''; // needed so TTL expiry can clean up ALL chunks of a large file, not just this one doc — see _runExpirySweep
@@ -5593,6 +5629,7 @@ async function joinFromInvite() {
     }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
+    _roomTtlMs = Number(roomSnap.data()?.msgTtlMs) > 0 ? Number(roomSnap.data().msgTtlMs) : 0;
       _membersCanManage = roomSnap.data()?.membersCanManage === true;
     { const _iv = roomSnap.data()?.inactivityTtlMs; _roomExpiryMs = _iv !== undefined ? _iv : 300000; }
     _healRoomSchema(code, roomSnap.data()).catch(() => {});
