@@ -2,6 +2,7 @@
 'use strict';
 // @ts-check
 // script internals are now encapsulated — only window.X exports below are public.
+import { runBacklogSweepLoop } from './backlog-sweep.js';
 
 /* ── Global error telemetry ─────────────────────────────────────────────────
  * Catches all uncaught JS errors and unhandled promise rejections.
@@ -1770,6 +1771,9 @@ function bootApp() {
   _initSessionHmac().catch(() => {});
   _initAntiCapture();
   _startExpirySweep();
+  // Catches any expired backlog older than what gets paginated in below —
+  // see _sweepExpiredBacklog for why this is needed on top of the DOM sweep.
+  if (_roomTtlMs > 0) _sweepExpiredBacklog(state.roomCode, _roomTtlMs);
 
   // Load IDB cache instantly, then fetch history from Firestore
   loadCachedMessages();
@@ -2268,6 +2272,10 @@ function startRoomListener() {
       if (newTtl !== _roomTtlMs) {
         _roomTtlMs = newTtl;
         try { _runExpirySweep(); } catch {}
+        // TTL was just turned on, shortened, or (re)set to a value that puts
+        // older-than-page-1 history back in scope — sweep the full backlog,
+        // not just whatever's currently rendered.
+        if (_roomTtlMs > 0) _sweepExpiredBacklog(state.roomCode, _roomTtlMs);
         const ttlEl = $('ttl-display');
         if (ttlEl) ttlEl.textContent = _fmtTtl(_roomTtlMs);
       }
@@ -2506,6 +2514,59 @@ function _runExpirySweep() {
     }
     w.querySelector('.msg-ttl-timer')?.remove(); // remove old text timer if present
   });
+}
+
+// ─── Message TTL — full-history backlog sweep ──────────────────────────────
+// _runExpirySweep (DOM-driven, every 5s) and the expiry checks inside
+// fetchHistoryOnce/loadEarlierMessages only ever see messages that have
+// actually been loaded into THIS client — which by default is just the
+// newest _HISTORY_PAGE (100) messages, or however far someone has clicked
+// "Load earlier". A message past its TTL that sits further back than that
+// is invisible to every path above: never queried, so never deleted, no
+// matter how long an active client sits in the room with the sweep
+// ticking. For a busy/old room this leaves most of its expired backlog
+// stuck forever. This sweep queries for expired messages directly,
+// independent of what's paginated into the DOM, and runs once per room
+// entry plus whenever the room's msgTtlMs changes (see startRoomListener).
+const _BACKLOG_SWEEP_PAGE = 400;
+let _backlogSweepInFlight = false;
+
+async function _sweepExpiredBacklog(code, ttlMs) {
+  if (!ttlMs || ttlMs <= 0 || !code || !db) return;
+  if (_backlogSweepInFlight) return; // avoid overlapping sweeps (boot + listener firing close together)
+  _backlogSweepInFlight = true;
+  try {
+    const cutoff = firebase.firestore.Timestamp.fromMillis(Date.now() - ttlMs);
+    const col = db.collection('rooms').doc(code).collection('messages');
+
+    const { pages, exhausted } = await runBacklogSweepLoop(
+      async () => {
+        const snap = await col.where('createdAt', '<=', cutoff).limit(_BACKLOG_SWEEP_PAGE).get();
+        return snap.docs;
+      },
+      async (docs) => {
+        const batch = db.batch();
+        docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+        try {
+          const idb = await openIDB();
+          const tx  = idb.transaction('msgs', 'readwrite');
+          const st  = tx.objectStore('msgs');
+          docs.forEach(d => st.delete(d.id));
+        } catch {}
+      },
+      _BACKLOG_SWEEP_PAGE
+    );
+    if (pages > 0) _log('debug', '[MIUT ttl] backlog sweep:', pages, 'page(s)', exhausted ? '(exhausted)' : '(hit safety cap — will resume next sweep)');
+  } catch (e) {
+    // Most likely cause: Firestore rules reject the delete (see the
+    // messageExpired()-based rule in config/firestore.rules — this needs
+    // to be the rule actually deployed to the project, not just present
+    // in this repo).
+    _log('warn', '[MIUT ttl] backlog sweep failed (check Firestore rules allow TTL-based deletion by any room member):', e);
+  } finally {
+    _backlogSweepInFlight = false;
+  }
 }
 
 // ─── Message TTL helpers ──────────────────────────────────────────────────────
