@@ -2,7 +2,6 @@
 'use strict';
 // @ts-check
 // script internals are now encapsulated — only window.X exports below are public.
-import { runBacklogSweepLoop } from './backlog-sweep.js';
 
 /* ── Global error telemetry ─────────────────────────────────────────────────
  * Catches all uncaught JS errors and unhandled promise rejections.
@@ -2531,6 +2530,30 @@ function _runExpirySweep() {
 const _BACKLOG_SWEEP_PAGE = 400;
 let _backlogSweepInFlight = false;
 
+// Pure loop, deliberately NOT imported from src/app/backlog-sweep.js: app.js
+// is built with --bundle=false (see scripts/build.js's baseFlags) and has no
+// other top-level imports anywhere in it — only the lazy/ chunks import FROM
+// app.js, never the reverse. A static `import` added here would survive
+// un-inlined into app.min.js and 404 in production (confirmed: that's
+// exactly what broke the splash screen the first time this landed), since
+// build.js has no step that emits backlog-sweep.js into dist/. This is a
+// deliberate duplicate of runBacklogSweepLoop in backlog-sweep.js — that
+// file stays around purely so test/backlog-sweep.test.js can unit test the
+// loop in Node without loading all of app.js (which has browser-only
+// top-level side effects, e.g. the navigator.sendBeacon error-reporting IIFE
+// a few lines up, and would throw immediately outside a browser). If you
+// change the looping/termination logic here, mirror the change there too.
+async function _runBacklogSweepLoop(fetchPage, deletePage, pageSize, maxPages = 40) {
+  let pages = 0;
+  for (; pages < maxPages; pages++) {
+    const items = await fetchPage();
+    if (!items || !items.length) return { pages, exhausted: true };
+    await deletePage(items);
+    if (items.length < pageSize) return { pages: pages + 1, exhausted: true };
+  }
+  return { pages, exhausted: false };
+}
+
 async function _sweepExpiredBacklog(code, ttlMs) {
   if (!ttlMs || ttlMs <= 0 || !code || !db) return;
   if (_backlogSweepInFlight) return; // avoid overlapping sweeps (boot + listener firing close together)
@@ -2539,7 +2562,7 @@ async function _sweepExpiredBacklog(code, ttlMs) {
     const cutoff = firebase.firestore.Timestamp.fromMillis(Date.now() - ttlMs);
     const col = db.collection('rooms').doc(code).collection('messages');
 
-    const { pages, exhausted } = await runBacklogSweepLoop(
+    const { pages, exhausted } = await _runBacklogSweepLoop(
       async () => {
         const snap = await col.where('createdAt', '<=', cutoff).limit(_BACKLOG_SWEEP_PAGE).get();
         return snap.docs;
