@@ -959,13 +959,18 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:3px;border-rad
 .ann-cd-num{font-family:var(--fui);font-weight:800;font-size:1.5rem;color:var(--teal);font-variant-numeric:tabular-nums}
 .ann-cd-unit{font-family:var(--fmono);font-size:.56rem;letter-spacing:2px;color:var(--text2);text-transform:uppercase}
 .ann-countdown-done{font-family:var(--fui);font-weight:800;color:var(--teal)}
-.ann-poll,.ann-results{padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:var(--surf);display:flex;flex-direction:column;gap:10px}
+.ann-poll{padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:var(--surf);display:flex;flex-direction:column;gap:10px}
 .ann-poll-q{font-family:var(--fui);font-weight:700;font-size:.86rem;color:var(--text)}
 .ann-poll-opts{display:flex;flex-direction:column;gap:6px}
 .ann-opt{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:12px;cursor:pointer;font-family:var(--fmono);font-size:.72rem}
 .ann-opt:has(input:checked){border-color:var(--teal);background:var(--teal-dim)}
 .ann-opt input{accent-color:var(--teal)}
+.ann-opt-other{flex-wrap:wrap}
+.ann-opt-other-text{flex:1;min-width:120px;background:var(--surf2);border:1px solid var(--border);border-radius:8px;padding:7px 10px;color:var(--text);font-family:var(--fmono);font-size:.7rem;outline:none;transition:border-color var(--fast) ease}
+.ann-opt-other-text:focus{border-color:var(--teal)}
+.ann-opt-other-text:disabled{opacity:.5}
 .ann-poll-msg,.ann-res-foot{font-family:var(--fmono);font-size:.64rem;color:var(--text2);min-height:1em}
+.ann-results-inline{display:flex;flex-direction:column;gap:10px;margin-top:2px;padding-top:12px;border-top:1px solid var(--border)}
 .ann-res-row{display:flex;flex-direction:column;gap:4px}
 .ann-res-top{display:flex;justify-content:space-between;gap:10px;font-family:var(--fmono);font-size:.7rem}
 .ann-res-val{color:var(--text2);white-space:nowrap}

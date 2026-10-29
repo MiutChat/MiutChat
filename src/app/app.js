@@ -1185,27 +1185,23 @@ async function _checkAnnouncement() {
       } finally { clearTimeout(_annTimer); }
       const data = snap.exists ? (snap.data() || {}) : {};
       const msg = String(data.message || '').trim();
-      // Components come either as typed `blocks`, or as ONE plain string in `message` using the
-      // line syntax (![alt](id =WxH), [!poll …], [!notice …] …) — see lazy/announcement.js.
-      const dsl = !(Array.isArray(data.blocks) && data.blocks.length) && /^[ \t]*(?:\[!|!\[)/m.test(msg);
-      const structured = dsl || (Array.isArray(data.blocks) && data.blocks.length > 0);
-      if (!msg && !structured) return; // doc exists on this shard but is empty — don't fall through to others
+      // config/announcement.message is the ONE source of truth — one plain string,
+      // one component per line (![alt](id =WxH), [!poll …], [!notice …] …), or just
+      // plain prose if the admin wrote no tags at all. See lazy/announcement.js.
+      if (!msg) return; // doc exists on this shard but is empty — don't fall through to others
 
       let seen = '';
       try { seen = localStorage.getItem('miut_announcement_seen') || ''; } catch {}
 
-      // Structured announcement (components) takes priority; `message` is the legacy plain-text form
-      // and stays as the fallback if the components module can't load or yields nothing renderable.
-      if (structured) {
-        try {
-          const m = await _loadAnnouncement();
-          const key = m.announcementKey(data);
-          if (seen === key) return;
-          if (_showStructuredAnnouncement(m, data, dbName, key)) return;
-        } catch (e) {
-          _sysConsole?.warn?.('[MIUT] Structured announcement failed, falling back to message:', e?.message);
-        }
-        if (!msg || dsl) return;   // never dump raw [!tags] as text
+      // The components module renders the message; if it can't load (network),
+      // fall back to showing the raw text so the announcement still gets seen.
+      try {
+        const m = await _loadAnnouncement();
+        const key = m.announcementKey(data);
+        if (seen === key) return;
+        if (_showStructuredAnnouncement(m, data, dbName, key)) return;
+      } catch (e) {
+        _sysConsole?.warn?.('[MIUT] Structured announcement failed, falling back to message:', e?.message);
       }
       if (seen === msg) return;
       _showAnnouncementPopup(msg);

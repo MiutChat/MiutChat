@@ -3,17 +3,12 @@
  * Announcement Components System
  * ------------------------------------------------------------------
  * Firestore stores configuration, StoreGit serves assets, MiutChat renders.
- * Admins never write HTML: config/announcement holds a list of typed
- * components ("blocks"), each validated and normalised here before it is
- * rendered. Anything invalid is dropped silently — a bad block can never
- * break the popup, and unknown types (written by a newer admin than this
- * client) are skipped, so the format can grow without breaking old clients.
+ * Admins never write HTML: `config/announcement.message` is ONE plain string,
+ * one component per line (see parseAnnouncementText below). Every block gets
+ * validated and normalised here before it is rendered. Anything invalid is
+ * dropped silently — a bad line can never break the popup.
  *
- *   config/announcement = {
- *     message: "<one plain string, one component per line — see parseAnnouncementText>",   // simplest
- *     // or, for full control, typed blocks:
- *     id: "oct-launch", rev: 2, title: "WHAT'S NEW", blocks: [ { type: "...", ... }, ... ]
- *   }
+ *   config/announcement = { message: "<one plain string, one component per line>" }
  *
  * Adding a new component = add one entry to COMPONENTS ({ normalize, render }).
  * Adding a new button action = add one entry to ACTIONS. Nothing else changes.
@@ -21,13 +16,14 @@
 
 import { _log, toast, ensureAuth, renderTextContent } from '../app.js';
 
-const LIMITS = { blocks: 30, text: 4000, notice: 600, label: 80, question: 200, caption: 200, alt: 160, options: 8, img: 1200 };
+const LIMITS = { blocks: 30, text: 4000, notice: 600, label: 80, question: 200, caption: 200, alt: 160, options: 8, img: 1200, writein: 200 };
 const ID_RE       = /^[A-Za-z0-9_-]{1,32}$/;
 const SHORT_ID_RE = /^[A-Za-z0-9_-]{3,8}$/;
 const DEFAULT_BASE = 'https://storegit.pages.dev';
 
 /* ── helpers ──────────────────────────────────────────────────────── */
-const str = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+const str  = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+const bool = v => v === 'true' || v === '1' || v === 'yes';
 const int = (v, lo, hi) => {
   if (v === '' || v == null) return null;
   const n = Math.floor(Number(v));
@@ -106,16 +102,17 @@ export const ACTIONS = {
   },
 };
 
-/* ── poll store (shared by the Poll and Results components) ───────── */
-// announcementPolls/{annId__pollId}/votes/{uid}  → { choices:[optId], ts }
+/* ── poll store (shared across any views of the same poll) ────────── */
+// announcementPolls/{annId__pollId}/votes/{uid}  → { choices:[optId], otherText?, ts }
 // announcementPolls/{annId__pollId}/tally/{optId} → { n }       (+ tally/_total = voters)
+// '_write_in' is a reserved option id used for the optional free-text choice.
 function _pollStore(ctx, poll) {
   const hit = ctx.polls.get(poll.id);
   if (hit) return hit;
   const s = { my: undefined, counts: {}, total: 0, err: null, busy: false, subs: new Set(), started: false };
   const fs   = () => firebase.firestore(firebase.app(ctx.dbName));
   const base = () => fs().collection('announcementPolls').doc(`${ctx.annId}__${poll.id}`);
-  const valid = new Set(poll.options.map(o => o.id));
+  const valid = new Set(poll.options.map(o => o.id).concat(poll.writeIn ? ['_write_in'] : []));
   s.notify = () => s.subs.forEach(f => { try { f(s); } catch (e) { _log('warn', '[ann] poll view', e?.message); } });
 
   s.init = async () => {
@@ -144,16 +141,21 @@ function _pollStore(ctx, poll) {
     else col.get().then(apply).catch(() => { s.err = 'unavailable'; s.notify(); });
   };
 
-  s.vote = async choices => {
+  s.vote = async (choices, otherTextRaw) => {
     if (s.busy || s.my) return false;
     choices = [...new Set(choices)].filter(c => valid.has(c));
     const max = poll.multi ? poll.max : 1;
     if (!choices.length || choices.length > max) return false;
+    const hasOther = choices.includes('_write_in');
+    const otherText = hasOther ? str(otherTextRaw, LIMITS.writein) : '';
+    if (hasOther && !otherText) return false;              // write-in picked but left blank
     s.busy = true; s.notify();
     try {
       const uid = await ensureAuth(ctx.dbName);
       const F = firebase.firestore.FieldValue, b = base(), batch = fs().batch();
-      batch.set(b.collection('votes').doc(uid), { choices, ts: F.serverTimestamp() });
+      const payload = { choices, ts: F.serverTimestamp() };
+      if (hasOther) payload.otherText = otherText;
+      batch.set(b.collection('votes').doc(uid), payload);
       for (const c of choices) batch.set(b.collection('tally').doc(c), { n: F.increment(1) }, { merge: true });
       batch.set(b.collection('tally').doc('_total'), { n: F.increment(1) }, { merge: true });
       await batch.commit();
@@ -277,6 +279,12 @@ export const COMPONENTS = {
     },
   },
 
+  // Vote + results in one block. Options are fixed-choice by default; add
+  // writein=true to also offer a free-text "Other" answer (counted in the
+  // results bar, but the text itself is never shown back in the UI — only
+  // the admin can read individual vote docs in Firestore). Add results=true
+  // to reveal the live results, inline, the instant this device's vote is
+  // recorded — no separate tag needed.
   poll: {
     normalize: (r, ctx) => {
       if (!ctx.annId || !ID_RE.test(String(r.id || ''))) return null;        // polls need an announcement id + poll id
@@ -290,21 +298,76 @@ export const COMPONENTS = {
       });
       if (options.length < 2) return null;
       const multi = r.multi === true;
-      return { type: 'poll', id: r.id, question, options, multi,
-               max: multi ? (int(r.max, 1, options.length) || options.length) : 1, closesAt: _time(r.closesAt) };
+      return {
+        type: 'poll', id: r.id, question, options, multi,
+        max: multi ? (int(r.max, 1, options.length) || options.length) : 1,
+        closesAt: _time(r.closesAt),
+        writeIn: r.writeIn === true,
+        showResults: r.showResults === true,
+      };
     },
     render: (b, ctx) => {
       const store = _pollStore(ctx, b);
-      const box = el('div', 'ann-poll');
+      const resultOpts = b.writeIn ? [...b.options, { id: '_write_in', label: 'Other' }] : b.options;
+      if (b.showResults) store.watch(true);
+
+      const box  = el('div', 'ann-poll');
       box.append(el('div', 'ann-poll-q', b.question));
-      const list = el('div', 'ann-poll-opts'), msg = el('div', 'ann-poll-msg'), go = el('button', 'ann-btn ann-btn-primary', 'VOTE');
+      const list = el('div', 'ann-poll-opts');
+      const msg  = el('div', 'ann-poll-msg');
+      const go   = el('button', 'ann-btn ann-btn-primary', 'VOTE');
       go.type = 'button';
+
       const inputs = b.options.map(o => {
         const row = el('label', 'ann-opt'), inp = document.createElement('input');
         inp.type = b.multi ? 'checkbox' : 'radio'; inp.name = 'ann-' + b.id; inp.value = o.id;
         row.append(inp, el('span', 'ann-opt-label', o.label)); list.append(row);
         return inp;
       });
+
+      let otherInput = null, otherText = null;
+      if (b.writeIn) {
+        const row = el('label', 'ann-opt ann-opt-other');
+        otherInput = document.createElement('input');
+        otherInput.type = b.multi ? 'checkbox' : 'radio';
+        otherInput.name = 'ann-' + b.id; otherInput.value = '_write_in';
+        otherText = document.createElement('input');
+        otherText.type = 'text'; otherText.className = 'ann-opt-other-text';
+        otherText.placeholder = 'Your own answer\u2026'; otherText.maxLength = LIMITS.writein;
+        otherText.addEventListener('click', e => e.stopPropagation());
+        row.append(otherInput, el('span', 'ann-opt-label', 'Other'), otherText);
+        list.append(row);
+        inputs.push(otherInput);
+      }
+
+      // Results are only built once the vote is in — never created hidden,
+      // so there is nothing for a stray `display` rule to un-hide.
+      const resultsBox = b.showResults ? el('div', 'ann-results-inline') : null;
+      let resultRows = null, resultFoot = null;
+      const buildResults = () => {
+        if (!resultsBox || resultRows) return;
+        resultRows = resultOpts.map(o => {
+          const row = el('div', 'ann-res-row'), top = el('div', 'ann-res-top'),
+                bar = el('div', 'ann-res-bar'), fill = el('div', 'ann-res-fill');
+          const name = el('span', 'ann-res-name', o.label), val = el('span', 'ann-res-val', '0');
+          top.append(name, val); bar.append(fill); row.append(top, bar); resultsBox.append(row);
+          return { o, fill, val, row };
+        });
+        resultFoot = el('div', 'ann-res-foot');
+        resultsBox.append(resultFoot);
+        box.append(resultsBox);
+      };
+      const syncResults = () => {
+        if (!resultsBox || !resultRows) return;
+        const total = store.total || 0;
+        resultRows.forEach(({ o, fill, val, row }) => {
+          const n = store.counts[o.id] || 0, pct = total ? Math.round(n * 100 / total) : 0;
+          fill.style.width = pct + '%'; val.textContent = `${pct}% \u00B7 ${n}`;
+          row.classList.toggle('mine', Array.isArray(store.my) && store.my.includes(o.id));
+        });
+        resultFoot.textContent = store.err ? 'Live results unavailable.' : `${total} vote${total === 1 ? '' : 's'}`;
+      };
+
       const picked = () => inputs.filter(i => i.checked).map(i => i.value);
       const closed = () => b.closesAt != null && Date.now() > b.closesAt;
       const sync = () => {
@@ -314,51 +377,22 @@ export const COMPONENTS = {
           if (voted) i.checked = store.my.includes(i.value);
           else if (b.multi && n >= b.max && !i.checked) i.disabled = true;
         });
+        if (otherText) {
+          otherText.disabled = voted || closed() || store.busy || store.my === undefined || !otherInput.checked;
+          if (voted) otherText.value = '';
+        }
         go.hidden = voted || closed();
-        go.disabled = store.busy || store.my === undefined || n === 0;
+        go.disabled = store.busy || store.my === undefined || n === 0 || (!!otherInput?.checked && !otherText.value.trim());
         go.textContent = store.busy ? 'SENDING\u2026' : 'VOTE';
         msg.textContent = voted ? 'Thanks \u2014 your vote is in.' : closed() ? 'Voting is closed.'
           : store.err ? 'Voting is unavailable right now.' : b.multi ? `Choose up to ${b.max}.` : '';
+        if (voted && b.showResults) { buildResults(); syncResults(); }
       };
       list.addEventListener('change', sync);
-      go.addEventListener('click', () => store.vote(picked()));
+      if (otherText) otherText.addEventListener('input', sync);
+      go.addEventListener('click', () => store.vote(picked(), otherText?.value));
       store.subs.add(sync); ctx.cleanup.push(() => store.subs.delete(sync));
       box.append(list, go, msg); sync();
-      return box;
-    },
-  },
-
-  results: {
-    normalize: r => (ID_RE.test(String(r.pollId || ''))
-      ? { type: 'results', pollId: r.pollId, live: r.live !== false, visibility: r.visibility === 'after-vote' ? 'after-vote' : 'always' } : null),
-    render: (b, ctx) => {
-      const poll = ctx.pollDefs.get(b.pollId);
-      const store = _pollStore(ctx, poll);
-      store.watch(b.live);
-      const box = el('div', 'ann-results');
-      box.append(el('div', 'ann-poll-q', poll.question));
-      const rows = poll.options.map(o => {
-        const row = el('div', 'ann-res-row'), top = el('div', 'ann-res-top'), bar = el('div', 'ann-res-bar'), fill = el('div', 'ann-res-fill');
-        const name = el('span', 'ann-res-name', o.label), val = el('span', 'ann-res-val', '0');
-        top.append(name, val); bar.append(fill); row.append(top, bar); box.append(row);
-        return { o, fill, val, row };
-      });
-      const foot = el('div', 'ann-res-foot');
-      box.append(foot);
-      const sync = () => {
-        const hidden = b.visibility === 'after-vote' && !Array.isArray(store.my);
-        rows.forEach(r => r.row.hidden = hidden);
-        if (hidden) { foot.textContent = store.my === undefined ? '' : 'Vote to see the results.'; return; }
-        const total = store.total || 0;
-        rows.forEach(({ o, fill, val, row }) => {
-          const n = store.counts[o.id] || 0, pct = total ? Math.round(n * 100 / total) : 0;
-          fill.style.width = pct + '%'; val.textContent = `${pct}% \u00B7 ${n}`;
-          row.classList.toggle('mine', Array.isArray(store.my) && store.my.includes(o.id));
-        });
-        foot.textContent = store.err ? 'Live results unavailable.' : `${total} vote${total === 1 ? '' : 's'}`;
-      };
-      store.subs.add(sync); ctx.cleanup.push(() => store.subs.delete(sync));
-      sync();
       return box;
     },
   },
@@ -366,28 +400,27 @@ export const COMPONENTS = {
 
 
 /* ── plain-string format ──────────────────────────────────────────────
- * Admins can write the whole announcement as ONE string (the `message` field), one component per line:
+ * The whole announcement is ONE string (the `message` field), one component per line:
  *
  *   ![Banner](waRt =320x)                       image: StoreGit id or URL, optional =WxH / =Wx / =xH
  *   [![Banner](waRt =320x)](https://site.com)   clickable image
  *   [!title WHAT'S NEW]                         modal title            ([!id oct] / [!rev 2] also exist)
  *   [!notice warn | Maintenance | Sunday 02:00] level (info|success|warn|danger) | title | text
  *   [!countdown 2026-11-01T02:00:00Z | MAINTENANCE IN | In progress]
- *   [!poll next | What next? | Voice notes | Themes | Threads]     add  multi=2  or  closes=2026-11-01T00:00:00Z
- *   [!results next]                             add  show=after-vote  or  live=false
+ *   [!poll next | What next? | Voice notes | Themes | Threads]
+ *       optional:  multi=2   closes=2026-11-01T00:00:00Z
+ *                  writein=true   — adds a free-text "Other" choice
+ *                  results=true   — show live results inline right after voting
  *   [!link Release notes | https://example.com | optional description]
  *   [!button dismiss | GOT IT]                  [!button open-url | Open | https://…]  [!button copy | Copy | CODE]
  *   anything else                               normal text (Markdown-style), consecutive lines = one text block
  *
  * Use \| for a literal pipe. Everything still goes through the same validators as typed blocks.
  */
-const OPT_KEYS = new Set(['w', 'h', 'style', 'multi', 'closes', 'live', 'show', 'caption', 'href', 'alt']);
+const OPT_KEYS = new Set(['w', 'h', 'style', 'multi', 'closes', 'caption', 'href', 'alt', 'writein', 'results']);
 const LEVELS = ['info', 'success', 'warn', 'danger'];
 const TAG_RE = /^\[!([a-z]+)(?:[ \t]+(.*))?\]$/i;
 const IMG_RE = /^(\[)?!\[([^\]]*)\]\(([^\s)]+)(?:[ \t]+=(\d*)x(\d*))?\)(?:\]\(([^\s)]+)\))?$/;
-const COMPONENT_LINE = /^[ \t]*(?:\[!|!\[|\[!\[)/m;
-
-export function looksLikeComponentText(s) { return COMPONENT_LINE.test(String(s || '')); }
 
 function _pipes(s) {
   const out = []; let cur = '';
@@ -434,12 +467,8 @@ export function parseAnnouncementText(text) {
       case 'link':      b = { type: 'link', label: pos[0], url: pos[1], desc: pos[2] }; break;
       case 'button':    b = { type: 'button', action: (pos[0] || '').toLowerCase(), label: pos[1], value: pos[2], style: opts.style }; break;
       case 'countdown': b = { type: 'countdown', to: pos[0], label: pos[1], doneText: pos[2] }; break;
-      case 'poll':      b = { type: 'poll', id: pos[0], question: pos[1], options: pos.slice(2), multi: opts.multi != null, max: opts.multi, closesAt: opts.closes }; break;
-      case 'results': {                                                // "[!results next]" or "[!results next show=after-vote live=false]"
-        const toks = (pos[0] || '').split(/\s+/), o = { ...opts };
-        for (const t of toks.slice(1)) { const m = /^([a-z]+)=(.*)$/i.exec(t); if (m) o[m[1].toLowerCase()] = m[2]; }
-        b = { type: 'results', pollId: toks[0], live: o.live !== 'false', visibility: o.show === 'after-vote' ? 'after-vote' : 'always' }; break;
-      }
+      case 'poll':      b = { type: 'poll', id: pos[0], question: pos[1], options: pos.slice(2), multi: opts.multi != null, max: opts.multi,
+                               closesAt: opts.closes, writeIn: bool(opts.writein), showResults: bool(opts.results) }; break;
       default:          buf.push(raw); continue;                      // unknown tag → show as plain text
     }
     flush(); blocks.push(b);
@@ -450,14 +479,11 @@ export function parseAnnouncementText(text) {
 
 function _hash(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
 
-/** Source of truth for "what is this announcement": typed `blocks` win; otherwise a component-string `message`. */
+/** Source of truth for "what is this announcement": the `message` string, line-parsed. */
 function _expand(data) {
-  let blocks = Array.isArray(data?.blocks) ? data.blocks : [];
-  let id = data?.id, rev = data?.rev, title = data?.title;
-  if (!blocks.length && typeof data?.message === 'string' && looksLikeComponentText(data.message)) {
-    const p = parseAnnouncementText(data.message);
-    blocks = p.blocks; id = id || p.meta.id; rev = rev ?? p.meta.rev; title = title || p.meta.title;
-  }
+  const p = parseAnnouncementText(data?.message);
+  const blocks = p.blocks;
+  let { id, rev, title } = p.meta;
   const explicit = ID_RE.test(String(id || ''));
   if (!explicit) {                                   // polls need an id: derive it from the poll definitions only,
     const polls = blocks.filter(b => b?.type === 'poll');   // so editing the text around a poll never resets its votes
@@ -481,8 +507,7 @@ export function normalizeAnnouncement(data, cfg = _cfg()) {
     if (b.type === 'poll') { if (polls.has(b.id)) continue; polls.add(b.id); }
     out.push(b);
   }
-  const blocks = out.filter(b => b.type !== 'results' || polls.has(b.pollId));
-  return { id: x.id, keyId: x.explicit ? x.id : '', rev: x.rev != null ? String(x.rev).slice(0, 20) : '', title: str(x.title, 60) || 'ANNOUNCEMENT', blocks };
+  return { id: x.id, keyId: x.explicit ? x.id : '', rev: x.rev != null ? String(x.rev).slice(0, 20) : '', title: str(x.title, 60) || 'ANNOUNCEMENT', blocks: out };
 }
 
 /** Identity used to remember "already seen": explicit id(+rev) when given, otherwise a hash of the content. */
@@ -495,8 +520,7 @@ export function announcementKey(data, cfg) {
 export function renderAnnouncement(data, { dbName = 'miut-db0', close = () => {}, cfg } = {}) {
   const c = cfg || _cfg();
   const ann = normalizeAnnouncement(data, c);
-  const ctx = { cfg: c, annId: ann.id, dbName, close, cleanup: [], polls: new Map(),
-                pollDefs: new Map(ann.blocks.filter(b => b.type === 'poll').map(b => [b.id, b])) };
+  const ctx = { cfg: c, annId: ann.id, dbName, close, cleanup: [], polls: new Map() };
   const root = el('div', 'ann-root');
   for (const b of ann.blocks) {
     try { root.append(COMPONENTS[b.type].render(b, ctx)); }
