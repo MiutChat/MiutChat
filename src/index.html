@@ -67,7 +67,6 @@
 </head>
 <body>
 
-<div id="ripple-container"></div>
 
 <div id="splash" class="screen active">
   <div class="splash-bg"></div>
@@ -114,13 +113,13 @@
       </div>
 
       <div class="join-tabs">
-        <button class="join-tab-btn active ripple-btn" data-tab="create">
+        <button class="join-tab-btn active" data-tab="create">
           <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
             <path d="M8 2v12M2 8h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
           CREATE ROOM
         </button>
-        <button class="join-tab-btn ripple-btn" data-tab="enter">
+        <button class="join-tab-btn" data-tab="enter">
           <svg viewBox="0 0 16 16" fill="none" width="13" height="13">
             <path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="2"
                   stroke-linecap="round" stroke-linejoin="round"/>
@@ -144,7 +143,7 @@
                    placeholder="e.g. MIUT42"
                    data-placeholders='["e.g. MIUT42","e.g. 482910","e.g. HAWK42","e.g. STORM9","e.g. ALPHA7","e.g. 007XYZ"]'
                    maxlength="32" autocomplete="off" spellcheck="false" />
-            <button class="toggle-pw ripple-btn" id="create-eye-btn" title="Show/hide">
+            <button class="toggle-pw" id="create-eye-btn" title="Show/hide">
               <svg class="eye-open" viewBox="0 0 20 20" fill="none" width="16" height="16">
                 <ellipse cx="10" cy="10" rx="7" ry="4.5" stroke="currentColor" stroke-width="1.5"/>
                 <circle cx="10" cy="10" r="2" fill="currentColor"/>
@@ -181,7 +180,7 @@
             <button class="ttl-opt" data-ttl="604800">7d</button>
           </div>
         </div>
-        <button class="btn-join ripple-btn" id="btn-create">
+        <button class="btn-join" id="btn-create">
           <span>CREATE ROOM</span>
           <div class="btn-shimmer"></div>
         </button>
@@ -200,7 +199,7 @@
             <input type="text" id="input-room-code"
                    placeholder="Enter the room code"
                    maxlength="32" autocomplete="off" spellcheck="false" />
-            <button class="toggle-pw ripple-btn" id="enter-eye-btn" title="Show/hide">
+            <button class="toggle-pw" id="enter-eye-btn" title="Show/hide">
               <svg class="eye-open" viewBox="0 0 20 20" fill="none" width="16" height="16">
                 <ellipse cx="10" cy="10" rx="7" ry="4.5" stroke="currentColor" stroke-width="1.5"/>
                 <circle cx="10" cy="10" r="2" fill="currentColor"/>
@@ -214,7 +213,7 @@
           </div>
           <div class="code-hint">Enter the exact code the room creator shared with you</div>
         </div>
-        <button class="btn-join ripple-btn" id="btn-enter">
+        <button class="btn-join" id="btn-enter">
           <span>ENTER ROOM</span>
           <div class="btn-shimmer"></div>
         </button>
@@ -253,7 +252,7 @@
 
     <div class="waiting-dots"><span></span><span></span><span></span></div>
 
-    <button class="btn-waiting-cancel ripple-btn" id="btn-waiting-cancel">
+    <button class="btn-waiting-cancel" id="btn-waiting-cancel">
       <svg viewBox="0 0 20 20" fill="none" width="13" height="13" style="flex-shrink:0">
         <path d="M13 10H3M5 7l-3 3 3 3" stroke="currentColor" stroke-width="1.5"
               stroke-linecap="round" stroke-linejoin="round"/>
@@ -281,7 +280,7 @@
       </button>
     </div>
     <div id="invite-error" class="invite-error"></div>
-    <button class="btn-invite-join ripple-btn" id="invite-join-btn" disabled>
+    <button class="btn-invite-join" id="invite-join-btn" disabled>
       <span>JOIN ROOM</span>
     </button>
     <button class="btn-invite-back">← Cancel Invite</button>
@@ -337,7 +336,7 @@
 
     <div class="sidebar-footer">
 
-      <button class="btn-skip ripple-btn" id="btn-report-problem" style="margin-bottom:8px">
+      <button class="btn-skip" id="btn-report-problem" style="margin-bottom:8px">
         <svg viewBox="0 0 20 20" fill="none" width="14" height="14" style="flex-shrink:0">
           <path d="M10 6v5M10 14h.01" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
           <path d="M8.6 2.9L1.5 15a1.5 1.5 0 001.3 2.2h14.4a1.5 1.5 0 001.3-2.2L11.4 2.9a1.5 1.5 0 00-2.8 0z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
@@ -345,7 +344,7 @@
         Report a problem
       </button>
 
-      <button class="btn-logout ripple-btn" id="btn-logout">
+      <button class="btn-logout" id="btn-logout">
         <svg viewBox="0 0 20 20" fill="none" width="14" height="14" style="flex-shrink:0">
           <path d="M13 10H3M5 7l-3 3 3 3" stroke="currentColor" stroke-width="1.5"
                 stroke-linecap="round" stroke-linejoin="round"/>
@@ -364,7 +363,7 @@
 
     <div class="chat-header" id="chat-header">
 
-      <button class="icon-btn hamburger-btn ripple-btn" id="hamburger-btn" title="Menu" aria-label="Open menu">
+      <button class="icon-btn hamburger-btn" id="hamburger-btn" title="Menu" aria-label="Open menu">
         <svg viewBox="0 0 20 20" fill="none" width="18" height="18">
           <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
         </svg>
@@ -379,14 +378,14 @@
           </div>
         </div>
       </div>
-      <button class="icon-btn ripple-btn" title="Copy room code">
+      <button class="icon-btn" title="Copy room code">
         <svg viewBox="0 0 20 20" fill="none" width="17" height="17">
           <rect x="7" y="7" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/>
           <path d="M13 7V5a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2"
                 stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
         </svg>
       </button>
-      <button class="icon-btn ripple-btn" id="search-btn" title="Search messages">
+      <button class="icon-btn" id="search-btn" title="Search messages">
         <svg viewBox="0 0 20 20" fill="none" width="17" height="17">
           <circle cx="8.5" cy="8.5" r="5" stroke="currentColor" stroke-width="1.5"/>
           <path d="M13 13l3.5 3.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
@@ -440,7 +439,7 @@
         <div class="reply-bar-sender" id="reply-sender"></div>
         <div class="reply-bar-text"   id="reply-preview"></div>
       </div>
-      <button class="reply-bar-close ripple-btn" aria-label="Cancel reply">
+      <button class="reply-bar-close" aria-label="Cancel reply">
         <svg viewBox="0 0 20 20" fill="none" width="14" height="14">
           <path d="M15 5L5 15M5 5l10 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
         </svg>
@@ -457,7 +456,7 @@
 
     <div class="input-area" id="input-area">
       <div class="attach-wrap">
-        <button class="icon-btn attach-btn ripple-btn" title="Attach" id="attach-btn" aria-expanded="false">
+        <button class="icon-btn attach-btn" title="Attach" id="attach-btn" aria-expanded="false">
           <svg viewBox="0 0 20 20" fill="none" width="19" height="19">
             <path d="M16.5 10.5l-6.3 6.3a4.24 4.24 0 01-6-6l7-7a2.83 2.83 0 014 4l-7.1 7.1a1.41 1.41 0 01-2-2l6.3-6.3"
                   stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
@@ -523,18 +522,12 @@
       </button>
     </div>
     <div class="modal-body">
+      <!-- ── Switches ─────────────────────────────────────────────── -->
       <div class="setting-item">
         <label>SOUND ALERTS</label>
         <div class="toggle-wrap">
           <input type="checkbox" id="sound-toggle" checked />
           <label for="sound-toggle" class="toggle"></label>
-        </div>
-      </div>
-      <div class="setting-item">
-        <label>ANIMATIONS</label>
-        <div class="toggle-wrap">
-          <input type="checkbox" id="anim-toggle" checked />
-          <label for="anim-toggle" class="toggle"></label>
         </div>
       </div>
       <div class="setting-item">
@@ -554,24 +547,6 @@
           <label for="push-toggle" class="toggle"></label>
         </div>
       </div>
-      <div class="setting-divider"></div>
-      <div class="setting-item">
-        <label>APP VERSION</label>
-        <span class="setting-value" id="app-version-label">MIUT v…</span>
-      </div>
-      <div class="setting-item">
-        <label>ENCRYPTION</label>
-        <span class="setting-value teal">AES-256-GCM ✓</span>
-      </div>
-      <div class="setting-item">
-        <label>SIGNING</label>
-        <span class="setting-value teal">ECDSA P-256 ✓</span>
-      </div>
-      <div class="setting-item">
-        <label>KEY EPOCH</label>
-        <span class="setting-value teal" id="epoch-display">0</span>
-      </div>
-
       <div id="approval-setting-row" class="setting-item" style="display:none">
         <div class="setting-label-group">
           <label>APPROVAL GATE</label>
@@ -582,7 +557,6 @@
           <label for="approval-toggle" class="toggle"></label>
         </div>
       </div>
-
       <div id="members-manage-row" class="setting-item" style="display:none">
         <div class="setting-label-group">
           <label>MEMBER CONTROLS</label>
@@ -594,12 +568,15 @@
         </div>
       </div>
 
+      <div class="setting-divider"></div>
+
+      <!-- ── Controls ─────────────────────────────────────────────── -->
       <div id="rotate-key-row" class="setting-item" style="display:none">
         <div class="setting-label-group">
           <label>ROTATE KEY</label>
           <span class="setting-sublabel">New messages will use a freshly derived key</span>
         </div>
-        <button class="btn-rotate-key ripple-btn">
+        <button class="btn-rotate-key">
           <svg viewBox="0 0 20 20" fill="none" width="13" height="13">
             <path d="M4 4v4h4M16 16v-4h-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
             <path d="M4.3 12A7 7 0 0015.7 8M15.7 8A7 7 0 004.3 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
@@ -638,7 +615,7 @@
         </select>
       </div>
 
-      <button class="btn-join ripple-btn small" style="margin-top:16px">
+      <button class="btn-join small" style="margin-top:16px">
         SAVE SETTINGS
       </button>
 
@@ -647,7 +624,7 @@
           <label>INSTALL APP</label>
           <span class="setting-sublabel">Add Miut Chat to your home screen</span>
         </div>
-        <button class="btn-rotate-key ripple-btn">
+        <button class="btn-rotate-key">
           <svg viewBox="0 0 20 20" fill="none" width="13" height="13">
             <path d="M10 3v10M6 9l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
             <path d="M3 15h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
@@ -656,12 +633,31 @@
         </button>
       </div>
 
+      <div class="setting-divider"></div>
+
+      <!-- ── Info rows ────────────────────────────────────────────── -->
+      <div class="setting-item">
+        <label>APP VERSION</label>
+        <span class="setting-value" id="app-version-label">MIUT v…</span>
+      </div>
+      <div class="setting-item">
+        <label>ENCRYPTION</label>
+        <span class="setting-value teal">AES-256-GCM ✓</span>
+      </div>
+      <div class="setting-item">
+        <label>SIGNING</label>
+        <span class="setting-value teal">ECDSA P-256 ✓</span>
+      </div>
+      <div class="setting-item">
+        <label>KEY EPOCH</label>
+        <span class="setting-value teal" id="epoch-display">0</span>
+      </div>
       <div class="setting-item" id="github-row">
         <div class="setting-label-group">
           <label>SOURCE CODE</label>
           <span class="setting-sublabel">MiutChat is open source — audit it yourself</span>
         </div>
-        <a class="btn-rotate-key ripple-btn" href="https://github.com/MiutChat/MiutChat" target="_blank" rel="noopener">
+        <a class="btn-rotate-key" href="https://github.com/MiutChat/MiutChat" target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16" fill="currentColor" width="13" height="13">
             <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/>
           </svg>
@@ -771,8 +767,8 @@
       <div class="feedback-charcount"><span id="feedback-charcount">0</span>/500</div>
 
       <div class="feedback-actions">
-        <button class="btn-skip ripple-btn" id="feedback-skip-btn">SKIP</button>
-        <button class="btn-join ripple-btn small" id="feedback-submit-btn" disabled><span id="feedback-submit-label">SEND FEEDBACK</span></button>
+        <button class="btn-skip" id="feedback-skip-btn">SKIP</button>
+        <button class="btn-join small" id="feedback-submit-btn" disabled><span id="feedback-submit-label">SEND FEEDBACK</span></button>
       </div>
       <div class="feedback-privacy-note">
         Feedback is anonymous — it isn't linked to your name or messages.
@@ -794,7 +790,7 @@
     <div class="modal-body">
       <div class="feedback-lead" id="announcement-body" style="white-space:pre-wrap"></div>
       <div class="feedback-actions">
-        <button class="btn-join ripple-btn small" id="announcement-ok-btn" style="margin-left:auto">GOT IT</button>
+        <button class="btn-join small" id="announcement-ok-btn" style="margin-left:auto">GOT IT</button>
       </div>
     </div>
   </div>

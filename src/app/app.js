@@ -173,7 +173,6 @@ export let state = {
   roomCode:   null,
   prefs: {
     sound:            true,
-    animations:       true,
     approvalRequired: false,
     enterToSend:      true,    // on by default — Enter sends, Shift+Enter = newline
     // Explicit user intent for push — the ONLY thing that turns push on,
@@ -1190,8 +1189,19 @@ async function _checkAnnouncement() {
       // plain prose if the admin wrote no tags at all. See lazy/announcement.js.
       if (!msg) return; // doc exists on this shard but is empty — don't fall through to others
 
+      // "Seen" lives in IndexedDB (meta store), not localStorage — it survives the
+      // browser clearing site data the way IDB usually does, and keeps it off the
+      // same storage quota the UI uses for other small one-off flags. One-time
+      // migration: an existing localStorage value from before this switch is still
+      // honoured (and copied into IDB) so nobody sees an old announcement again.
       let seen = '';
-      try { seen = localStorage.getItem('miut_announcement_seen') || ''; } catch {}
+      try {
+        seen = (await idbGetMeta('announcement_seen')) || '';
+        if (!seen) {
+          const legacy = localStorage.getItem('miut_announcement_seen') || '';
+          if (legacy) { seen = legacy; await idbSetMeta('announcement_seen', legacy); }
+        }
+      } catch {}
 
       // The components module renders the message; if it can't load (network),
       // fall back to showing the raw text so the announcement still gets seen.
@@ -1218,9 +1228,9 @@ function _showStructuredAnnouncement(m, data, dbName, key) {
   const body    = $('announcement-body');
   if (!overlay || !body) return false;
   let view = null;
-  const close = () => {
+  const close = async () => {
     overlay.style.display = 'none';
-    try { localStorage.setItem('miut_announcement_seen', key); } catch {}
+    try { await idbSetMeta('announcement_seen', key); } catch {}
     view?.destroy();          // stops countdown timers + live poll listeners
     body.replaceChildren();
   };
@@ -1247,20 +1257,15 @@ function _showAnnouncementPopup(msg) {
   body.innerHTML = renderTextContent(msg, true);
   overlay.style.display = 'flex';
 
-  const close = () => {
+  const close = async () => {
     overlay.style.display = 'none';
-    try { localStorage.setItem('miut_announcement_seen', msg); } catch {}
+    try { await idbSetMeta('announcement_seen', msg); } catch {}
   };
   $('announcement-close-btn')?.addEventListener('click', close, { once: true });
   $('announcement-ok-btn')?.addEventListener('click', close, { once: true });
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); }, { once: true });
 }
 
-
-
-  // Ripple
-  document.addEventListener('touchstart', handleRipple, { passive: true });
-  document.addEventListener('mousedown',  handleRipple);
 
   document.addEventListener('copy',        e => { if (!e.target.closest('input,textarea')) e.preventDefault(); });
   document.addEventListener('cut',         e => { if (!e.target.closest('input,textarea')) e.preventDefault(); });
@@ -5914,10 +5919,9 @@ async function handleLogout() {
 }
 
 function openSettings() {
-  const st = $('sound-toggle'), at = $('anim-toggle'), et = $('enter-to-send-toggle');
+  const st = $('sound-toggle'), et = $('enter-to-send-toggle');
   const ap = $('approval-toggle'), approvalRow = $('approval-setting-row');
   if (st) st.checked = state.prefs.sound;
-  if (at) at.checked = state.prefs.animations;
   if (et) et.checked = !!state.prefs.enterToSend;
 
   // Checked state is the AND of two different things: the browser's own
@@ -5990,7 +5994,6 @@ function saveSettings() {
 }
 
 function toggleSoundAlerts()   { state.prefs.sound         = $('sound-toggle').checked; }
-function toggleAnimations()    { state.prefs.animations    = $('anim-toggle').checked; }
 // Push isn't a plain stored pref like the others — flipping it has to
 // actually call the browser's permission/subscription APIs (in
 // sw-bridge.js), and the box can get flipped back by openSettings() on
@@ -6071,7 +6074,11 @@ function showConfirm(title, msg, confirmLabel = 'CONFIRM') {
     ov.id = 'nx-confirm';
     ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);backdrop-filter:blur(6px);z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px';
     const box = document.createElement('div');
-    box.style.cssText = 'background:var(--surface2);border:1px solid var(--teal-border);border-radius:14px;padding:28px 24px;max-width:320px;width:100%;display:flex;flex-direction:column;gap:18px;box-shadow:0 16px 48px rgba(0,0,0,0.6)';
+    // Was --surface2 / --teal-border — neither var exists in style.css, so this
+    // card rendered fully transparent and invisible (e.g. the Leave Room dialog).
+    // Real tokens: --surf2 (card surface) and --teal-b (teal-tinted border).
+    box.className = 'ann-glass-pop';
+    box.style.cssText = 'background:var(--surf2);border:1px solid var(--teal-b);border-radius:14px;padding:28px 24px;max-width:320px;width:100%;display:flex;flex-direction:column;gap:18px;box-shadow:0 16px 48px rgba(0,0,0,0.6)';
     const h = document.createElement('div'); h.style.cssText = 'font-family:var(--fui);font-size:.9rem;font-weight:700;color:#fff;letter-spacing:1px'; h.textContent = title;
     const m = document.createElement('div'); m.style.cssText = 'font-size:.75rem;color:var(--text2);line-height:1.7;font-family:var(--fmono)'; m.textContent = msg;
     const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:10px;justify-content:flex-end';
@@ -6174,34 +6181,11 @@ export function updateActionBtn() {
 function setupActionBtn() {
   const btn = $('send-btn');
   if (!btn) return;
-  btn.addEventListener('click', () => { _animateSend(); sendMessage(); });
+  btn.addEventListener('click', () => { sendMessage(); });
   btn.addEventListener('touchstart', e => {
     e.preventDefault();
-    _animateSend(); sendMessage();
+    sendMessage();
   }, { passive: false });
-}
-
-function _animateSend() {
-  const btn = $('send-btn');
-  if (!btn || !state.prefs.animations) return;
-  btn.style.transition = 'transform .06s ease';
-  btn.style.transform = 'scale(.82)';
-  requestAnimationFrame(() => {
-    setTimeout(() => {
-      btn.style.transition = 'transform .28s cubic-bezier(.34,1.56,.64,1)';
-      btn.style.transform = '';
-      setTimeout(() => { btn.style.transition = ''; }, 300);
-    }, 70);
-  });
-}
-
-function handleRipple(e) {
-  if (!state.prefs.animations) return;
-  if (!e.target.closest('.ripple-btn,.send-btn')) return;
-  const x = e.touches?.[0]?.clientX ?? e.clientX, y = e.touches?.[0]?.clientY ?? e.clientY;
-  const r = document.createElement('div');
-  r.className = 'ripple-wave'; r.style.cssText = `left:${x-40}px;top:${y-40}px;width:80px;height:80px`;
-  $('ripple-container')?.appendChild(r); setTimeout(() => r.remove(), 650);
 }
 /* ──────────────────────────────────────────
    PUSH NOTIFICATIONS — triggering (sending side)
@@ -6363,7 +6347,7 @@ window.addEventListener('appinstalled', () => {
 // ── JSDoc type definitions ────────────────────────────────────────────────────
 /**
  * @typedef {{ id:string, name:string, color:string, joinedAt:number, role?:string, approved?:boolean }} UserState
- * @typedef {{ me:UserState|null, roomCode:string|null, prefs:{sound:boolean,animations:boolean,approvalRequired:boolean} }} AppState
+ * @typedef {{ me:UserState|null, roomCode:string|null, prefs:{sound:boolean,approvalRequired:boolean} }} AppState
  * @typedef {{ type:string, enc?:string, senderId?:string, senderName?:string, senderColor?:string, ts?:number, sig?:string, edited?:boolean, reactions?:Object, replyTo?:Object, encData?:string, mime?:string, fileName?:string, fileSize?:number, groupId?:string, chunkIdx?:number, chunkOf?:number }} MsgData
  * @typedef {{ wrongCount:number, lockedUntil:number }} WrongState
  * @typedef {{ tokens:number, lastRefill:number }} RlState
@@ -6500,7 +6484,6 @@ function _wireAllHandlers() {
 
 
   on('sound-toggle',         'change', () => toggleSoundAlerts());
-  on('anim-toggle',          'change', () => toggleAnimations());
   on('enter-to-send-toggle', 'change', () => toggleEnterToSend());
   on('push-toggle',          'change', () => togglePushNotifications());
   on('approval-toggle', 'change', () => toggleApprovalGate());
@@ -6536,7 +6519,7 @@ Object.assign(window, {
   _wireAllHandlers,
   cancelJoinRequest, checkInviteCode, joinFromInvite, cancelInvite,
   handleLogout, openSettings, closeSettings, closeModal, saveSettings,
-  toggleSoundAlerts, toggleAnimations, toggleEnterToSend, toggleApprovalGate, rotateKey,
+  toggleSoundAlerts, toggleEnterToSend, toggleApprovalGate, rotateKey,
   triggerPWAInstall, copyRoomCode, shareRoomLink, toggleSearch, doSearch,
   handleKey, handleTyping, clearReply,
   setRoomTtl, toggleSidebar, closeSidebar,
