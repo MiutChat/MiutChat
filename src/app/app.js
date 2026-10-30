@@ -6078,7 +6078,7 @@ function showConfirm(title, msg, confirmLabel = 'CONFIRM') {
     // card rendered fully transparent and invisible (e.g. the Leave Room dialog).
     // Real tokens: --surf2 (card surface) and --teal-b (teal-tinted border).
     box.className = 'ann-glass-pop';
-    box.style.cssText = 'background:var(--surf2);border:1px solid var(--teal-b);border-radius:14px;padding:28px 24px;max-width:320px;width:100%;display:flex;flex-direction:column;gap:18px;box-shadow:0 16px 48px rgba(0,0,0,0.6)';
+    box.style.cssText = 'background:var(--glass2);border:1px solid var(--teal-b);border-radius:14px;padding:28px 24px;max-width:320px;width:100%;display:flex;flex-direction:column;gap:18px;box-shadow:var(--sh-glass),0 16px 48px rgba(0,0,0,0.6);backdrop-filter:blur(32px) saturate(1.4);-webkit-backdrop-filter:blur(32px) saturate(1.4)';
     const h = document.createElement('div'); h.style.cssText = 'font-family:var(--fui);font-size:.9rem;font-weight:700;color:#fff;letter-spacing:1px'; h.textContent = title;
     const m = document.createElement('div'); m.style.cssText = 'font-size:.75rem;color:var(--text2);line-height:1.7;font-family:var(--fmono)'; m.textContent = msg;
     const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:10px;justify-content:flex-end';

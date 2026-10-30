@@ -173,6 +173,64 @@ function _pollStore(ctx, poll) {
   return s;
 }
 
+/* ── react store — independent emoji taps, toggleable (unlike a poll vote,
+   which locks once cast) ───────────────────────────────────────────── */
+// announcementReacts/{annId__reactId}/votes/{uid}  → { emojis:[...], ts }
+// announcementReacts/{annId__reactId}/tally/{emoji} → { n }
+function _reactStore(ctx, comp) {
+  const key = 'react:' + comp.id;
+  const hit = ctx.polls.get(key);
+  if (hit) return hit;
+  const s = { mine: undefined, counts: {}, err: null, busy: false, subs: new Set(), started: false };
+  const fs   = () => firebase.firestore(firebase.app(ctx.dbName));
+  const base = () => fs().collection('announcementReacts').doc(`${ctx.annId}__${comp.id}`);
+  const valid = new Set(comp.emojis);
+  s.notify = () => s.subs.forEach(f => { try { f(s); } catch (e) { _log('warn', '[ann] react view', e?.message); } });
+
+  s.init = async () => {
+    try {
+      s._uid = await ensureAuth(ctx.dbName);
+      const snap = await base().collection('votes').doc(s._uid).get();
+      s.mine = snap.exists && Array.isArray(snap.data()?.emojis) ? snap.data().emojis.filter(e => valid.has(e)) : [];
+    } catch (e) { s.err = 'unavailable'; s.mine = []; _log('warn', '[ann] react lookup failed', e?.message); }
+    s.notify();
+  };
+
+  s.watch = live => {
+    if (s.started) return;
+    s.started = true;
+    const apply = snap => {
+      const counts = {};
+      snap.forEach(d => { if (valid.has(d.id)) counts[d.id] = Number(d.data()?.n) || 0; });
+      s.counts = counts; s.notify();
+    };
+    const col = base().collection('tally');
+    if (live) ctx.cleanup.push(col.onSnapshot(apply, e => { s.err = 'unavailable'; _log('warn', '[ann] react tally', e?.message); s.notify(); }));
+    else col.get().then(apply).catch(() => { s.err = 'unavailable'; s.notify(); });
+  };
+
+  s.toggle = async em => {
+    if (s.busy || !valid.has(em) || s.mine === undefined) return;
+    s.busy = true; s.notify();
+    try {
+      const uid = s._uid || await ensureAuth(ctx.dbName);
+      const F = firebase.firestore.FieldValue, b = base();
+      const on = s.mine.includes(em);
+      const next = on ? s.mine.filter(x => x !== em) : [...s.mine, em];
+      await b.collection('votes').doc(uid).set({ emojis: next, ts: F.serverTimestamp() }, { merge: true });
+      await b.collection('tally').doc(em).set({ n: F.increment(on ? -1 : 1) }, { merge: true });
+      s.mine = next;
+    } catch (e) {
+      _log('warn', '[ann] react failed', e?.code || e?.message);
+      toast('Couldn\u2019t react', 'Check your connection', 'err');
+    } finally { s.busy = false; s.notify(); }
+  };
+
+  ctx.polls.set(key, s);
+  s.init();
+  return s;
+}
+
 /* ── components ───────────────────────────────────────────────────── */
 export const COMPONENTS = {
   text: {
@@ -396,6 +454,120 @@ export const COMPONENTS = {
       return box;
     },
   },
+
+  // Quick emoji taps — independent of each other and toggleable (tap again
+  // to un-react), unlike a poll vote which locks once cast. Good for a fast
+  // "how do you feel about this" pulse-check under an announcement.
+  react: {
+    normalize: (r, ctx) => {
+      if (!ctx.annId || !ID_RE.test(String(r.id || ''))) return null;
+      const label = str(r.label, LIMITS.label);
+      const emojis = Array.isArray(r.emojis)
+        ? [...new Set(r.emojis.map(e => String(e).trim()).filter(Boolean))].slice(0, 8)
+        : [];
+      if (emojis.length < 2) return null;
+      return { type: 'react', id: r.id, label, emojis };
+    },
+    render: (b, ctx) => {
+      const store = _reactStore(ctx, b);
+      store.watch(true);
+      const box = el('div', 'ann-react');
+      if (b.label) box.append(el('div', 'ann-poll-q', b.label));
+      const row = el('div', 'ann-react-row');
+      box.append(row);
+      const btns = b.emojis.map(em => {
+        const btn = el('button', 'ann-react-btn'); btn.type = 'button';
+        const glyph = el('span', 'ann-react-emoji', em);
+        const count = el('span', 'ann-react-count', '');
+        btn.append(glyph, count);
+        btn.addEventListener('click', () => store.toggle(em));
+        row.append(btn);
+        return { em, btn, count };
+      });
+      const sync = () => {
+        btns.forEach(({ em, btn, count }) => {
+          const n = store.counts[em] || 0;
+          count.textContent = n ? String(n) : '';
+          btn.classList.toggle('mine', (store.mine || []).includes(em));
+          btn.disabled = store.busy || store.mine === undefined;
+        });
+      };
+      store.subs.add(sync); ctx.cleanup.push(() => store.subs.delete(sync));
+      sync();
+      return box;
+    },
+  },
+
+  // Star rating. Internally votes through the same poll store, as a
+  // single-choice "poll" whose options are just the numbers 1..max — so
+  // it gets the same once-per-device vote lock and live tally for free.
+  rate: {
+    normalize: (r, ctx) => {
+      if (!ctx.annId || !ID_RE.test(String(r.id || ''))) return null;
+      const question = str(r.question, LIMITS.question);
+      if (!question) return null;
+      const max = int(r.max, 3, 10) || 5;
+      return { type: 'rate', id: r.id, question, max, showResults: r.showResults === true };
+    },
+    render: (b, ctx) => {
+      const options = Array.from({ length: b.max }, (_, i) => ({ id: String(i + 1), label: String(i + 1) }));
+      const store = _pollStore(ctx, { id: b.id, options, multi: false, max: 1, closesAt: null, writeIn: false });
+      if (b.showResults) store.watch(true);
+
+      const box = el('div', 'ann-rate');
+      box.append(el('div', 'ann-poll-q', b.question));
+      const row = el('div', 'ann-rate-stars'); box.append(row);
+      const msg = el('div', 'ann-poll-msg'); 
+
+      let picked = null;
+      const stars = options.map(o => {
+        const btn = el('button', 'ann-rate-star', '\u2605'); btn.type = 'button'; btn.dataset.val = o.id;
+        row.append(btn); return btn;
+      });
+      const paint = hoverVal => {
+        const v = Number(hoverVal ?? picked ?? 0);
+        stars.forEach(btn => btn.classList.toggle('filled', Number(btn.dataset.val) <= v));
+      };
+      stars.forEach(btn => {
+        btn.addEventListener('mouseenter', () => paint(btn.dataset.val));
+        btn.addEventListener('mouseleave', () => paint());
+        btn.addEventListener('click', () => {
+          if (store.my !== null || store.busy) return;        // not loaded yet, or already voted
+          picked = btn.dataset.val; paint();
+          store.vote([picked]);
+        });
+      });
+
+      const resultsBox = b.showResults ? el('div', 'ann-results-inline') : null;
+      let avgEl = null;
+      const buildResults = () => {
+        if (!resultsBox || avgEl) return;
+        avgEl = el('div', 'ann-rate-avg');
+        resultsBox.append(avgEl);
+        box.append(resultsBox);
+      };
+      const syncResults = () => {
+        if (!resultsBox || !avgEl) return;
+        const total = store.total || 0;
+        let sum = 0;
+        for (const [k, n] of Object.entries(store.counts)) sum += Number(k) * n;
+        const avg = total ? (sum / total).toFixed(1) : '0.0';
+        avgEl.textContent = store.err ? 'Live results unavailable.' : `${avg} \u2605 average \u00B7 ${total} rating${total === 1 ? '' : 's'}`;
+      };
+
+      const sync = () => {
+        const voted = Array.isArray(store.my);
+        stars.forEach(btn => { btn.disabled = voted || store.busy || store.my === undefined; });
+        if (voted) { picked = store.my[0]; paint(); }
+        msg.textContent = voted ? 'Thanks \u2014 rating saved.' : store.err ? 'Rating is unavailable right now.' : 'Tap a star to rate.';
+        if (voted && b.showResults) { buildResults(); syncResults(); }
+      };
+      box.append(msg);
+      store.subs.add(sync); ctx.cleanup.push(() => store.subs.delete(sync));
+      sync();
+      return box;
+    },
+  },
 };
 
 
@@ -411,13 +583,17 @@ export const COMPONENTS = {
  *       optional:  multi=2   closes=2026-11-01T00:00:00Z
  *                  writein=true   — adds a free-text "Other" choice
  *                  results=true   — show live results inline right after voting
+ *   [!react mood | How do you feel about this? | 👍 | 👎 | ❤️ | 🎉]
+ *       tap to react, tap again to un-react; counts are live. 2-8 emojis.
+ *   [!rate csat | Rate this update | max=5 | results=true]
+ *       star rating, 3-10 stars (default 5); results=true shows the live average
  *   [!link Release notes | https://example.com | optional description]
  *   [!button dismiss | GOT IT]                  [!button open-url | Open | https://…]  [!button copy | Copy | CODE]
  *   anything else                               normal text (Markdown-style), consecutive lines = one text block
  *
  * Use \| for a literal pipe. Everything still goes through the same validators as typed blocks.
  */
-const OPT_KEYS = new Set(['w', 'h', 'style', 'multi', 'closes', 'caption', 'href', 'alt', 'writein', 'results']);
+const OPT_KEYS = new Set(['w', 'h', 'style', 'multi', 'closes', 'caption', 'href', 'alt', 'writein', 'results', 'max']);
 const LEVELS = ['info', 'success', 'warn', 'danger'];
 const TAG_RE = /^\[!([a-z]+)(?:[ \t]+(.*))?\]$/i;
 const IMG_RE = /^(\[)?!\[([^\]]*)\]\(([^\s)]+)(?:[ \t]+=(\d*)x(\d*))?\)(?:\]\(([^\s)]+)\))?$/;
@@ -469,6 +645,8 @@ export function parseAnnouncementText(text) {
       case 'countdown': b = { type: 'countdown', to: pos[0], label: pos[1], doneText: pos[2] }; break;
       case 'poll':      b = { type: 'poll', id: pos[0], question: pos[1], options: pos.slice(2), multi: opts.multi != null, max: opts.multi,
                                closesAt: opts.closes, writeIn: bool(opts.writein), showResults: bool(opts.results) }; break;
+      case 'react':     b = { type: 'react', id: pos[0], label: pos[1], emojis: pos.slice(2) }; break;
+      case 'rate':      b = { type: 'rate', id: pos[0], question: pos[1], max: opts.max, showResults: bool(opts.results) }; break;
       default:          buf.push(raw); continue;                      // unknown tag → show as plain text
     }
     flush(); blocks.push(b);
@@ -485,9 +663,13 @@ function _expand(data) {
   const blocks = p.blocks;
   let { id, rev, title } = p.meta;
   const explicit = ID_RE.test(String(id || ''));
-  if (!explicit) {                                   // polls need an id: derive it from the poll definitions only,
-    const polls = blocks.filter(b => b?.type === 'poll');   // so editing the text around a poll never resets its votes
-    id = polls.length ? 'p' + _hash(JSON.stringify(polls.map(b => [b.id, b.question, b.options]))) : '';
+  if (!explicit) {                                   // stateful components (poll/react/rate) need an annId to key their
+    // Firestore vote docs under — derive it from just those definitions, so editing
+    // surrounding text (a notice, an image) never resets anyone's vote.
+    const stateful = blocks.filter(b => b?.type === 'poll' || b?.type === 'react' || b?.type === 'rate');
+    id = stateful.length
+      ? 'p' + _hash(JSON.stringify(stateful.map(b => [b.type, b.id, b.question || b.label, b.options || b.emojis || b.max])))
+      : '';
   }
   return { id: String(id || ''), explicit, rev, title, blocks };
 }

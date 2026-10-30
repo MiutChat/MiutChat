@@ -14,8 +14,11 @@
   --bg:        #050d0c;
   --bg2:       #091413;
   --bg3:       #0d1c1b;
-  --glass:     rgba(8,17,16,.76);
-  --glass2:    rgba(12,22,21,.88);
+  --glass:     rgba(8,17,16,.58);
+  --glass2:    rgba(12,22,21,.66);
+  /* Rim light + base shadow together — the thin bright top edge is what
+     actually reads as "glass" rather than a plain tinted panel. */
+  --sh-glass: var(--sh-lg), inset 0 1px 0 rgba(255,255,255,.08), inset 0 0 0 1px rgba(255,255,255,.02);
   --surf:      #112120;
   --surf2:     #172c2a;
   --surf3:     #1d3532;
@@ -416,7 +419,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .msg-react-btn:hover{color:var(--typing);border-color:var(--typing);background:rgba(247,196,48,.10);transform:scale(1.14)}
 .msg-delete-btn:hover{color:var(--danger);border-color:var(--danger);background:var(--d-dim);transform:scale(1.14)}
 /* Action strip */
-.msg-action-strip{position:absolute;bottom:calc(100% + 10px);z-index:80;display:flex;flex-direction:column;gap:0;background:var(--glass2);border:1px solid var(--border);border-radius:22px;padding:6px;box-shadow:var(--sh-lg);min-width:248px;max-width:295px;opacity:0;transform:scale(.84) translateY(14px);transition:opacity .17s ease,transform .22s var(--spring);pointer-events:none;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+.msg-action-strip{position:absolute;bottom:calc(100% + 10px);z-index:80;display:flex;flex-direction:column;gap:0;background:var(--glass2);border:1px solid var(--border);border-radius:22px;padding:6px;box-shadow:var(--sh-glass);min-width:248px;max-width:295px;opacity:0;transform:scale(.84) translateY(14px);transition:opacity .17s ease,transform .22s var(--spring);pointer-events:none;backdrop-filter:blur(12px) saturate(1.4);-webkit-backdrop-filter:blur(12px) saturate(1.4)}
 .msg-action-strip.visible{opacity:1;transform:none;pointer-events:all}
 .msg-wrapper.sent .msg-action-strip{right:0;left:auto;transform-origin:bottom right}
 .msg-wrapper.received .msg-action-strip{left:0;right:auto;transform-origin:bottom left}
@@ -530,7 +533,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 @keyframes p-urg{0%,100%{opacity:.7}50%{opacity:1}}
 
 /* ── Mentions ─────────────────────────────────────── */
-.mention-dropdown{display:none;flex-direction:column;background:var(--glass2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;box-shadow:0 -8px 28px rgba(0,0,0,.52);z-index:40;max-height:200px;overflow-y:auto;margin:0 12px 4px;animation:drop-in var(--fast) var(--spring) both;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
+.mention-dropdown{display:none;flex-direction:column;background:var(--glass2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;box-shadow:0 -8px 28px rgba(0,0,0,.52),inset 0 1px 0 rgba(255,255,255,.08);z-index:40;max-height:200px;overflow-y:auto;margin:0 12px 4px;animation:drop-in var(--fast) var(--spring) both;backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4)}
 @keyframes drop-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 .mention-item{display:flex;align-items:center;gap:10px;padding:10px 14px;font-family:var(--fui);font-size:.75rem;font-weight:600;color:var(--text);transition:background .11s ease,color .11s ease}
 .mention-item:hover,.mention-item:focus{background:var(--teal-dim);color:var(--teal)}
@@ -545,7 +548,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .attach-btn{color:var(--text2);flex-shrink:0;margin-bottom:1px;transition:color var(--fast) ease,transform var(--fast) var(--spring)}
 .attach-wrap{position:relative;flex-shrink:0}
 .attach-btn[aria-expanded="true"]{color:var(--teal);transform:rotate(45deg)}
-.attach-tabs{position:absolute;bottom:calc(100% + 10px);left:0;display:flex;gap:6px;background:var(--glass2);border:1px solid var(--border);border-radius:18px;padding:8px;box-shadow:var(--sh-lg);opacity:0;transform:scale(.85) translateY(10px);transform-origin:bottom left;pointer-events:none;transition:opacity .16s ease,transform .18s var(--spring);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);z-index:60}
+.attach-tabs{position:absolute;bottom:calc(100% + 10px);left:0;display:flex;gap:6px;background:var(--glass2);border:1px solid var(--border);border-radius:18px;padding:8px;box-shadow:var(--sh-glass);opacity:0;transform:scale(.85) translateY(10px);transform-origin:bottom left;pointer-events:none;transition:opacity .16s ease,transform .18s var(--spring);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);z-index:60}
 .attach-tabs.open{opacity:1;transform:scale(1) translateY(0);pointer-events:auto}
 .attach-tab{display:flex;flex-direction:column;align-items:center;gap:5px;padding:10px 12px;border-radius:13px;background:transparent;border:none;color:var(--text2);font-family:var(--fui);font-size:.56rem;font-weight:700;letter-spacing:.8px;white-space:nowrap;transition:background var(--fast) ease,color var(--fast) ease,transform var(--fast) var(--spring)}
 .attach-tab:hover{background:var(--teal-dim);color:var(--teal)}
@@ -564,10 +567,10 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 
 /* ── Modal / Settings ─────────────────────────────── */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px}
-.modal{background:var(--glass2);border:1px solid var(--border);border-radius:24px;width:100%;max-width:368px;max-height:88vh;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border) transparent;box-shadow:var(--sh-lg);backdrop-filter:blur(32px);-webkit-backdrop-filter:blur(32px)}
+.modal{background:var(--glass2);border:1px solid var(--border);border-radius:24px;width:100%;max-width:368px;max-height:88vh;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border) transparent;box-shadow:var(--sh-glass);backdrop-filter:blur(32px) saturate(1.4);-webkit-backdrop-filter:blur(32px) saturate(1.4)}
 .modal::-webkit-scrollbar{width:3px}
 .modal::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.modal-header{display:flex;align-items:center;justify-content:space-between;padding:20px 22px 15px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--glass2);z-index:1;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:20px 22px 15px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--glass2);z-index:1;backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4)}
 .modal-header h3{font-family:var(--fui);font-size:.77rem;font-weight:800;letter-spacing:5px;color:var(--teal)}
 .modal-body{padding:14px 20px 22px;display:flex;flex-direction:column;gap:0}
 .setting-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 0;border-bottom:1px solid var(--border2)}
@@ -641,7 +644,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .err-icon{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:5px;background:var(--d-dim);border:1px solid rgba(255,95,95,.2);margin-right:6px;flex-shrink:0;vertical-align:middle}
 .err-icon svg{display:block}
 .error-msg{display:flex;align-items:flex-start;gap:4px}
-.toast{background:var(--glass2);border:1px solid var(--border);border-radius:18px;padding:13px 16px;display:flex;align-items:flex-start;gap:12px;pointer-events:all;cursor:pointer;position:relative;overflow:hidden;box-shadow:var(--sh-lg);animation:toast-in .34s cubic-bezier(.22,1,.36,1) both;backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px)}
+.toast{background:var(--glass2);border:1px solid var(--border);border-radius:18px;padding:13px 16px;display:flex;align-items:flex-start;gap:12px;pointer-events:all;cursor:pointer;position:relative;overflow:hidden;box-shadow:var(--sh-glass);animation:toast-in .34s cubic-bezier(.22,1,.36,1) both;backdrop-filter:blur(28px) saturate(1.4);-webkit-backdrop-filter:blur(28px) saturate(1.4)}
 @keyframes toast-in{from{opacity:0;transform:translateX(36px) scale(.88)}to{opacity:1;transform:none}}
 .toast.removing{animation:toast-out .26s ease forwards}
 @keyframes toast-out{to{opacity:0;transform:translateX(28px) scale(.94)}}
@@ -666,7 +669,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .skel-line.w50{width:50%}.skel-line.w55{width:55%}.skel-line.w60{width:60%}.skel-line.w70{width:70%}
 
 /* ── Context menu (legacy, kept for compat) ───────── */
-.msg-context-menu{position:absolute;bottom:calc(100% + 6px);min-width:155px;background:var(--glass2);border:1px solid var(--border);border-radius:12px;padding:4px;box-shadow:var(--sh-lg);z-index:60;opacity:0;transform:scale(.91) translateY(7px);transform-origin:bottom center;transition:opacity var(--fast) ease,transform var(--fast) var(--spring);pointer-events:none;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px)}
+.msg-context-menu{position:absolute;bottom:calc(100% + 6px);min-width:155px;background:var(--glass2);border:1px solid var(--border);border-radius:12px;padding:4px;box-shadow:var(--sh-glass);z-index:60;opacity:0;transform:scale(.91) translateY(7px);transform-origin:bottom center;transition:opacity var(--fast) ease,transform var(--fast) var(--spring);pointer-events:none;backdrop-filter:blur(24px) saturate(1.4);-webkit-backdrop-filter:blur(24px) saturate(1.4)}
 .msg-context-menu.visible{opacity:1;transform:none;pointer-events:all}
 .ctx-item{display:flex;align-items:center;gap:8px;width:100%;padding:9px 12px;border-radius:9px;font-family:var(--fui);font-size:.71rem;font-weight:600;letter-spacing:1px;color:var(--text);transition:background .11s ease,color .11s ease}
 .ctx-item:hover{background:var(--teal-dim);color:var(--teal)}
@@ -947,3 +950,18 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:3px;border-rad
 .ann-res-fill{height:100%;width:0;border-radius:99px;background:var(--teal3);transition:width .4s var(--out)}
 .ann-res-row.mine .ann-res-fill{background:var(--teal)}
 .ann-res-row.mine .ann-res-name::after{content:' \2713';color:var(--teal)}
+.ann-react{padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:var(--surf);display:flex;flex-direction:column;gap:10px}
+.ann-react-row{display:flex;flex-wrap:wrap;gap:8px}
+.ann-react-btn{display:flex;align-items:center;gap:6px;padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:var(--surf2);cursor:pointer;transition:border-color var(--fast) ease,background var(--fast) ease}
+.ann-react-btn.mine{border-color:var(--teal);background:var(--teal-dim)}
+.ann-react-btn:disabled{opacity:.6;cursor:default}
+.ann-react-emoji{font-size:1rem;line-height:1}
+.ann-react-count{font-family:var(--fmono);font-size:.68rem;color:var(--text2);min-width:.8em;text-align:left}
+.ann-react-btn.mine .ann-react-count{color:var(--teal)}
+.ann-rate{padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:var(--surf);display:flex;flex-direction:column;gap:10px}
+.ann-rate-stars{display:flex;gap:4px}
+.ann-rate-star{font-size:1.4rem;line-height:1;background:none;border:none;padding:2px;cursor:pointer;color:var(--text2);transition:color var(--fast) ease,transform var(--fast) ease}
+.ann-rate-star:hover:not(:disabled){transform:scale(1.1)}
+.ann-rate-star.filled{color:var(--teal)}
+.ann-rate-star:disabled{cursor:default}
+.ann-rate-avg{font-family:var(--fmono);font-size:.68rem;color:var(--text2)}
