@@ -1,0 +1,48 @@
+name: Cleanup expired rooms & messages
+
+# Free server-side expiry: GitHub calls /api/cleanup on a schedule. Cloudflare
+# Pages Functions can't run cron triggers themselves, so this is the scheduler.
+#
+# Needs two repository secrets (Settings → Secrets and variables → Actions):
+#   CLEANUP_URL   e.g. https://miutchat.pages.dev/api/cleanup
+#   ADMIN_ACCESS  the same value as the ADMIN_ACCESS env var on Cloudflare
+# If either is missing the job exits successfully without doing anything.
+#
+# Note: GitHub pauses scheduled workflows on public repos after 60 days with no
+# repo activity — a push (or the "Run workflow" button) re-enables it.
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call /api/cleanup (repeat while the server reports more work)
+        env:
+          CLEANUP_URL: ${{ secrets.CLEANUP_URL }}
+          ADMIN_ACCESS: ${{ secrets.ADMIN_ACCESS }}
+        run: |
+          if [ -z "$CLEANUP_URL" ] || [ -z "$ADMIN_ACCESS" ]; then
+            echo "CLEANUP_URL / ADMIN_ACCESS secrets not set — skipping."
+            exit 0
+          fi
+          body='{}'
+          for i in $(seq 1 15); do
+            resp=$(curl -fsS --max-time 60 -X POST "$CLEANUP_URL" \
+              -H "Authorization: Bearer $ADMIN_ACCESS" \
+              -H 'Content-Type: application/json' \
+              -d "$body") || { echo "Request failed (round $i)"; exit 1; }
+            echo "round $i: $resp"
+            [ "$(echo "$resp" | jq -r '.more // false')" = "true" ] || break
+            body=$(echo "$resp" | jq -c '{cursors: (.cursors // {})}')
+          done

@@ -1824,6 +1824,8 @@ async function checkApprovalAndBoot(_retryCount) {
     const roomSnap = await db.collection('rooms').doc(state.roomCode).get();
     _log('log', `[MIUT checkApprovalAndBoot] room=${state.roomCode} shard=${_dbName} uid=${_resumeUid} — room doc exists=${roomSnap.exists}`);
     if (roomSnap.exists) {
+      // Same rule as a manual join: an expired room is deleted, not revived.
+      if (await _checkRoomExpiry(state.roomCode, db, roomSnap)) return;
       _roomEpoch = roomSnap.data()?.epoch || 0;
       _roomSalt  = roomSnap.data()?.salt  || null;
       _roomTtlMs = Number(roomSnap.data()?.msgTtlMs) > 0 ? Number(roomSnap.data().msgTtlMs) : 0;
@@ -3549,6 +3551,18 @@ async function _healRoomSchema(code, roomData) {
   catch (e) { _log('warn', '[MIUT] Room schema heal failed (non-fatal):', e); }
 }
 
+/** Ask the server to delete an expired room. Non-admins can't do it from the
+ *  client (Firestore rules), so this is what actually removes it. Fire-and-forget;
+ *  a 501 (no service account configured) is simply ignored. */
+function _requestServerExpire(code) {
+  try {
+    fetch('/api/expire-room', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }), keepalive: true,
+    }).catch(() => {});
+  } catch {}
+}
+
 /** Check if room has expired (autoDeleteAt < now) and show expired screen */
 async function _checkRoomExpiry(code, db, knownSnap) {
   try {
@@ -3559,6 +3573,7 @@ async function _checkRoomExpiry(code, db, knownSnap) {
     if (expiry && expiry < Date.now()) {
       // Room expired — wipe and send user back to join screen
       toast('Room expired', 'This room has expired after inactivity.', 'clock');
+      _requestServerExpire(code);
       await wipeRoom(code, db).catch(() => {});
       clearCacheForRoom(code).catch(() => {});
       localStorage.removeItem(CONFIG.SESSION_KEY);

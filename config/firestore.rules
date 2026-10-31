@@ -56,6 +56,16 @@ service cloud.firestore {
         && request.time.toMillis() > resource.data.createdAt.toMillis() + ttl;
     }
 
+    // A non-admin may schedule autoDeleteAt only in the future (or clear it).
+    // Without this, any member could back-date it and make the room count as
+    // "expired", which the server cleanup and entry-time check delete.
+    function autoDeleteNotPast() {
+      return !('autoDeleteAt' in changedKeys())
+        || request.resource.data.get('autoDeleteAt', null) == null
+        || (request.resource.data.autoDeleteAt is timestamp
+            && request.resource.data.autoDeleteAt > request.time);
+    }
+
     function isMemberMessageUpdate() {
       return changedKeys().hasOnly(['readBy', 'reactions', 'replyTo'])
         && request.resource.data.get('readBy', {}).diff(resource.data.get('readBy', {})).affectedKeys().hasOnly([request.auth.uid])
@@ -147,10 +157,12 @@ service cloud.firestore {
           || (
             isApprovedMember(roomCode)
             && changedKeys().hasOnly(['emptyAt', 'autoDeleteAt', 'lastActivity'])
+            && autoDeleteNotPast()
           )
           || (
             isRoomManager(roomCode)
             && changedKeys().hasOnly(['approvalRequired', 'inactivityTtlMs', 'msgTtlMs', 'epoch', 'blockedUsers', 'emptyAt', 'autoDeleteAt', 'lastActivity'])
+            && autoDeleteNotPast()
           )
         );
 

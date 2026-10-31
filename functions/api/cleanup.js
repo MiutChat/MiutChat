@@ -44,6 +44,8 @@
 
 'use strict';
 
+import { discoverAdminShards, runAdminCleanup } from '../_lib/firebase-admin.js';
+
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 
 function discoverShards(env) {
@@ -138,19 +140,38 @@ async function cleanupShard(shard) {
   return { shard: shard.name, deleted, checked: paths.length };
 }
 
-async function runCleanup(env) {
-  const shards = discoverShards(env).filter(s => s.active);
-  if (!shards.length) {
+async function runCleanup(env, opts = {}) {
+  // Shards with a service account use the rules-bypassing admin path (can list
+  // rooms, delete subcollections, and sweep expired messages). Any shard
+  // without one keeps the original anonymous-auth behaviour, unchanged.
+  const admin = discoverAdminShards(env);
+  const adminNames = new Set(admin.map(s => s.name));
+  const legacy = discoverShards(env).filter(s => s.active && !adminNames.has(s.name));
+
+  if (!admin.length && !legacy.length) {
     return { error: 'No active shards configured (need FIREBASE_API_KEY/FIREBASE_PROJECT_ID at minimum)', deleted: 0 };
   }
 
   // Independent per shard — one project having a bad day (auth hiccup,
   // query failure) never blocks cleanup on the others.
-  const results = await Promise.all(shards.map(cleanupShard));
+  const adminResult = admin.length ? await runAdminCleanup(admin, { cursors: opts.cursors }) : null;
+  const results = await Promise.all(legacy.map(cleanupShard));
 
   const deleted = results.reduce((sum, r) => sum + r.deleted, 0);
   const checked = results.reduce((sum, r) => sum + r.checked, 0);
-  return { deleted, checked, shards: results, ts: new Date().toISOString() };
+  return {
+    deleted, checked, shards: results, ts: new Date().toISOString(),
+    ...(adminResult ? { admin: adminResult.shards, cursors: adminResult.cursors, more: adminResult.more } : {}),
+  };
+}
+
+/** Constant-time string comparison (avoids leaking the secret via timing). */
+function safeEqual(a, b) {
+  const te = new TextEncoder();
+  const x = te.encode(String(a)), y = te.encode(String(b));
+  let diff = x.length ^ y.length;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] || 0) ^ (y[i] || 0);
+  return diff === 0;
 }
 
 export async function onRequest(ctx) {
@@ -165,12 +186,14 @@ export async function onRequest(ctx) {
 
   const secret = env?.ADMIN_ACCESS || '';
   const auth   = request.headers.get('Authorization') || '';
-  if (!secret || auth !== `Bearer ${secret}`) {
+  if (!secret || !safeEqual(auth, `Bearer ${secret}`)) {
     return new Response(JSON.stringify({ error: 'Unauthorized' }),
       { status: 401, headers: { 'Content-Type': 'application/json', ...CORS } });
   }
 
-  const result = await runCleanup(env);
+  let opts = {};
+  try { opts = await request.json(); } catch { /* body is optional */ }
+  const result = await runCleanup(env, opts || {});
   return new Response(JSON.stringify(result),
     { status: 200, headers: { 'Content-Type': 'application/json', ...CORS } });
 }
