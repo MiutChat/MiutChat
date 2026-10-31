@@ -258,14 +258,24 @@ export async function sweepExpiredMessages(client, budget, cursor = 0) {
   return { processed, deleted, more, nextCursor: more ? cursor + processed : 0 };
 }
 
-/** One resumable pass over all admin-enabled shards. */
-export async function runAdminCleanup(shards, { cursors = {}, budgetPerShard = 40, fetchImpl = fetch } = {}) {
+/**
+ * One resumable pass over all admin-enabled shards.
+ *
+ * Cloudflare counts subrequests PER INVOCATION across everything (free plan:
+ * 50), so the budget is shared: each shard gets an equal slice of what is
+ * left, and a shard that finishes early hands its unused calls to the next.
+ */
+export async function runAdminCleanup(shards, { cursors = {}, totalBudget = 46, fetchImpl = fetch } = {}) {
   const out = { shards: [], cursors: {}, more: false };
-  for (const shard of shards) {
-    const budget = new Budget(budgetPerShard);
+  let remaining = totalBudget;
+  for (let i = 0; i < shards.length; i++) {
+    const shard = shards[i];
+    const slice = Math.max(0, Math.floor(remaining / (shards.length - i)));
+    const budget = new Budget(slice);
     const client = makeClient(shard, budget, fetchImpl);
     const r = { shard: shard.name };
     try {
+      if (slice < 3) throw new BudgetExceeded();
       const rooms = await wipeExpiredRooms(client, budget);
       r.roomsWiped = rooms.wiped;
       const msgs = await sweepExpiredMessages(client, budget, Number(cursors[shard.name]) || 0);
@@ -273,8 +283,10 @@ export async function runAdminCleanup(shards, { cursors = {}, budgetPerShard = 4
       out.cursors[shard.name] = msgs.nextCursor;
       if (rooms.more || msgs.more) out.more = true;
     } catch (e) {
-      r.error = String(e && e.message || e);
+      if (e instanceof BudgetExceeded) { out.more = true; out.cursors[shard.name] = Number(cursors[shard.name]) || 0; r.deferred = true; }
+      else r.error = String(e && e.message || e);
     }
+    remaining -= (slice - budget.left);
     out.shards.push(r);
   }
   return out;

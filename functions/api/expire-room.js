@@ -60,9 +60,9 @@ export async function onRequestPost(context) {
   if (!shards.length) return json({ error: 'not_configured' }, 501, CORS);
 
   let sawRoom = false;
+  const budget = new Budget(46);   // one shared budget: the platform limit is per invocation, not per shard
   try {
     for (const shard of shards) {
-      const budget = new Budget(40);
       const client = makeClient(shard, budget);
       const room = await client.getRoom(code);
       if (!room) continue;

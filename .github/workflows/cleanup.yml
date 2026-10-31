@@ -25,7 +25,7 @@ concurrency:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Call /api/cleanup (repeat while the server reports more work)
         env:
@@ -37,7 +37,7 @@ jobs:
             exit 0
           fi
           body='{}'
-          for i in $(seq 1 15); do
+          for i in $(seq 1 40); do
             resp=$(curl -fsS --max-time 60 -X POST "$CLEANUP_URL" \
               -H "Authorization: Bearer $ADMIN_ACCESS" \
               -H 'Content-Type: application/json' \
