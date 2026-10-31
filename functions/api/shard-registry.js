@@ -217,16 +217,165 @@ async function restIncrement(projectId, token, path, field) {
 // shard doesn't stay excluded forever if nothing ever re-checks it.
 const DEGRADED_MS = 8 * 3600 * 1000;
 
+
+// ── Hashed bindings ──────────────────────────────────────────────────────
+// Bindings used to live at bindings/<plaintext room code>. The room code is also the key material for the
+// room's end-to-end encryption, so the registry (and its logs / any prefix of a half-typed code) must not hold it:
+//   client  sends   codeHash = base64url(SHA-256("miut-room-v1\0" + code))        (43 chars, never the code)
+//   server  stores  bindings/h_<codeHash>                     (or h_<HMAC-SHA256(REGISTRY_PEPPER, codeHash)> when the
+//                                                              pepper secret is set — a leaked database is then useless
+//                                                              for guessing codes offline; set it once, never rotate)
+// The hash is also a fixed-length, URL-safe id, which closes a path-injection hole: the old code put the raw room code
+// into the Firestore REST URL, so a code such as "../shardLoad/miut-db0" read other registry documents, and "?" or "#"
+// silently truncated the id so different rooms collided.
+// Legacy plaintext bindings are migrated lazily (a lookup that carries the plaintext code and finds an old document
+// copies it to the hashed id and deletes the old one) or all at once with the admin `migrate` action. Once migration is
+// done set REGISTRY_LEGACY=off and plaintext codes are never accepted again.
+const CODE_HASH_RE   = /^[A-Za-z0-9_-]{43}$/;
+const LEGACY_CODE_RE = /^[a-zA-Z0-9 _\-@#!?+*=.]{6,64}$/;      // same allowlist as the client
+const HASH_DOMAIN    = 'miut-room-v1\u0000';
+const _enc = new TextEncoder();
+const _b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const _hex    = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+
+async function codeHashOf(code) {
+  return _b64url(await crypto.subtle.digest('SHA-256', _enc.encode(HASH_DOMAIN + code)));
+}
+async function bindingIdOf(env, codeHash) {
+  const pepper = env?.REGISTRY_PEPPER;
+  if (!pepper) return 'h_' + codeHash;
+  const key = await crypto.subtle.importKey('raw', _enc.encode(String(pepper)), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return 'h_' + _hex(await crypto.subtle.sign('HMAC', key, _enc.encode(codeHash)));
+}
+const legacyEnabled = env => env?.REGISTRY_LEGACY !== 'off';
+
+// body -> { id, codeHash, legacyCode } | { error }
+async function identify(body, env) {
+  let codeHash = body?.codeHash, legacyCode = null;
+  if (codeHash !== undefined) {
+    if (typeof codeHash !== 'string' || !CODE_HASH_RE.test(codeHash)) return { error: 'invalid codeHash' };
+  } else {
+    const rc = body?.roomCode;
+    if (!legacyEnabled(env) || typeof rc !== 'string' || !LEGACY_CODE_RE.test(rc) || rc === '.' || rc === '..') return { error: 'codeHash required' };
+    legacyCode = rc;
+    codeHash = await codeHashOf(rc);
+  }
+  return { id: await bindingIdOf(env, codeHash), codeHash, legacyCode };
+}
+
+async function restDeleteDoc(projectId, token, path) {
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${path}`,
+    { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } }
+  );
+  if (!res.ok && res.status !== 404) throw new Error(`REST DELETE ${path} -> ${res.status}`);
+}
+
+async function restListDocs(projectId, token, collection, pageSize, pageToken) {
+  const q = `pageSize=${pageSize}` + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collection}?${q}`,
+    { headers: { 'Authorization': `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`REST LIST ${collection} -> ${res.status}`);
+  const j = await res.json();
+  return { docs: (j.documents || []).map(d => ({ id: decodeURIComponent(d.name.split('/').pop()), data: decodeFields(d.fields) })), next: j.nextPageToken || null };
+}
+
+// Current binding for a room, migrating a legacy plaintext one on the way. -> { db } | null
+async function findBinding(projectId, token, ident, env, names) {
+  const cur = await restGetDoc(projectId, token, `bindings/${ident.id}`);
+  if (cur?.db && names.has(cur.db)) return cur;
+  if (ident.legacyCode && legacyEnabled(env)) {
+    const oldPath = `bindings/${encodeURIComponent(ident.legacyCode)}`;
+    const old = await restGetDoc(projectId, token, oldPath).catch(() => null);
+    if (old?.db && names.has(old.db)) {
+      try { await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: old.db }); await restDeleteDoc(projectId, token, oldPath); } catch { /* best effort: next lookup retries */ }
+      return { db: old.db };
+    }
+  }
+  return null;
+}
+
+function ctEq(a, b) {
+  const x = _enc.encode(String(a)), y = _enc.encode(String(b));
+  let d = x.length ^ y.length;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) d |= (x[i] || 0) ^ (y[i] || 0);
+  return d === 0;
+}
+
+// ── Per-action rate limits (per client IP, in-memory token buckets) ─────────────────────────────────────────────
+// The API-wide limiter in _middleware.js is coarse; these are tighter per action because the registry endpoints are
+// unauthenticated and each call costs a Firestore REST read/write on the registry project. A copy of the bucket maths
+// lives here on purpose (importing a helper into Pages Functions is fine, but this file already keeps its
+// dependencies inline). KV is not used: 1,000 writes/day account-wide.
+const REG_LIMITS = { lookup: [40, 90], resolve: [10, 20], confirm: [10, 20], bind: [6, 10], 'report-error': [3, 6], status: [6, 20], migrate: [10, 30] };
+const _regBuckets = new Map();
+function regTake(ip, action) {
+  const [burst, perMin] = REG_LIMITS[action] || [6, 20];
+  const key = action + '|' + ip, now = Date.now(), rate = perMin / 60000;
+  let b = _regBuckets.get(key);
+  if (b) { b.t = Math.min(burst, b.t + (now - b.at) * rate); b.at = now; _regBuckets.delete(key); } else b = { t: burst, at: now };
+  _regBuckets.set(key, b);
+  if (_regBuckets.size > 10000) { for (const k of _regBuckets.keys()) { _regBuckets.delete(k); if (_regBuckets.size <= 9000) break; } }
+  if (b.t >= 1) { b.t -= 1; return 0; }
+  return Math.max(1, Math.ceil((1 - b.t) / rate / 1000));
+}
+const tooMany = wait => new Response(JSON.stringify({ error: 'rate limited', retryAfter: wait }), {
+  status: 429, headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Retry-After': String(wait), 'Cache-Control': 'no-store' },
+});
+
+// GET /api/shard-registry?h=<codeHash>[&fresh=1] — the read-only lookup as a cacheable GET. Positive answers are kept at the
+// edge for a minute (bindings almost never change; the client verifies the room on the shard anyway), negative answers are
+// never cached so a freshly created room is found immediately. `fresh=1` skips the cache.
+async function handleGetLookup(request, env, waitUntil) {
+  const url = new URL(request.url);
+  const h = url.searchParams.get('h') || '';
+  if (!CODE_HASH_RE.test(h)) return json({ error: 'invalid codeHash' }, 400);
+  const apiKey = env?.FIREBASE_REGISTRY_API_KEY, projectId = env?.FIREBASE_REGISTRY_PROJECT_ID;
+  if (!apiKey || !projectId) return json({ error: 'registry not configured' }, 500);
+  const cache = (typeof caches !== 'undefined' && caches.default) ? caches.default : null;
+  const cacheKey = new Request(`${url.origin}/api/shard-registry?h=${h}`, { method: 'GET' });
+  const fresh = url.searchParams.get('fresh') === '1';
+  if (cache && !fresh) { const hit = await cache.match(cacheKey); if (hit) return hit; }
+
+  const wait = regTake(request.headers.get('CF-Connecting-IP') || 'unknown', 'lookup');
+  if (wait) return tooMany(wait);
+
+  const shards = discoverShards(env).filter(s => s.active);
+  if (!shards.length) return json({ error: 'no active shards configured' }, 500);
+  const names = new Set(shards.map(s => s.name));
+  let token;
+  try { token = await getFirebaseToken(apiKey); } catch (e) { return json({ error: 'registry auth failed: ' + e.message }, 502); }
+  let rec;
+  try { rec = await findBinding(projectId, token, { id: await bindingIdOf(env, h), codeHash: h, legacyCode: null }, env, names); }
+  catch (e) { return json({ error: 'registry read failed: ' + e.message }, 502); }
+  if (!rec) return json({ found: false, legacy: legacyEnabled(env) });
+  const res = new Response(JSON.stringify({ db: rec.db, found: true }), {
+    status: 200, headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Cache-Control': 'public, max-age=30, s-maxage=60' },
+  });
+  if (cache) { const p = cache.put(cacheKey, res.clone()).catch(() => {}); if (typeof waitUntil === 'function') waitUntil(p); else await p; }
+  return res;
+}
+
 export async function onRequest(ctx) {
   const { request, env } = ctx;
   const apiKey    = env?.FIREBASE_REGISTRY_API_KEY;
   const projectId = env?.FIREBASE_REGISTRY_PROJECT_ID;
   if (!apiKey || !projectId) return json({ error: 'FIREBASE_REGISTRY_API_KEY / FIREBASE_REGISTRY_PROJECT_ID not configured' }, 500);
+  if (request.method === 'GET') return handleGetLookup(request, env, ctx.waitUntil ? ctx.waitUntil.bind(ctx) : null);
   if (request.method !== 'POST') return json({ error: 'POST only' }, 405);
+  if (Number(request.headers.get('Content-Length') || 0) > 4096) return json({ error: 'request too large' }, 413);
 
   let body;
-  try { body = await request.json(); } catch { return json({ error: 'invalid JSON' }, 400); }
+  // Size-check the real body (Content-Length can be absent on chunked requests).
+  try {
+    const raw = await request.text();
+    if (raw.length > 4096) return json({ error: 'request too large' }, 413);
+    body = JSON.parse(raw);
+  } catch { return json({ error: 'invalid JSON' }, 400); }
   const action = body?.action;
+  { const wait = regTake(request.headers.get('CF-Connecting-IP') || 'unknown', String(action)); if (wait) return tooMany(wait); }
 
   const shards = discoverShards(env).filter(s => s.active);
   if (!shards.length) return json({ error: 'no active shards configured' }, 500);
@@ -239,28 +388,25 @@ export async function onRequest(ctx) {
   // ── lookup: read-only "which shard is this room on" — never creates a
   //    binding, so joins and typos can't pollute the registry ──
   if (action === 'lookup') {
-    const roomCode = body?.roomCode;
-    if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
-      return json({ error: 'roomCode required' }, 400);
-    }
+    const ident = await identify(body, env);
+    if (ident.error) return json({ error: ident.error }, 400);
     let existing = null;
-    try { existing = await restGetDoc(projectId, token, `bindings/${roomCode}`); }
+    try { existing = await findBinding(projectId, token, ident, env, names); }
     catch (e) { return json({ error: 'registry read failed: ' + e.message }, 502); }
-    if (existing?.db && names.has(existing.db)) return json({ db: existing.db, found: true });
-    return json({ found: false });
+    if (existing?.db) return json({ db: existing.db, found: true });
+    // `legacy` tells a hash-only client that retrying with the plaintext code can still find an old binding.
+    return json({ found: false, legacy: legacyEnabled(env) && !ident.legacyCode });
   }
 
   // ── resolve: "which shard is this room on, or should a new one go to?" ──
   if (action === 'resolve') {
-    const roomCode = body?.roomCode;
-    if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
-      return json({ error: 'roomCode required' }, 400);
-    }
+    const ident = await identify(body, env);
+    if (ident.error) return json({ error: ident.error }, 400);
 
     const replace = body?.replace === true;
 
     const [existing, scored] = await Promise.all([
-      replace ? null : restGetDoc(projectId, token, `bindings/${roomCode}`).catch(() => null),
+      replace ? null : findBinding(projectId, token, ident, env, names).catch(() => null),
       Promise.all(shards.map(async s => {
         let load = null;
         try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
@@ -293,11 +439,11 @@ export async function onRequest(ctx) {
 
     try {
       if (replace) {
-        await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
-      } else if (!(await restCreateDocIfAbsent(projectId, token, `bindings/${roomCode}`, { db: chosen.name }))) {
-        const winner = await restGetDoc(projectId, token, `bindings/${roomCode}`).catch(() => null);
+        await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name });
+      } else if (!(await restCreateDocIfAbsent(projectId, token, `bindings/${ident.id}`, { db: chosen.name }))) {
+        const winner = await restGetDoc(projectId, token, `bindings/${ident.id}`).catch(() => null);
         if (winner?.db && names.has(winner.db)) { releasePick(chosen.name, reservation); return json({ db: winner.db, isNew: false }); }
-        await restSetDoc(projectId, token, `bindings/${roomCode}`, { db: chosen.name });
+        await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name });
       }
     } catch (e) {
       releasePick(chosen.name, reservation);
@@ -336,10 +482,8 @@ export async function onRequest(ctx) {
   //    ever affects which shard looks marginally least-loaded for the
   //    next placement, never correctness of an already-bound room. ──
   if (action === 'confirm') {
-    const roomCode = body?.roomCode, db = body?.db;
-    if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
-      return json({ error: 'roomCode required' }, 400);
-    }
+    const ident = await identify(body, env), db = body?.db;
+    if (ident.error) return json({ error: ident.error }, 400);
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
     settlePick(db);
     try {
@@ -352,13 +496,11 @@ export async function onRequest(ctx) {
   //    db-manager.js to make a hash/localStorage fallback resolution
   //    authoritative in the registry for next time ──
   if (action === 'bind') {
-    const roomCode = body?.roomCode, db = body?.db;
-    if (!roomCode || typeof roomCode !== 'string' || roomCode.length > 128) {
-      return json({ error: 'roomCode required' }, 400);
-    }
+    const ident = await identify(body, env), db = body?.db;
+    if (ident.error) return json({ error: ident.error }, 400);
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
     try {
-      await restSetDoc(projectId, token, `bindings/${roomCode}`, { db });
+      await restSetDoc(projectId, token, `bindings/${ident.id}`, { db });
     } catch (e) { return json({ error: 'registry write failed: ' + e.message }, 502); }
     return json({ ok: true });
   }
@@ -396,6 +538,29 @@ export async function onRequest(ctx) {
       };
     }));
     return json({ shards: status });
+  }
+
+  // -- migrate: ONE-TIME admin action. Moves legacy plaintext bindings to hashed ids (up to 100 per call).
+  //    curl -X POST /api/shard-registry -H "Authorization: Bearer $ADMIN_ACCESS" -d '{"action":"migrate"}'
+  //    Repeat with {"action":"migrate","pageToken":"<nextPageToken>"} until nextPageToken is null, then set REGISTRY_LEGACY=off.
+  if (action === 'migrate') {
+    const secret = env?.ADMIN_ACCESS || '';
+    if (!secret || !ctEq(request.headers.get('Authorization') || '', 'Bearer ' + secret)) return json({ error: 'unauthorized' }, 401);
+    let page;
+    try { page = await restListDocs(projectId, token, 'bindings', 100, typeof body?.pageToken === 'string' ? body.pageToken : null); }
+    catch (e) { return json({ error: 'list failed: ' + e.message }, 502); }
+    let migrated = 0, skipped = 0, alreadyHashed = 0;
+    for (const d of page.docs) {
+      if (d.id.startsWith('h_')) { alreadyHashed++; continue; }
+      if (!d.data?.db || !names.has(d.data.db) || !LEGACY_CODE_RE.test(d.id)) { skipped++; continue; }
+      try {
+        const id = await bindingIdOf(env, await codeHashOf(d.id));
+        await restCreateDocIfAbsent(projectId, token, `bindings/${id}`, { db: d.data.db });
+        await restDeleteDoc(projectId, token, `bindings/${encodeURIComponent(d.id)}`);
+        migrated++;
+      } catch { skipped++; }
+    }
+    return json({ migrated, skipped, alreadyHashed, nextPageToken: page.next });
   }
 
   return json({ error: 'unknown action' }, 400);

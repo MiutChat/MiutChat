@@ -148,6 +148,10 @@ const _COOLDOWNS = [30e3, 120e3, 480e3, 1800e3, 3600e3]; // 30s→2m→8m→30m�
 
 /* Per-room database resolution cache (session lifetime, in-memory) */
 const _roomDbCache = new Map();
+// Remember the last shard a room was resolved to, so warmJoin() knows the ONE shard worth signing in to ahead of time.
+const _LAST_SHARD_KEY = 'miut_last_shard';
+{ const _origSet = _roomDbCache.set.bind(_roomDbCache);
+  _roomDbCache.set = (k, v) => { try { localStorage.setItem(_LAST_SHARD_KEY, v); } catch {} return _origSet(k, v); }; }
 
 /* ── Persistent room → database binding ───────────────────────────
  * Critical correctness fix: _hashRoom(code) % _ACTIVE_DBS.length means
@@ -309,9 +313,10 @@ function _onFail(name, err) {
  * unreachable — correctness across devices/members matters more here than
  * shaving off a network round trip, especially right after a migration.
  * ────────────────────────────────────────────────────────────────────── */
-async function _registryCall(body, timeoutMs) {
+async function _registryCall(body, timeoutMs, signal) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs || 2500);
+  if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener('abort', () => controller.abort(), { once: true }); }
   try {
     const res = await fetch('/api/shard-registry', {
       method: 'POST',
@@ -325,6 +330,44 @@ async function _registryCall(body, timeoutMs) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/* -- Room-code hashing ---------------------------------------------------
+ * The registry never needs the room code itself, and the code is key material for the room's encryption, so the client
+ * sends codeHash = base64url(SHA-256("miut-room-v1\0" + code)) instead. SHA-256 of a short string is microseconds
+ * via WebCrypto, so this costs nothing next to the network round trip. Must match shard-registry.js's codeHashOf(). */
+const _hashMemo = new Map();
+async function _roomHash(code) {
+  const hit = _hashMemo.get(code);
+  if (hit) return hit;
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('miut-room-v1\u0000' + code));
+  let bin = ''; new Uint8Array(buf).forEach(b => { bin += String.fromCharCode(b); });
+  const h = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  if (_hashMemo.size > 200) _hashMemo.clear();
+  _hashMemo.set(code, h);
+  return h;
+}
+
+/* Read-only "which shard is this room on". Uses a cacheable GET keyed by the hash: the Cloudflare edge keeps positive
+ * answers for a minute, so a second person joining the same room skips the registry's Firestore read entirely.
+ * opts.noLegacy: speculative callers (prefetch) must never fall back to sending the plaintext code. */
+async function _registryLookup(roomCode, opts = {}) {
+  const h = await _roomHash(roomCode);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2500);
+  if (opts.signal) { if (opts.signal.aborted) controller.abort(); else opts.signal.addEventListener('abort', () => controller.abort(), { once: true }); }
+  let data;
+  try {
+    const res = await fetch('/api/shard-registry?h=' + h + (opts.fresh ? '&fresh=1' : ''), { credentials: 'same-origin', signal: controller.signal });
+    if (!res.ok) throw new Error('shard-registry HTTP ' + res.status);
+    data = await res.json();
+  } finally { clearTimeout(timer); }
+  if (data && data.found === false && data.legacy === true && !opts.noLegacy) {
+    // A binding written before hashing existed: the server needs the plaintext code ONCE to move it to its hashed id.
+    // Disappears when the server runs with REGISTRY_LEGACY=off (then `legacy` is never true).
+    data = await _registryCall({ action: 'lookup', roomCode }, 2500, opts.signal);
+  }
+  return data;
 }
 
 const _expiredRooms = new Set();
@@ -348,7 +391,9 @@ async function _resolveViaRegistry(roomCode) {
   // wrong shard forever. 'resolve' is only called from shard-registry's
   // own placement path, triggered via confirmRoomCreated() after a room
   // doc has actually been written. getDb()'s job here is lookup only.
-  const data = await _registryCall({ action: 'lookup', roomCode });
+  const pre = _pfPositive(roomCode);          // a fresh answer from the typing-time prefetch -- no network at all
+  if (pre) return pre;
+  const data = await _registryLookup(roomCode);
   if (!data) throw new Error('shard-registry returned no response');
   if (!data.found) throw new Error('shard-registry: no binding for this room');
   if (data.expired) _expiredRooms.add(roomCode); else _expiredRooms.delete(roomCode);
@@ -362,7 +407,7 @@ window.isRoomExpired = function (roomCode) {
 window.markRoomExpired = function (roomCode, dbName) {
   const name = dbName || _roomDbCache.get(roomCode);
   if (!roomCode || !name) return;
-  _registryCall({ action: 'expire', roomCode, db: name }, 6000)
+  _roomHash(roomCode).then(h => _registryCall({ action: 'expire', codeHash: h, db: name }, 6000))
     .then(r => { if (r && r.ok) _expiredRooms.add(roomCode); })
     .catch(() => {});
 };
@@ -418,7 +463,7 @@ async function _flushPendingBinds() {
   _dbg('flushPendingBinds', `retrying ${codes.length} unconfirmed registry binding(s) left over from a previous session`);
   for (const code of codes) {
     try {
-      await _registryCall({ action: 'bind', roomCode: code, db: map[code].db }, 4000);
+      await _registryCall({ action: 'bind', codeHash: await _roomHash(code), db: map[code].db }, 4000);
       _clearBindPending(code);
       _dbg('flushPendingBinds', code, '→ now confirmed in registry as', map[code].db);
     } catch (e) {
@@ -442,7 +487,7 @@ async function _bindRegistry(roomCode, dbName, attempt) {
   attempt = attempt || 0;
   if (attempt === 0) _markBindPending(roomCode, dbName);
   try {
-    await _registryCall({ action: 'bind', roomCode, db: dbName }, 4000);
+    await _registryCall({ action: 'bind', codeHash: await _roomHash(roomCode), db: dbName }, 4000);
     _clearBindPending(roomCode);
   } catch {
     if (attempt < 2) {
@@ -465,7 +510,7 @@ async function _bindRegistry(roomCode, dbName, attempt) {
  * biases placement away from a shard nothing was ever created on. */
 function _confirmRoomCreated(roomCode, dbName) {
   _expiredRooms.delete(roomCode);
-  _registryCall({ action: 'confirm', roomCode, db: dbName }, 4000).catch(() => {});
+  _roomHash(roomCode).then(h => _registryCall({ action: 'confirm', codeHash: h, db: dbName }, 4000)).catch(() => {});
 }
 window.confirmRoomCreated = _confirmRoomCreated;
 
@@ -819,7 +864,7 @@ window._dbFirebaseReady = new Promise((resolve, reject) => {
 async function getDbForCreate(roomCode, replace) {
   await _loadConfig();
   try {
-    const data = await _registryCall({ action: 'resolve', roomCode, replace: replace === true }, 4000);
+    const data = await _registryCall({ action: 'resolve', codeHash: await _roomHash(roomCode), replace: replace === true }, 4000);
     const cfg = _ACTIVE_DBS.find(x => x.name === data?.db);
     if (cfg && _healthy(cfg.name)) {
       const fs = _initDb(cfg);
@@ -837,6 +882,99 @@ async function getDbForCreate(roomCode, replace) {
 
 window.getDb         = getDb;
 window.getDbForCreate = getDbForCreate;
+
+/* -- Join prefetch -------------------------------------------------------
+ * Goal: when the person presses Join the shard is already known, their sign-in on it is done, and the room document is
+ * already in hand -- without ever searching by a partial code.
+ *
+ *   warmJoin()          code-independent: load config + sign in anonymously on ONE shard (the one this device used
+ *                       last). Nothing about any room is sent anywhere. One-time per device; Firebase persists it.
+ *   prefetchRoom(code)  called by the UI once typing has paused. Looks up that EXACT string (never a prefix -- a prefix
+ *                       oracle would let anyone find a code one character at a time), read-only, then signs in on that
+ *                       shard and reads the room doc. Nothing is shown to the user and nothing is written anywhere:
+ *                       results live in their own small cache, NOT in _roomDbCache / the persisted binding / the
+ *                       registry (a typo must never be able to poison those).
+ *
+ * Safeguards: only valid codes of 6+ chars; one lookup in flight (single-flight, same string = no duplicate); a newer
+ * string aborts the stale request; at most 6 lookups/minute; not in background tabs or with Save-Data; never sends the
+ * plaintext code (hash-only, no legacy fallback); a prefetch is only a hint -- handleEnter still verifies the room doc,
+ * blocked list and expiry itself, and every write is still enforced by the Firestore rules. */
+const _PF_TTL_MS = 60000, _PF_NEG_MS = 10000, _PF_SNAP_TTL_MS = 12000, _PF_MAX_PER_MIN = 6;
+const _PF_CODE_RE = /^[a-zA-Z0-9 _\-@#!?+*=.]{6,64}$/;
+const _pf = new Map();        // code -> { at, found, db, expired }
+const _pfSnaps = new Map();   // code -> { snap, at }
+const _pfStarts = [];         // start times of speculative lookups (budget)
+let _pfInflight = null;       // { code, ctrl }
+
+function _pfPositive(code) {
+  const e = _pf.get(code);
+  return e && e.found && Date.now() - e.at < _PF_TTL_MS ? { db: e.db, found: true, expired: e.expired } : null;
+}
+function _pfPrune(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
+function _pfCancel() { if (_pfInflight) { try { _pfInflight.ctrl.abort(); } catch {} _pfInflight = null; } }
+
+window.cancelPrefetch = _pfCancel;
+
+window.warmJoin = function () {
+  if ((typeof document !== 'undefined' && document.hidden) || navigator.connection?.saveData) return;
+  _loadConfig().then(() => {
+    // ONE shard, not all of them. Each extra shard costs a Firebase app init + IndexedDB persistence + an anonymous
+    // sign-in round trip, which is real CPU, memory and bandwidth on a low-end phone, and most joins touch only one
+    // shard. So warm the shard this device used last (else the first healthy one); if the room turns out to live
+    // elsewhere, prefetchRoom() signs in on exactly that shard once the lookup names it. Deferred to idle time so it
+    // can never compete with typing or the first paint.
+    let last = null; try { last = localStorage.getItem(_LAST_SHARD_KEY); } catch {}
+    const cfg = _ACTIVE_DBS.find(d => d.name === last && _healthy(d.name)) || _ACTIVE_DBS.find(d => _healthy(d.name));
+    if (!cfg) return;
+    const run = () => { try { _initDb(cfg); _ensureShardAuth(cfg).catch(() => {}); } catch { /* best effort */ } };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 1500 }); else setTimeout(run, 300);
+  }).catch(() => {});
+};
+
+window.prefetchRoom = async function (rawCode) {
+  const code = typeof rawCode === 'string' ? rawCode.trim() : '';
+  if (!_PF_CODE_RE.test(code) || code === '.' || code === '..') { _pfCancel(); return; }
+  if ((typeof document !== 'undefined' && document.hidden) || navigator.connection?.saveData) return;
+  const known = _pf.get(code);
+  if (known && Date.now() - known.at < (known.found ? _PF_TTL_MS : _PF_NEG_MS)) return;   // already asked recently
+  if (_pfInflight && _pfInflight.code === code) return;                                     // single-flight
+  _pfCancel();                                                                              // typed on: drop the stale lookup
+  const now = Date.now();
+  while (_pfStarts.length && now - _pfStarts[0] > 60000) _pfStarts.shift();
+  if (_pfStarts.length >= _PF_MAX_PER_MIN) return;
+  _pfStarts.push(now);
+
+  const ctrl = new AbortController();
+  _pfInflight = { code, ctrl };
+  try {
+    await _loadConfig();
+    if (!_ACTIVE_DBS.length || ctrl.signal.aborted) return;
+    const data = await _registryLookup(code, { signal: ctrl.signal, noLegacy: true });
+    if (ctrl.signal.aborted) return;
+    if (!data?.found || !_ACTIVE_DBS.some(d => d.name === data.db)) { _pf.set(code, { at: Date.now(), found: false }); _pfPrune(_pf, 50); return; }
+    _pf.set(code, { at: Date.now(), found: true, db: data.db, expired: !!data.expired });
+    _pfPrune(_pf, 50);
+    const cfg = _ACTIVE_DBS.find(d => d.name === data.db);
+    if (!_healthy(cfg.name)) return;
+    const fs = _initDb(cfg);
+    await _ensureShardAuth(cfg);
+    if (ctrl.signal.aborted) return;
+    const snap = await fs.collection('rooms').doc(code).get();
+    if (ctrl.signal.aborted) return;
+    if (snap.exists) { _pfSnaps.set(code, { snap, at: Date.now() }); _pfPrune(_pfSnaps, 5); }
+  } catch (e) {
+    _dbg('prefetch', 'failed (harmless, the normal join path still works):', e?.message || e);
+  } finally {
+    if (_pfInflight && _pfInflight.ctrl === ctrl) _pfInflight = null;
+  }
+};
+
+// One-shot, short-lived, and only a server-fresh snapshot (never one served from the offline cache).
+window.takePrefetchSnap = function (code) {
+  const e = _pfSnaps.get(code);
+  _pfSnaps.delete(code);
+  return e && Date.now() - e.at < _PF_SNAP_TTL_MS && !e.snap.metadata?.fromCache ? e.snap : null;
+};
 window.getDbStatus   = getDbStatus;
 window.resetDbHealth = resetDbHealth;
 /**

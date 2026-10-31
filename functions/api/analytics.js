@@ -64,16 +64,20 @@ export async function onRequest(ctx) {
       return new Response('ok', { status: 200, headers: CORS });
     }
 
+    // A client may report several events in one request (`n`, 1..10) so a chatty session costs one KV round
+    // trip instead of one per message. Old clients send no `n` and count as 1.
+    const n = Math.min(10, Math.max(1, Math.floor(Number(body?.n)) || 1));
+
     // Increment total counter
     const totalKey = `analytics:${event}`;
     const cur = parseInt(await kv.get(totalKey) || '0', 10);
-    await kv.put(totalKey, String(cur + 1));
+    await kv.put(totalKey, String(cur + n));
 
     // Increment daily counter
     const day = new Date().toISOString().slice(0, 10);
     const dayKey = `analytics:day:${day}:${event}`;
     const dayVal = parseInt(await kv.get(dayKey) || '0', 10);
-    await kv.put(dayKey, String(dayVal + 1), { expirationTtl: 90 * 24 * 3600 }); // keep 90 days
+    await kv.put(dayKey, String(dayVal + n), { expirationTtl: 90 * 24 * 3600 }); // keep 90 days
 
     return new Response('ok', { status: 200, headers: CORS });
   }

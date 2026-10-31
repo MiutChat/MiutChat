@@ -1562,7 +1562,9 @@ async function handleEnter() {
     let uid = _firstUid;
     _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — reading room doc`);
     let _memberRead = db.collection('rooms').doc(code).collection('members').doc(uid).get().catch(() => null);
-    let roomSnap = await db.collection('rooms').doc(code).get();
+    // A snapshot pre-read while the code was being typed (db-manager's prefetchRoom) saves a round trip; it is one-shot,
+    // seconds-old at most, and everything below (blocked list, expiry, member state) still runs on it exactly as before.
+    let roomSnap = window.takePrefetchSnap?.(code) || await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
       _memberRead = null;
       _log('warn', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc does not exist on this shard`);
@@ -3586,18 +3588,29 @@ async function _checkRoomExpiry(code, db, knownSnap) {
   } catch { return false; }
 }
 
-/** _ping — anonymous event counter, fire-and-forget */
-function _ping(event) {
+/** _ping — anonymous event counter, fire-and-forget. `n` > 1 reports a batch of events in one request. */
+function _ping(event, n) {
   try {
     fetch('/api/analytics', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ e: event }),
+      body: JSON.stringify(n > 1 ? { e: event, n } : { e: event }),
       keepalive: true,
     }).catch(() => {});
   } catch {}
 }
 
+
+// Message analytics are batched: the ping goes out after every 2nd message (n = 2) instead of after each one. Each ping
+// costs the server 2 KV reads + 2 KV writes against a 1,000-writes/day budget, so this halves that cost without losing
+// counts. The not-yet-sent remainder is kept in localStorage so a reload doesn't drop it.
+const _ANALYTICS_EVERY = 2;
+let _msgPending = (() => { try { return Math.min(_ANALYTICS_EVERY - 1, Math.max(0, parseInt(localStorage.getItem('miut_msg_pending'), 10) || 0)); } catch { return 0; } })();
+function _countMessageForAnalytics() {
+  _msgPending++;
+  if (_msgPending >= _ANALYTICS_EVERY) { const n = _msgPending; _msgPending = 0; _ping('message_sent', n); }
+  try { localStorage.setItem('miut_msg_pending', String(_msgPending)); } catch {}
+}
 
 // ── Multi-select action bar ─────────────────────────────────────────────────
 function _enterSelectMode() {
@@ -3932,7 +3945,7 @@ async function sendMessage() {
       _pendingMsgPayloads.delete(_localId);
       _pendingByTs.delete(ts_client);
       _reconcileSentMessage(_localId, ref.id, msgData);
-      _ping('message_sent');
+      _countMessageForAnalytics();
       // Message-count-based epoch rotation is tracked in the live listener
       // (startChatListeners) instead of here — see the comment there for why.
       // Push permission is opt-in only, from the Settings toggle — no
@@ -5683,7 +5696,10 @@ function cancelInvite() {
   showScreen('join-screen');
 }
 
+let _invPfT = 0;
 function checkInviteCode(el) {
+  clearTimeout(_invPfT); window.cancelPrefetch?.();
+  { const v = el.value; _invPfT = setTimeout(() => window.prefetchRoom?.(v), 450); }
   const btn = $('invite-join-btn');
   const err = $('invite-error'); if (err) err.textContent = '';
   const code = el.value.trim();
@@ -5709,7 +5725,7 @@ async function joinFromInvite() {
     db = await getDb(code);
     const _dbName = window.getCurrentDbName?.(code) || 'miut-db0';
     const uid = await getUID(_dbName);
-    const roomSnap = await db.collection('rooms').doc(code).get();
+    const roomSnap = window.takePrefetchSnap?.(code) || await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
       if (window.isRoomExpired?.(code)) {
         if (err) err.textContent = 'This room has expired and was deleted.';
@@ -6400,6 +6416,11 @@ function _wireAllHandlers() {
 
   // ── Enter room: Enter key ─────────────────────────────────────────────────────
   on('input-room-code', 'keydown', e => { if (e.key === 'Enter') handleEnter(); });
+  // Typing-time prefetch: warm one sign-in on focus (no room data involved); look up the exact code once typing pauses.
+  { let _pfT = 0;
+    on('input-room-code', 'focus', () => window.warmJoin?.());
+    on('input-room-code', 'input', e => { clearTimeout(_pfT); window.cancelPrefetch?.(); const v = e.target.value; _pfT = setTimeout(() => window.prefetchRoom?.(v), 450); });
+  }
 
   // ── Waiting screen ────────────────────────────────────────────────────────────
   on('btn-waiting-cancel', 'click', () => cancelJoinRequest());

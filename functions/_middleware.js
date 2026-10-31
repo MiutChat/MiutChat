@@ -83,10 +83,76 @@ async function verifyAdminCookie(value, secret) {
 
 const MAINTENANCE_HTML = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Maintenance — MiutChat</title><meta name="robots" content="noindex,nofollow"/><meta http-equiv="refresh" content="60"/><meta name="theme-color" content="#050d0c"/><style>:root{--t:#4ecdc4;--bg:#050d0c;--bdr:rgba(78,205,196,.12);--tb:rgba(78,205,196,.17);--tdim:rgba(78,205,196,.08);--tx:#cdeae7;--tx2:#4e7a77}*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}html,body{height:100%;background:var(--bg);color:var(--tx);font-family:'Space Mono',monospace;-webkit-font-smoothing:antialiased}body{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:40px 6%;text-align:center;position:relative}.bg{position:absolute;inset:0;background:radial-gradient(ellipse 55% 50% at 50% 50%,rgba(78,205,196,.07) 0%,transparent 65%);pointer-events:none}.card{position:relative;z-index:1;max-width:480px;padding:48px 40px;background:rgba(12,22,21,.92);border:1px solid var(--bdr);border-radius:24px}.icon{width:64px;height:64px;border-radius:18px;background:var(--tdim);border:1px solid var(--tb);display:flex;align-items:center;justify-content:center;margin:0 auto 24px}@keyframes spin{to{transform:rotate(360deg)}}.ring{width:36px;height:36px;border:2px solid rgba(78,205,196,.15);border-top-color:var(--t);border-radius:50%;animation:spin 1.2s linear infinite}.label{font-size:.55rem;font-weight:700;letter-spacing:5px;color:var(--t);margin-bottom:14px}h1{font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:12px}p{font-size:.76rem;color:var(--tx2);line-height:1.85;margin-bottom:20px}.badge{display:inline-flex;align-items:center;gap:7px;padding:6px 14px;background:var(--tdim);border:1px solid var(--tb);border-radius:100px;font-size:.58rem;letter-spacing:2px;color:var(--t)}@keyframes pd{0%,100%{opacity:1}50%{opacity:.35}}.pulse{width:6px;height:6px;border-radius:50%;background:var(--t);animation:pd 1.6s ease-in-out infinite}#cd{color:var(--t);font-weight:700}</style></head><body><div class="bg"></div><div class="card"><div class="icon"><div class="ring"></div></div><div class="label">MAINTENANCE</div><h1>We'll be back soon.</h1><p>MiutChat is undergoing scheduled maintenance. No data is lost.</p><div class="badge"><span class="pulse"></span>WORKING ON IT</div><p style="font-size:.65rem;margin-top:16px;margin-bottom:0">Refreshes in <span id="cd">60</span>s</p></div><script>var t=60,e=document.getElementById('cd');setInterval(function(){t--;e&&(e.textContent=t);t<=0&&location.reload()},1000);</script></body></html>`;
 
+
+// ══════════════════════════════════════════════════════════
+// API rate limiting (every /api/* route)
+// ══════════════════════════════════════════════════════════
+// In-memory token buckets, per client IP per endpoint class. Deliberately NOT Cloudflare KV: the free tier
+// allows only 1,000 KV writes/day account-wide (see shard-registry.js), so per-request counters would burn it
+// in minutes. Trade-off: each Worker isolate counts separately, so the effective ceiling can be a small multiple
+// of the numbers below when traffic is spread across isolates. That is fine as a first line of defence; for a hard
+// global cap add a Cloudflare WAF rate-limiting rule on /api/* as well. rate-limit.js (KV-backed, per action)
+// remains the stricter limiter for create/enter/send.
+//   API_RATE_LIMIT_DISABLED=1   switch the limiter off (e.g. when a WAF rule replaces it)
+//   API_RATE_LIMIT_MULT=2       scale every limit (0.1 .. 20)
+// burst = bucket size, perMin = sustained refill. Shared NATs (schools, mobile carriers) put many people behind
+// one IP, so the numbers are generous for normal use and only bite on scripted traffic.
+const API_LIMITS = [
+  { p: '/api/shard-registry', m: '*',    name: 'registry',    burst: 40, perMin: 90 },
+  { p: '/api/rate-limit',     m: '*',    name: 'rate-limit',  burst: 40, perMin: 90 },
+  { p: '/api/validate-room',  m: '*',    name: 'validate',    burst: 20, perMin: 40 },
+  { p: '/api/analytics',      m: 'POST', name: 'analytics-w', burst: 10, perMin: 20 },   // writes KV
+  { p: '/api/analytics',      m: '*',    name: 'analytics-r', burst: 5,  perMin: 10 },   // admin read (Bearer secret)
+  { p: '/api/notify',         m: '*',    name: 'notify',      burst: 20, perMin: 30 },
+  { p: '/api/cleanup',        m: '*',    name: 'cleanup',     burst: 45, perMin: 60 },   // admin (Bearer secret). The GitHub Action calls it up to 40x back-to-back per run, so this must stay above that.
+  { p: '/api/expire-room',    m: '*',    name: 'expire-room', burst: 5,  perMin: 10 },   // public; each call costs service-account reads
+  { p: '/api/canary',         m: '*',    name: 'canary',      burst: 3,  perMin: 6  },   // writes KV (ban list)
+  { p: '/api/csp-report',     m: '*',    name: 'csp',         burst: 10, perMin: 20 },
+  { p: '/api/config',         m: '*',    name: 'config',      burst: 30, perMin: 60 },
+  { p: '/api/health',         m: '*',    name: 'health',      burst: 20, perMin: 60 },
+];
+const API_DEFAULT_LIMIT = { name: 'api-default', burst: 30, perMin: 60 };   // any /api/* route not listed above
+const _apiBuckets = new Map();                                              // LRU: insertion order == recency
+const _API_BUCKET_CAP = 20000;
+
+// Returns 0 when the request may proceed, otherwise the seconds to wait.
+function _takeToken(key, burst, perMin, now) {
+  const rate = perMin / 60000;                                              // tokens per ms
+  let b = _apiBuckets.get(key);
+  if (b) { b.t = Math.min(burst, b.t + (now - b.at) * rate); b.at = now; _apiBuckets.delete(key); }
+  else   { b = { t: burst, at: now }; }
+  _apiBuckets.set(key, b);
+  if (_apiBuckets.size > _API_BUCKET_CAP) {                                 // evict least-recently-used
+    for (const k of _apiBuckets.keys()) { _apiBuckets.delete(k); if (_apiBuckets.size <= _API_BUCKET_CAP * 0.9) break; }
+  }
+  if (b.t >= 1) { b.t -= 1; return 0; }
+  return Math.max(1, Math.ceil((1 - b.t) / rate / 1000));
+}
+
+function apiRateLimit(request, path, env) {
+  if (env?.API_RATE_LIMIT_DISABLED === '1') return null;
+  const mv   = parseFloat(env?.API_RATE_LIMIT_MULT);
+  let mult   = Number.isFinite(mv) ? Math.min(20, Math.max(0.1, mv)) : 1;
+  const ipH  = request.headers.get('CF-Connecting-IP');
+  if (!ipH) mult *= 5;                                                      // header is always set by Cloudflare; missing = local dev
+  const rule = API_LIMITS.find(r => (path === r.p || path.startsWith(r.p + '/')) && (r.m === '*' || r.m === request.method)) || API_DEFAULT_LIMIT;
+  const wait = _takeToken(`${rule.name}|${ipH || 'unknown'}`, Math.max(1, rule.burst * mult), rule.perMin * mult, Date.now());
+  if (!wait) return null;
+  return new Response(JSON.stringify({ error: 'Too many requests', retryAfter: wait }), {
+    status: 429,
+    headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Retry-After': String(wait), 'Cache-Control': 'no-store' },
+  });
+}
+
 export async function onRequest(ctx) {
   const { request, env, next } = ctx;
   const url  = new URL(request.url);
   const path = url.pathname;
+
+  if (path.startsWith('/api/')) {
+    const limited = apiRateLimit(request, path, env);
+    if (limited) return limited;
+  }
 
   // ══════════════════════════════════════════════════════════
   // /access?key=ADMIN_ACCESS — MUST be FIRST before anything
