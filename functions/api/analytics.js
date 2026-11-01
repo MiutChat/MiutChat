@@ -15,6 +15,11 @@
  *        Always answers 200 "ok": analytics must never affect the app.
  * READ   GET  /api/analytics?days=30        (Authorization: Bearer ADMIN_ACCESS)
  *        → { source, room_created, message_sent, totals, days, rollup, ts }
+ * DEBUG  GET  /api/analytics?debug=1        (Authorization: Bearer ADMIN_ACCESS)
+ *        End-to-end self-test: config → OAuth → a real Firestore write →
+ *        readback, reporting exactly which step failed and why. Use this
+ *        first if READ looks empty/wrong — it won't tell you WHY, since a
+ *        write failure never affects the app and is never exposed there.
  * MIGRATE POST /api/analytics?action=migrate&cursor=…   (Bearer ADMIN_ACCESS)
  *        One-off import of the old KV counters. Repeat with the returned
  *        `cursor` until it reports done:true. Safe to re-run.
@@ -22,7 +27,7 @@
 
 'use strict';
 
-import { CLIENT_EVENTS, recordEvents, readStats, migrateKv, registryAdmin } from '../_lib/analytics-store.js';
+import { CLIENT_EVENTS, recordEvents, readStats, migrateKv, registryAdmin, diagnose } from '../_lib/analytics-store.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 const JSON_HDR = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS };
@@ -49,6 +54,17 @@ export async function onRequest(ctx) {
   if (request.method === 'GET') {
     if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
 
+    // ?debug=1 — end-to-end self-test (config → OAuth → a real Firestore
+    // write → readback), reporting exactly which step failed and why.
+    // Everything else here either returns cached/aggregate data or
+    // deliberately swallows write failures (POST always answers the
+    // browser 200 "ok" — see recordEvents' doc comment) so this is the
+    // only path that will actually tell you *why* events aren't landing.
+    if (url.searchParams.get('debug') === '1') {
+      try { return json(await diagnose(env)); }
+      catch (e) { return json({ ok: false, step: 'unexpected', detail: String(e && e.message || e) }, 500); }
+    }
+
     if (registryAdmin(env)) {
       try {
         const s = await readStats(env, url.searchParams.get('days'));
@@ -59,7 +75,16 @@ export async function onRequest(ctx) {
           totals: s.totals, days: s.days, rollup: s.rollup,
           ts: new Date().toISOString(),
         });
-      } catch { return json({ error: 'analytics_read_failed' }, 502); }
+      } catch (e) {
+        // This endpoint is admin-only (same Bearer check as everything else
+        // here), so there's no reason to hide the real cause the way the
+        // public-facing POST path has to — surface it instead of a bare
+        // "something failed". readStats() already builds a message with
+        // both Firestore response statuses in it; this used to be an
+        // unbound `catch {}` that threw that detail away entirely.
+        console.error('[MIUT analytics] readStats failed', e && e.message || e);
+        return json({ error: 'analytics_read_failed', detail: String(e && e.message || e) }, 502);
+      }
     }
 
     const kv = env?.MIUT_KV;
