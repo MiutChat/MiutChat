@@ -1,84 +1,112 @@
 /**
  * functions/api/analytics.js
  *
- * Anonymous event counter — no user data stored, ever.
+ * Anonymous usage counters — no user data, room codes or IPs stored, ever.
  *
- * Events: room_created | message_sent
- * Storage: Cloudflare KV  (MIUT_KV)
- * Reads:   GET /api/analytics  (requires Authorization: Bearer ADMIN_ACCESS)
+ * STORAGE
+ *   Firestore (the REGISTRY project) when FIREBASE_REGISTRY_SA_JSON is set —
+ *   atomic increments, 20,000 writes/day free, full event set.
+ *   Otherwise the original Cloudflare KV counters (room_created / message_sent
+ *   only) so nothing breaks before the service account is configured.
+ *   See functions/_lib/analytics-store.js for the schema and privacy notes.
  *
- * KV keys:
- *   analytics:room_created   → integer string
- *   analytics:message_sent   → integer string
- *   analytics:day:YYYY-MM-DD:room_created  → integer (daily breakdown)
- *   analytics:day:YYYY-MM-DD:message_sent  → integer
+ * WRITE  POST /api/analytics   { e: event, n?: 1..10, d?: { dimension: value } }
+ *        The browser batches message_sent (one call per 2 messages, n = 2).
+ *        Always answers 200 "ok": analytics must never affect the app.
+ * READ   GET  /api/analytics?days=30        (Authorization: Bearer ADMIN_ACCESS)
+ *        → { source, room_created, message_sent, totals, days, rollup, ts }
+ * MIGRATE POST /api/analytics?action=migrate&cursor=…   (Bearer ADMIN_ACCESS)
+ *        One-off import of the old KV counters. Repeat with the returned
+ *        `cursor` until it reports done:true. Safe to re-run.
  */
 
 'use strict';
 
-const ALLOWED_EVENTS = new Set(['room_created', 'message_sent']);
+import { CLIENT_EVENTS, recordEvents, readStats, migrateKv, registryAdmin } from '../_lib/analytics-store.js';
+
 const CORS = { 'Access-Control-Allow-Origin': '*' };
+const JSON_HDR = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS };
+const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: JSON_HDR });
+
+/** Constant-time compare of the Bearer secret. */
+function authorized(request, env) {
+  const secret = env?.ADMIN_ACCESS || '';
+  if (!secret) return false;
+  const te = new TextEncoder();
+  const a = te.encode(request.headers.get('Authorization') || ''), b = te.encode(`Bearer ${secret}`);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a[i] || 0) ^ (b[i] || 0);
+  return diff === 0;
+}
 
 export async function onRequest(ctx) {
   const { request, env } = ctx;
+  const url = new URL(request.url);
 
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS });
-  }
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
 
-  const kv = env?.MIUT_KV;
-
-  // ── GET — read totals (admin only) ────────────────────────────────────────
+  // ── GET — read stats (admin only) ─────────────────────────────────────────
   if (request.method === 'GET') {
-    const secret = env?.ADMIN_ACCESS || '';
-    const auth   = request.headers.get('Authorization') || '';
-    if (!secret || auth !== `Bearer ${secret}`) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }),
-        { status: 401, headers: { 'Content-Type': 'application/json', ...CORS } });
+    if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
+
+    if (registryAdmin(env)) {
+      try {
+        const s = await readStats(env, url.searchParams.get('days'));
+        return json({
+          source: 'firestore',
+          room_created: s.totals?.ev?.room_created || 0,          // same fields the old endpoint returned
+          message_sent: s.totals?.ev?.message_sent || 0,
+          totals: s.totals, days: s.days, rollup: s.rollup,
+          ts: new Date().toISOString(),
+        });
+      } catch { return json({ error: 'analytics_read_failed' }, 502); }
     }
 
-    if (!kv) return new Response(JSON.stringify({ error: 'KV not configured' }),
-      { status: 500, headers: { 'Content-Type': 'application/json', ...CORS } });
-
-    const [rooms, msgs] = await Promise.all([
-      kv.get('analytics:room_created'),
-      kv.get('analytics:message_sent'),
-    ]);
-
-    return new Response(JSON.stringify({
-      room_created:  parseInt(rooms  || '0', 10),
-      message_sent:  parseInt(msgs   || '0', 10),
-      ts: new Date().toISOString(),
-    }), { status: 200, headers: { 'Content-Type': 'application/json', ...CORS } });
+    const kv = env?.MIUT_KV;
+    if (!kv) return json({ error: 'No analytics storage configured (set FIREBASE_REGISTRY_SA_JSON)' }, 500);
+    const [rooms, msgs] = await Promise.all([kv.get('analytics:room_created'), kv.get('analytics:message_sent')]);
+    return json({ source: 'kv', room_created: parseInt(rooms || '0', 10), message_sent: parseInt(msgs || '0', 10), ts: new Date().toISOString() });
   }
 
-  // ── POST — record event ───────────────────────────────────────────────────
   if (request.method === 'POST') {
-    if (!kv) return new Response('ok', { status: 200, headers: CORS });
+    // ── POST ?action=migrate — one-off KV → Firestore import (admin only) ───
+    if (url.searchParams.get('action') === 'migrate') {
+      if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
+      try {
+        const r = await migrateKv(env, url.searchParams.get('cursor') || '');
+        return json(r.body, r.status);
+      } catch { return json({ error: 'migrate_failed' }, 502); }
+    }
 
+    // ── POST — record an event ──────────────────────────────────────────────
     let body;
     try { body = await request.json(); } catch { return new Response('ok', { status: 200, headers: CORS }); }
-
     const event = body?.e;
-    if (!event || !ALLOWED_EVENTS.has(event)) {
+    if (!event || !Object.prototype.hasOwnProperty.call(CLIENT_EVENTS, event)) return new Response('ok', { status: 200, headers: CORS });
+
+    // A client may report several events in one request (`n`, 1..10).
+    const n = Math.min(10, Math.max(1, Math.floor(Number(body?.n)) || 1));
+
+    if (registryAdmin(env)) {
+      const work = recordEvents(env, [{
+        event, n, dims: body?.d,
+        hour: new Date().getUTCHours(),
+        country: env.ANALYTICS_GEO === 'off' ? null : request.cf?.country,
+      }]);
+      if (ctx.waitUntil) ctx.waitUntil(work); else await work;
       return new Response('ok', { status: 200, headers: CORS });
     }
 
-    // A client may report several events in one request (`n`, 1..10) so a chatty session costs one KV round
-    // trip instead of one per message. Old clients send no `n` and count as 1.
-    const n = Math.min(10, Math.max(1, Math.floor(Number(body?.n)) || 1));
-
-    // Increment total counter
+    // ── Legacy KV fallback (only the two original events) ───────────────────
+    const kv = env?.MIUT_KV;
+    if (!kv || (event !== 'room_created' && event !== 'message_sent')) return new Response('ok', { status: 200, headers: CORS });
     const totalKey = `analytics:${event}`;
     const cur = parseInt(await kv.get(totalKey) || '0', 10);
     await kv.put(totalKey, String(cur + n));
-
-    // Increment daily counter
     const day = new Date().toISOString().slice(0, 10);
     const dayKey = `analytics:day:${day}:${event}`;
     const dayVal = parseInt(await kv.get(dayKey) || '0', 10);
     await kv.put(dayKey, String(dayVal + n), { expirationTtl: 90 * 24 * 3600 }); // keep 90 days
-
     return new Response('ok', { status: 200, headers: CORS });
   }
 

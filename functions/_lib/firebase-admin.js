@@ -97,6 +97,31 @@ export async function getAccessToken(sa, fetchImpl = fetch) {
   return (await res.json()).access_token;
 }
 
+// Access tokens live for an hour. Workers keep module state between requests in
+// the same isolate, so cache them: it saves a subrequest AND an RSA signature on
+// every call after the first (this matters on the analytics hot path).
+const _tokenCache = new Map();
+const _tokenKey = sa => `${sa.client_email}|${sa.project_id}`;
+export function peekCachedToken(sa) {
+  const hit = _tokenCache.get(_tokenKey(sa));
+  return hit && hit.exp - 60000 > Date.now() ? hit.token : null;
+}
+const _tokenInflight = new Map();   // concurrent cold callers share ONE token request
+export async function getAccessTokenCached(sa, fetchImpl = fetch) {
+  const hit = peekCachedToken(sa);
+  if (hit) return hit;
+  const key = _tokenKey(sa);
+  let p = _tokenInflight.get(key);
+  if (!p) {
+    p = getAccessToken(sa, fetchImpl)
+      .then(token => { _tokenCache.set(key, { token, exp: Date.now() + 3600e3 }); return token; })
+      .finally(() => _tokenInflight.delete(key));
+    _tokenInflight.set(key, p);
+  }
+  return p;
+}
+export function dropCachedToken(sa) { _tokenCache.delete(_tokenKey(sa)); }
+
 // ── Firestore REST client ───────────────────────────────────────────────────
 export function makeClient(shard, budget, fetchImpl = fetch) {
   const root = `projects/${shard.projectId}/databases/(default)/documents`;
@@ -104,7 +129,7 @@ export function makeClient(shard, budget, fetchImpl = fetch) {
   let token = null;
 
   async function call(url, init = {}) {
-    if (!token) { budget.take(); token = await getAccessToken(shard.sa, fetchImpl); }
+    if (!token) { token = peekCachedToken(shard.sa); if (!token) { budget.take(); token = await getAccessTokenCached(shard.sa, fetchImpl); } }
     budget.take();
     return fetchImpl(url, {
       ...init,
@@ -160,6 +185,55 @@ export function fieldMillis(f) {
 export function roomIdFromName(name) {
   const raw = String(name).split('/documents/rooms/')[1] || '';
   try { return decodeURIComponent(raw); } catch { return raw; }
+}
+
+// ── "Room is empty" verification (never trust the caller) ───────────────────
+
+/** True only when the admin explicitly chose "Instant" (inactivityTtlMs === 0). */
+export function isInstantExpiry(room) {
+  const f = room && room.inactivityTtlMs;
+  return !!f && (f.integerValue === '0' || f.doubleValue === 0);
+}
+
+/** Any member flagged online whose heartbeat is fresh (heartbeat is every 30 s; 4 missed beats = gone). */
+export async function hasRecentlyOnlineMember(client, code, windowMs = 120000) {
+  const rows = await client.runQuery(`rooms/${encodeURIComponent(code)}`, {
+    from: [{ collectionId: 'members' }],
+    where: { fieldFilter: { field: { fieldPath: 'online' }, op: 'EQUAL', value: { booleanValue: true } } },
+    select: { fields: [{ fieldPath: 'lastSeen' }] },
+    limit: 50,
+  });
+  const now = Date.now();
+  return rows.some(r => now - fieldMillis(r.document.fields && r.document.fields.lastSeen) < windowMs);
+}
+
+export async function hasApprovedMember(client, code) {
+  const rows = await client.runQuery(`rooms/${encodeURIComponent(code)}`, {
+    from: [{ collectionId: 'members' }],
+    where: { fieldFilter: { field: { fieldPath: 'approved' }, op: 'EQUAL', value: { booleanValue: true } } },
+    select: { fields: [{ fieldPath: '__name__' }] },
+    limit: 1,
+  });
+  return rows.length > 0;
+}
+
+/**
+ * Should this room be deleted right now? Returns null if yes, else a reason.
+ *   mode "expired": autoDeleteAt has passed.
+ *   mode "empty":   the last member left AND (the admin chose Instant expiry OR
+ *                   nobody was ever approved) — mirrors _handleRoomBecameEmpty in
+ *                   the client, but verified here because a non-admin's browser is
+ *                   not allowed to do the deletion itself.
+ */
+export async function deletionBlocker(client, code, room, mode) {
+  if (mode === 'empty') {
+    if (!fieldMillis(room.emptyAt)) return 'not_empty';
+    if (await hasRecentlyOnlineMember(client, code)) return 'not_empty';
+    if (!isInstantExpiry(room) && await hasApprovedMember(client, code)) return 'not_instant';
+    return null;
+  }
+  const expiry = fieldMillis(room.autoDeleteAt);
+  return (!expiry || expiry > Date.now()) ? 'not_expired' : null;
 }
 
 // ── Operations ──────────────────────────────────────────────────────────────
@@ -265,7 +339,7 @@ export async function sweepExpiredMessages(client, budget, cursor = 0) {
  * 50), so the budget is shared: each shard gets an equal slice of what is
  * left, and a shard that finishes early hands its unused calls to the next.
  */
-export async function runAdminCleanup(shards, { cursors = {}, totalBudget = 46, fetchImpl = fetch } = {}) {
+export async function runAdminCleanup(shards, { cursors = {}, totalBudget = 44, fetchImpl = fetch } = {}) {
   const out = { shards: [], cursors: {}, more: false };
   let remaining = totalBudget;
   for (let i = 0; i < shards.length; i++) {

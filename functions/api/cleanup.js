@@ -45,6 +45,7 @@
 'use strict';
 
 import { discoverAdminShards, runAdminCleanup } from '../_lib/firebase-admin.js';
+import { recordEvents } from '../_lib/analytics-store.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 
@@ -156,6 +157,16 @@ async function runCleanup(env, opts = {}) {
   // query failure) never blocks cleanup on the others.
   const adminResult = admin.length ? await runAdminCleanup(admin, { cursors: opts.cursors }) : null;
   const results = await Promise.all(legacy.map(cleanupShard));
+
+  // Count what the server actually removed (anonymous totals — see analytics-store.js).
+  if (adminResult) {
+    const rooms = adminResult.shards.reduce((a, r) => a + (r.roomsWiped || 0), 0);
+    const msgs  = adminResult.shards.reduce((a, r) => a + (r.messagesDeleted || 0), 0);
+    const items = [];
+    if (rooms) items.push({ event: 'rooms_wiped', n: rooms });
+    if (msgs)  items.push({ event: 'messages_expired', n: msgs });
+    if (items.length) await recordEvents(env, items).catch(() => {});
+  }
 
   const deleted = results.reduce((sum, r) => sum + r.deleted, 0);
   const checked = results.reduce((sum, r) => sum + r.checked, 0);

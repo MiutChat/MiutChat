@@ -91,7 +91,7 @@ export const CONFIG = {
   TYPING_WRITE_MS:    4000,
   TYPING_EXPIRE_MS:   9000,
   TYPING_IDLE_MS:     3500,
-  HEARTBEAT_MS:       20000,
+  HEARTBEAT_MS:       30000,   // presence is read as online while lastSeen < 90s (see _staleMs) — keep >= 3x this
   MAX_FILE_BYTES:     25 * 1024 * 1024,
 
 
@@ -1538,7 +1538,7 @@ async function handleCreate() {
     saveSession(); saveRoom(code);
     await registerPresence('admin', true, true);
     sendSys(`${state.me.name} created this room`).catch(() => {});
-    _ping('room_created');
+    _ping('room_created', 1, { ttl: _ttlBucket(_selectedTtlSec) });
     bootApp();
   } catch (e) { showSmartError(e, 'create'); }
   finally { setLoading(btn, false); }
@@ -1569,6 +1569,7 @@ async function handleEnter() {
       _memberRead = null;
       _log('warn', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — room doc does not exist on this shard`);
       if (window.isRoomExpired?.(code)) {
+        _ping('join_failed', 1, { why: 'expired' });
         showError('This room has expired and was deleted.');
         return;
       }
@@ -1600,6 +1601,7 @@ async function handleEnter() {
         }
       }
       if (!roomSnap.exists) {
+        _ping('join_failed', 1, { why: 'not_found' });
         _recordWrongCode();
         return;
       }
@@ -1609,6 +1611,7 @@ async function handleEnter() {
     // A blocked user is permanently barred from this room (see blockMember) —
     // check before anything else so there's no path that lets them back in.
     if ((roomSnap.data()?.blockedUsers || []).includes(uid)) {
+      _ping('join_failed', 1, { why: 'blocked' });
       const errEl = $('join-error');
       if (errEl) errEl.textContent = 'You have been blocked from this room by an admin.';
       setLoading(btn, false);
@@ -1617,7 +1620,7 @@ async function handleEnter() {
     // Check if room has expired before entering
     _setLoadingLabel(btn, 'Joining…');
     const _expired = await _checkRoomExpiry(code, db, roomSnap);
-    if (_expired) { setLoading(btn, false); return; }
+    if (_expired) { _ping('join_failed', 1, { why: 'expired' }); setLoading(btn, false); return; }
     _roomEpoch = roomSnap.data()?.epoch || 0;
     _roomSalt  = roomSnap.data()?.salt  || null;
     _roomTtlMs = Number(roomSnap.data()?.msgTtlMs) > 0 ? Number(roomSnap.data().msgTtlMs) : 0;
@@ -1638,15 +1641,18 @@ async function handleEnter() {
     if (isCreator && !prevData?.blocked && !(prevData?.role === 'admin' && prevData?.approved === true)) {
       await registerPresence('admin', true, !prevData, prevData);
       sendSys(`${state.me.name} rejoined the room`).catch(() => {});
+      _ping('room_joined', 1, { kind: 'rejoin' });
       bootApp();
     } else if (wasApproved) {
       // Returning approved member — skip the queue
       const role = prevData.role || 'member';
       await registerPresence(role, true, false, prevData);
       sendSys(`${state.me.name} rejoined the room`).catch(() => {});
+      _ping('room_joined', 1, { kind: 'rejoin' });
       bootApp();
     } else if (prevData && prevData.declined) {
       // Was explicitly declined by admin
+      _ping('join_failed', 1, { why: 'declined' });
       const errEl = $('join-error');
       if (errEl) errEl.textContent = 'Your request was declined by the room admin.';
       setLoading($('btn-enter'), false);
@@ -1660,12 +1666,14 @@ async function handleEnter() {
         // Gate — register as pending and show waiting screen
         await registerPresence('member', false, !prevData, prevData);
         _notifyRoomEvent('join-request'); // admins only — see functions/api/notify.js
+        _ping('room_joined', 1, { kind: 'pending' });
         showWaitingScreen();
       } else {
         // Open room — approve immediately and boot
         await registerPresence('member', true, !prevData, prevData);
         sendSys(`${state.me.name} joined the room`).catch(() => {});
         _notifyRoomEvent('member-joined'); // everyone else already in the room
+        _ping('room_joined', 1, { kind: 'new' });
         bootApp();
       }
     }
@@ -2406,7 +2414,7 @@ function _isMsgExpired(data, ttlMs = _roomTtlMs) {
 
 // Delete an already-expired message (all chunks if it is a chunked file) from
 // Firestore and the local IDB cache. Never renders it.
-function _purgeExpiredDoc(code, docId, data) {
+function _purgeExpiredDoc(code, docId, data, onDeleted) {
   try {
     const col = db.collection('rooms').doc(code).collection('messages');
     const gid = data && data.groupId;
@@ -2416,7 +2424,7 @@ function _purgeExpiredDoc(code, docId, data) {
           const b = db.batch(); snap.forEach(d => b.delete(d.ref)); return b.commit();
         })
       : col.doc(docId).delete();
-    p.then(() => _log('debug', '[MIUT ttl] purged expired message:', docId))
+    p.then(() => { _log('debug', '[MIUT ttl] purged expired message:', docId); if (onDeleted) onDeleted(); })
      .catch(e => _log('warn', '[MIUT ttl] expired purge rejected (check Firestore rules):', docId, e));
   } catch (e) {}
   openIDB().then(db2 => new Promise(res => {
@@ -2435,88 +2443,57 @@ function _startExpirySweep() {
 function _runExpirySweep() {
   if (!_roomTtlMs || !state.roomCode) return;
   const now = Date.now();
-  // Includes .msg-system now too — see renderMsg's system-message branch
-  // for why (they used to have no data-ts at all and were invisible here).
+  // Nothing to paint while the tab is hidden — but still delete what expired.
+  const visible = !document.hidden;
+  // Includes .msg-system too — see renderMsg's system-message branch for why
+  // (they used to have no data-ts at all and were invisible here).
   document.querySelectorAll('.msg-wrapper[data-ts], .msg-system[data-ts]').forEach(w => {
-    const ts    = parseInt(w.dataset.ts  || '0', 10);
-    const docId = w.dataset.docId || '';
+    if (w.dataset.expired === '1') return;            // already fading out / deleted
+    const ts = parseInt(w.dataset.ts || '0', 10);
     if (!ts) return;
-    const age     = now - ts;
-    const timeLeft = _roomTtlMs - age;
+    const timeLeft = _roomTtlMs - (now - ts);
 
     if (timeLeft <= 0) {
-      // ── Expired: remove from DOM and delete from Firestore ─────────────
+      // ── Expired: fade out, then delete from Firestore + the IDB cache ───
+      w.dataset.expired = '1';
       w.style.transition = 'opacity .4s, transform .4s';
       w.style.opacity    = '0';
       w.style.transform  = 'scale(.92)';
       setTimeout(() => w.remove(), 420);
-
-      // Delete from Firestore. Logged on failure now — this used to be a
-      // truly silent fire-and-forget, so a rejected delete (most likely a
-      // Firestore rule that only allows a message's own sender, or an
-      // admin, to delete it — which doesn't line up with "anyone's client
-      // can trigger automatic TTL expiry") left the message permanently
-      // undeletable with zero visible indication why, and it would keep
-      // reappearing on every future history load. See the rule note below.
-      if (docId && db && state.roomCode) {
-        const groupId = w.dataset.groupId || '';
-        if (groupId) {
-          // Chunked file (image/video split across many small docs) — the
-          // visible bubble only knows chunk 0's docId, but ALL chunks share
-          // this groupId and must be deleted together, or every chunk
-          // after the first would be orphaned in Firestore forever every
-          // time a large file's message expired.
-          db.collection('rooms').doc(state.roomCode).collection('messages')
-            .where('groupId', '==', groupId).get()
-            .then(snap => {
-              if (snap.empty) return;
-              const batch = db.batch();
-              snap.forEach(d => batch.delete(d.ref));
-              return batch.commit();
-            })
-            .then(() => { _log('debug', '[MIUT ttl] expired chunked file deleted (all chunks):', groupId); _sanitizeRepliesTo(docId); })
-            .catch(e => _log('warn', '[MIUT ttl] expired chunk-group delete REJECTED — some/all chunks may remain in Firestore. Check rules allow TTL-based deletion by any room member:', groupId, e));
-        } else {
-          db.collection('rooms').doc(state.roomCode)
-            .collection('messages').doc(docId)
-            .delete()
-            .then(() => { _log('debug', '[MIUT ttl] expired message deleted:', docId); _sanitizeRepliesTo(docId); })
-            .catch(e => _log('warn', '[MIUT ttl] expired message delete REJECTED — it will reappear on reload until this succeeds. Check Firestore rules allow TTL-based deletion by any room member, not just the sender/admin:', docId, e));
-        }
-      }
-      // Also purge the local IDB cache (see loadCached/cacheMsg) — without
-      // this, an expired-and-server-deleted message could still surface
-      // briefly from the offline cache on the next reload, which defeats
-      // "vanish" for the one client that had it cached.
-      if (docId) {
-        openIDB().then(db2 => new Promise(res => {
-          const tx = db2.transaction('msgs', 'readwrite');
-          tx.objectStore('msgs').delete(docId);
-          tx.oncomplete = res;
-        })).catch(() => {});
-      }
+      const docId = w.dataset.docId || '';
+      // A chunked file's bubble only knows chunk 0's docId, but every chunk
+      // shares the groupId and must go together (handled in _purgeExpiredDoc).
+      // Delete rejections are logged there with the rules hint.
+      if (docId && db) _purgeExpiredDoc(state.roomCode, docId, { groupId: w.dataset.groupId || '' }, () => _sanitizeRepliesTo(docId));
       return;
     }
+    if (!visible) return;
 
-    // ── Still alive: update progress bar (replaces text timer) ─────────
+    // ── Still alive: update the progress bar ────────────────────────────
     if (timeLeft < 10000) w.dataset.expiring = '1';
-    else delete w.dataset.expiring;
-    // Progress bar: width = timeLeft / total * 100%
-    let bar  = w.querySelector('.msg-ttl-bar');
-    if (!bar) {
-      bar = document.createElement('div'); bar.className = 'msg-ttl-bar';
-      const fill = document.createElement('div'); fill.className = 'msg-ttl-fill';
-      bar.appendChild(fill);
-      const inner = w.querySelector('.msg-inner');
-      if (inner) inner.after(bar);
+    else if (w.dataset.expiring) delete w.dataset.expiring;
+    let fill = w._ttlFill;                              // cached: no querySelector per tick
+    if (!fill || !fill.isConnected) {
+      let bar = w.querySelector('.msg-ttl-bar');
+      if (!bar) {
+        bar = document.createElement('div'); bar.className = 'msg-ttl-bar';
+        const f = document.createElement('div'); f.className = 'msg-ttl-fill';
+        bar.appendChild(f);
+        const inner = w.querySelector('.msg-inner');
+        if (inner) inner.after(bar);
+      }
+      fill = w._ttlFill = bar.querySelector('.msg-ttl-fill');
+      w.querySelector('.msg-ttl-timer')?.remove();      // old text timer, if present
     }
-    const fill = bar.querySelector('.msg-ttl-fill');
     if (fill) {
       const pct = Math.max(0, (timeLeft / _roomTtlMs) * 100);
-      fill.style.width = pct + '%';
-      fill.style.background = pct < 20 ? 'var(--danger)' : pct < 50 ? '#f7c430' : 'var(--teal)';
+      const w10 = Math.round(pct * 2) / 2;              // skip sub-0.5% style writes
+      if (fill._p !== w10) {
+        fill._p = w10;
+        fill.style.width = pct + '%';
+        fill.style.background = pct < 20 ? 'var(--danger)' : pct < 50 ? '#f7c430' : 'var(--teal)';
+      }
     }
-    w.querySelector('.msg-ttl-timer')?.remove(); // remove old text timer if present
   });
 }
 
@@ -3041,7 +3018,9 @@ async function _handleRoomBecameEmpty(code) {
         } catch (_e2) { /* fail open */ }
       }
       if (shouldWipe) {
-        await wipeRoom(code, db);
+        // A non-admin can't delete the room (Firestore rules) — wipeRoom then
+        // returns false and the server verifies emptiness and deletes it instead.
+        if (!(await wipeRoom(code, db))) _requestServerExpire(code, 'empty');
         await clearCacheForRoom(code);
       }
     } else if (!_roomWasEmpty) {
@@ -3068,7 +3047,7 @@ async function _handleRoomBecameEmpty(code) {
           });
         } catch { /* another tab likely won, or denied — skip */ }
         if (shouldWipe) {
-          await wipeRoom(code, db);
+          if (!(await wipeRoom(code, db))) _requestServerExpire(code, 'empty');
           await clearCacheForRoom(code);
         }
       } else {
@@ -3556,11 +3535,11 @@ async function _healRoomSchema(code, roomData) {
 /** Ask the server to delete an expired room. Non-admins can't do it from the
  *  client (Firestore rules), so this is what actually removes it. Fire-and-forget;
  *  a 501 (no service account configured) is simply ignored. */
-function _requestServerExpire(code) {
+function _requestServerExpire(code, mode) {
   try {
     fetch('/api/expire-room', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }), keepalive: true,
+      body: JSON.stringify(mode ? { code, mode } : { code }), keepalive: true,
     }).catch(() => {});
   } catch {}
 }
@@ -3588,17 +3567,39 @@ async function _checkRoomExpiry(code, db, knownSnap) {
   } catch { return false; }
 }
 
-/** _ping — anonymous event counter, fire-and-forget. `n` > 1 reports a batch of events in one request. */
-function _ping(event, n) {
+/** _ping — anonymous event counter, fire-and-forget. `n` > 1 reports a batch of events in one request.
+ *  `dims` are low-cardinality labels (e.g. { ttl: 'm5' }); the server only accepts values from fixed lists. */
+function _ping(event, n, dims) {
   try {
+    const body = { e: event };
+    if (n > 1) body.n = n;
+    if (dims) body.d = dims;
     fetch('/api/analytics', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(n > 1 ? { e: event, n } : { e: event }),
+      body: JSON.stringify(body),
       keepalive: true,
     }).catch(() => {});
   } catch {}
 }
+/** Public wrapper so the lazy modules (file-transfer, feedback) can report events too. */
+export function track(event, n, dims) { _ping(event, n, dims); }
+
+// Message-timer choice → the label the server whitelists (see functions/_lib/analytics-store.js).
+function _ttlBucket(sec) { return sec <= 0 ? 'off' : sec <= 30 ? 's30' : sec <= 300 ? 'm5' : sec <= 3600 ? 'h1' : sec <= 86400 ? 'h24' : 'd7'; }
+
+// One app_open per browser tab session (a reload doesn't count again): platform, install mode, version and language.
+(function _trackAppOpen() {
+  try {
+    if (sessionStorage.getItem('miut_ao')) return;
+    sessionStorage.setItem('miut_ao', '1');
+    const ua = navigator.userAgent || '';
+    const plat = /android/i.test(ua) ? 'android' : /iphone|ipad|ipod/i.test(ua) ? 'ios' : /windows/i.test(ua) ? 'windows'
+               : /cros/i.test(ua) ? 'chromeos' : /mac/i.test(ua) ? 'mac' : /linux/i.test(ua) ? 'linux' : 'other';
+    const mode = (matchMedia('(display-mode: standalone)').matches || navigator.standalone) ? 'pwa' : 'browser';
+    _ping('app_open', 1, { plat, mode, ver: APP_VERSION, lang: (navigator.language || '').slice(0, 3) });
+  } catch {}
+})();
 
 
 // Message analytics are batched: the ping goes out after every 2nd message (n = 2) instead of after each one. Each ping
@@ -3794,7 +3795,7 @@ const _origRunExpirySweep = typeof _runExpirySweep !== 'undefined' ? _runExpiryS
 // which may point to a different shard if getDb() was called for another room.
 async function wipeRoom(code, fsInstance) {
   const fs = fsInstance || db;
-  if (!fs || !code) return;  // silent guard
+  if (!fs || !code) return false;  // silent guard
   try {
     const batchDelete = async col => {
       let snap;
@@ -3813,6 +3814,7 @@ async function wipeRoom(code, fsInstance) {
     // Firestore rules now require isRoomAdmin() for room doc deletion.
     await fs.collection('rooms').doc(code).delete();
     window.markRoomExpired?.(code);
+    return true;
   } catch (e) {
     // This used to fail completely silently. A failed wipe here means the
     // room's messages/members subcollections can be left behind even
@@ -3822,6 +3824,7 @@ async function wipeRoom(code, fsInstance) {
     // tries to reuse that exact code and gets a confusing "already in
     // use" error for a room they thought was long gone. Surface it.
     _sysConsole?.warn?.(`[MIUT] wipeRoom(${code}) failed — subcollections or the room doc itself may still exist:`, e);
+    return false;
   }
 }
 
@@ -3835,15 +3838,27 @@ function startHeartbeat() {
   }, CONFIG.HEARTBEAT_MS);
 }
 
+// Brief tab/app switches (notification shade, app switcher) don't need the live
+// listeners torn down and rebuilt — Firestore's own listener reconnects and
+// delivers anything missed. Rebuilding is kept as a safety net for a LONG
+// absence, when a mobile OS may have silently killed the socket; it also resets
+// the typing indicator, which is why doing it on every switch was noisy.
+const _LISTENER_REBUILD_AFTER_MS = 30000;
+let _hiddenAt = 0;
 document.addEventListener('visibilitychange', () => {
   if (!state.me || !state.roomCode || !db) return;
   const online = !document.hidden;
+  if (!online) _hiddenAt = Date.now();
   db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
     .update({ online, lastSeen: ts_now() }).catch(() => {});
   if (online) {
     _unreadCount = 0;
     document.title = 'MIUT';
-    stopChatListeners(); startChatListeners();
+    if (!_hiddenAt || Date.now() - _hiddenAt >= _LISTENER_REBUILD_AFTER_MS || !_unsubMsgs) {
+      stopChatListeners(); startChatListeners();
+    }
+    _hiddenAt = 0;
+    try { _runExpirySweep(); } catch {}                 // refresh TTL bars right away
     setTimeout(_markVisibleAsRead, 400); // mark newly visible messages as read
   }
 });
@@ -5728,10 +5743,12 @@ async function joinFromInvite() {
     const roomSnap = window.takePrefetchSnap?.(code) || await db.collection('rooms').doc(code).get();
     if (!roomSnap.exists) {
       if (window.isRoomExpired?.(code)) {
+        _ping('join_failed', 1, { why: 'expired' });
         if (err) err.textContent = 'This room has expired and was deleted.';
         if (btn) { btn.disabled = false; const sp = btn.querySelector('span'); if (sp) sp.textContent = 'Join Room'; }
         return;
       }
+      _ping('join_failed', 1, { why: 'not_found' });
       _recordWrongCode();
       if (err) err.textContent = 'Room not found — check the code and try again.';
       if (btn) { btn.disabled = false; const sp = btn.querySelector('span'); if (sp) sp.textContent = 'Join Room'; }
@@ -5739,6 +5756,7 @@ async function joinFromInvite() {
     }
     _saveWrongState({ wrongCount: 0, lockedUntil: 0 });
     if ((roomSnap.data()?.blockedUsers || []).includes(uid)) {
+      _ping('join_failed', 1, { why: 'blocked' });
       if (err) err.textContent = 'You have been blocked from this room by an admin.';
       if (btn) { btn.disabled = false; const sp = btn.querySelector('span'); if (sp) sp.textContent = 'Join Room'; }
       return;
@@ -5762,17 +5780,20 @@ async function joinFromInvite() {
     if (wasApproved) {
       await registerPresence(prevData.role || 'member', true, false, prevData);
       sendSys(`${state.me.name} rejoined the room`).catch(() => {});
+      _ping('room_joined', 1, { kind: 'rejoin' });
       bootApp();
     } else {
       const approvalRequired = roomSnap.data()?.approvalRequired === true;
       if (approvalRequired) {
         await registerPresence('member', false, !prevData, prevData);
         _notifyRoomEvent('join-request'); // admins only — see functions/api/notify.js
+        _ping('room_joined', 1, { kind: 'pending' });
         showWaitingScreen();
       } else {
         await registerPresence('member', true, !prevData, prevData);
         sendSys(`${state.me.name} joined the room`).catch(() => {});
         _notifyRoomEvent('member-joined'); // everyone else already in the room
+        _ping('room_joined', 1, { kind: 'new' });
         bootApp();
       }
     }
@@ -6373,6 +6394,7 @@ window.addEventListener('appinstalled', () => {
   const row = $('install-app-row');
   if (row) row.style.display = 'none';
   toast('MIUT installed!', 'Find it on your home screen.', 'ok');
+  _ping('pwa_installed');
 });
 
 // ── JSDoc type definitions ────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 'use strict';
 
-import { db, toast, _log, APP_VERSION, $ } from '../app.js';
+import { db, toast, _log, APP_VERSION, $, track } from '../app.js';
 
 let _fbRating = 0;
 const _fbTags = new Set();
@@ -109,6 +109,7 @@ async function _fbSubmit() {
         createdAt:  firebase.firestore.FieldValue.serverTimestamp(),
       });
     }
+    track('feedback', 1, { rating: 'r' + _fbRating });
     _fbShowThanks(mode);
     setTimeout(() => overlay._fbDone && overlay._fbDone(), 1400);
   } catch (e) {

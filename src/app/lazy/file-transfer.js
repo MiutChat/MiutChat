@@ -26,7 +26,7 @@
 import {
   CONFIG, state, db, toast, scrollBottom, renderMsg, signMsg, ts_now, _log,
   esc, playSound, _testCompression, _b64uDec, idbGetBlob, idbSetBlob,
-  showScrollFab, _placeMsg, _notifyRoomOfNewMessage,
+  showScrollFab, _placeMsg, _notifyRoomOfNewMessage, track,
   _roomEpoch, _roomSalt, setRoomSalt, _lazyDataMap, _lruMap,
 } from '../app.js';
 
@@ -327,6 +327,7 @@ export async function handleFileAttach(e) {
     }
     playSound('send');
     _notifyRoomOfNewMessage();
+    track('file_sent', 1, { ft: msgType });
     if (_optimisticEl) {
       _optimisticEl.style.transition = 'opacity .3s';
       _optimisticEl.style.opacity = '0';
