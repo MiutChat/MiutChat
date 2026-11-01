@@ -150,7 +150,14 @@ function incWrite(root, docPath, marker, inc) {
   };
 }
 
-/** Record one or more events in a single atomic commit (daily doc + lifetime totals). */
+/** Record one or more events in a single atomic commit (daily doc + lifetime totals).
+ *  The caller (POST /api/analytics) always answers the browser 200 "ok" regardless
+ *  of what this returns — analytics must never affect the app. That means a write
+ *  failure here is otherwise invisible from the outside, so on failure this logs
+ *  the REAL reason (Firestore's own status + error body, not just a generic
+ *  "error") to the Worker's console — visible in the Cloudflare Pages dashboard's
+ *  Functions log / `wrangler pages deployment tail` — and callers with a debug
+ *  path (see diagnose() below) can surface it directly to an admin instead. */
 export async function recordEvents(env, items, fetchImpl = fetch) {
   const reg = registryAdmin(env);
   if (!reg) return { ok: false, reason: 'not_configured' };
@@ -163,8 +170,73 @@ export async function recordEvents(env, items, fetchImpl = fetch) {
       incWrite(root, `analytics_daily/${day}`, ['day', day], inc),
       incWrite(root, 'analytics_meta/totals',  ['kind', 'totals'], inc),
     ] }) });
-    return res.ok ? { ok: true } : { ok: false, reason: 'commit_' + res.status };
-  } catch (e) { return { ok: false, reason: 'error' }; }
+    if (res.ok) return { ok: true };
+    const detail = await res.text().catch(() => '');
+    console.error('[MIUT analytics] commit failed', res.status, detail.slice(0, 500));
+    return { ok: false, reason: 'commit_' + res.status, detail: detail.slice(0, 500) };
+  } catch (e) {
+    console.error('[MIUT analytics] commit threw', e && e.message || e);
+    return { ok: false, reason: 'error', detail: String(e && e.message || e) };
+  }
+}
+
+/**
+ * End-to-end self-test: checks config, fetches a real OAuth token, performs
+ * one real Firestore write + readback, and reports exactly where it failed —
+ * the actual status code and error body, not a guess. Built because every
+ * other path here deliberately hides write failures from the browser (by
+ * design — analytics must never affect the app), which otherwise makes a
+ * misconfigured service account or a Firestore-side permission problem
+ * completely silent. Never writes anything except a single counter in
+ * analytics_meta/totals (ev.diag_ping), same as a real event would.
+ */
+export async function diagnose(env, fetchImpl = fetch) {
+  const steps = [];
+  const raw = env && env.FIREBASE_REGISTRY_SA_JSON;
+  if (!raw) return { ok: false, step: 'env', detail: 'FIREBASE_REGISTRY_SA_JSON is not set' , steps};
+  steps.push('env: FIREBASE_REGISTRY_SA_JSON present');
+
+  let sa;
+  try { sa = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+  catch (e) { return { ok: false, step: 'parse', detail: 'FIREBASE_REGISTRY_SA_JSON is not valid JSON: ' + (e.message || e), steps }; }
+  if (!sa || !sa.client_email || !sa.private_key || !sa.project_id) {
+    return { ok: false, step: 'parse', detail: 'parsed JSON is missing client_email, private_key, or project_id', steps };
+  }
+  steps.push(`parse: service account for ${sa.client_email} (project ${sa.project_id})`);
+
+  const want = env.FIREBASE_REGISTRY_PROJECT_ID;
+  if (want && want !== sa.project_id) {
+    return { ok: false, step: 'project_match', detail: `FIREBASE_REGISTRY_PROJECT_ID ("${want}") does not match the service account's project_id ("${sa.project_id}") — registryAdmin() silently refuses to use it, so every event has been falling back to the legacy KV counters (room_created/message_sent only).`, steps };
+  }
+  steps.push('project_match: ok (or FIREBASE_REGISTRY_PROJECT_ID not set, so unchecked)');
+
+  let token;
+  try { token = await getAccessTokenCached(sa, fetchImpl); }
+  catch (e) { return { ok: false, step: 'oauth', detail: 'Could not get an access token for this service account: ' + (e.message || e) + ' — check that the private_key was copied in full (including the BEGIN/END PRIVATE KEY lines) and that the service account itself still exists in Google Cloud.', steps }; }
+  steps.push('oauth: got an access token');
+
+  const root = `projects/${sa.project_id}/databases/(default)/documents`;
+  const base = `https://firestore.googleapis.com/v1/${root}`;
+  const writeRes = await fetchImpl(base + ':commit', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes: [incWrite(root, 'analytics_meta/totals', ['kind', 'totals'], new Map([['ev.diag_ping', 1]]))] }),
+  });
+  if (!writeRes.ok) {
+    const detail = await writeRes.text().catch(() => '');
+    return { ok: false, step: 'firestore_write', detail: `Firestore rejected the write: HTTP ${writeRes.status} — ${detail.slice(0, 500)}`, steps };
+  }
+  steps.push('firestore_write: ok (incremented ev.diag_ping by 1 in analytics_meta/totals, same project your real events should be landing in)');
+
+  const readRes = await fetchImpl(base + '/analytics_meta/totals', { headers: { Authorization: `Bearer ${token}` } });
+  if (!readRes.ok) {
+    const detail = await readRes.text().catch(() => '');
+    return { ok: false, step: 'firestore_readback', detail: `Write succeeded but reading it back failed: HTTP ${readRes.status} — ${detail.slice(0, 500)}`, steps };
+  }
+  const fields = decodeFields((await readRes.json()).fields);
+  steps.push(`firestore_readback: ok — ev.diag_ping is now ${fields?.ev?.diag_ping ?? '(missing!)'}`);
+
+  return { ok: true, steps, project: sa.project_id, totals_doc_fields: Object.keys(fields || {}) };
 }
 
 // ── Reading ─────────────────────────────────────────────────────────────────
