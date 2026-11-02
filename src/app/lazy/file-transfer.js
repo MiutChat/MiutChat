@@ -621,7 +621,17 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
     // the image has actually decoded, causes a collapse-then-expand
     // layout shift on every image message.
     wireImageSwap(img, el, hint);
-    img.alt = 'image'; img.loading = 'lazy'; img.style.cursor = 'pointer';
+    // No `loading="lazy"` here: this <img> is only attached to the DOM
+    // once it has already loaded (see wireImageSwap/media-swap.js — that's
+    // the whole point, it avoids a layout-shift on swap-in). Lazy loading
+    // only starts tracking an element once it's connected to the document,
+    // so setting it here would deadlock: the browser never starts loading
+    // because the element is detached, and the element never gets attached
+    // because that only happens inside the 'load' handler. It's also
+    // redundant — this function only ever runs once the placeholder has
+    // already scrolled near-viewport, via the IntersectionObserver in
+    // _lazyDecrypt() (app.js), so the image is already meant to load now.
+    img.alt = 'image'; img.style.cursor = 'pointer';
     img.addEventListener('click', () => openViewer('img', url));
     img.addEventListener('error', () => {
       el.classList.remove('loading');
