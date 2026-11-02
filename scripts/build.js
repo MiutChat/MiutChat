@@ -109,6 +109,36 @@ function prepTmp(relPath, transform) {
   return tmp;
 }
 
+// Lazy modules get flattened to ROOT/_tmp_<name>.js before bundling (see
+// prepTmp above), so esbuild resolves any `from './sibling.js'` (or
+// `from '../../some/dir/sibling.js'`) import in them against ROOT/, not
+// the module's real source directory. Without this, a lazy module
+// importing a local (non-app.js) sibling — same directory or not — fails
+// bundling with "Could not resolve '...'" even though the file exists;
+// it's just not sitting where the flattened tmp copy's relative import
+// now points. Rewrites every such import to the sibling's flat basename
+// (e.g. '../../crypto/b64.js' -> './b64.js') and copies that sibling to
+// ROOT/<basename>.js to match, so esbuild's bundler can find it. Returns
+// the (possibly rewritten) text and the copied paths, so the caller can
+// write the former back to the tmp file and register the latter for the
+// usual tmp cleanup. Sibling basenames must stay unique across src/ for
+// this to work — same requirement SOURCE_INDEX already relies on.
+function copyLocalSiblingImports(txt, excludeFile) {
+  const re = /from\s+'((?:\.\.?\/)[\w./-]*\.js)'/g;
+  const copied = [];
+  const rewrittenTxt = txt.replace(re, (whole, relPath) => {
+    const name = path.basename(relPath);
+    if (name === excludeFile) return whole; // externalized target (e.g. app.min.js) — never a real source file
+    const dest = path.join(ROOT, name);
+    if (!fs.existsSync(dest)) {
+      fs.copyFileSync(srcPath(name), dest);
+      copied.push(dest);
+    }
+    return `from './${name}'`;
+  });
+  return { rewrittenTxt, copied };
+}
+
 function fmt(b) { return (b/1024).toFixed(1)+' KB'; }
 function pct(o,n) { return C.green+'-'+(((o-n)/o)*100).toFixed(0)+'%'+C.reset; }
 
@@ -139,8 +169,8 @@ const JS_JOBS = [
   ['crypto-bridge.js',       'crypto-bridge.min.js',       'es2020'],
   ['placeholder-rotator.js', 'placeholder-rotator.min.js', 'es2017'],
   ['security.js',            'security.min.js',            'es2020'],
-  ['storage-engine.js',      'storage-engine.min.js',      'es2020'],
   ['screen-guard.js',        'screen-guard.min.js',        'es2020'],
+  ['screen-transition.js',   'screen-transition.min.js',   'es2020'],
 ];
 const APP_CHUNKS = [];
 {
@@ -158,6 +188,9 @@ const APP_CHUNKS = [];
     if (!fs.existsSync(srcPath(mod))) continue;
     const modTmp = prepTmp(mod, t => t.replace(/from\s+'\.{1,2}\/app\.js'/g, "from './app.min.js'"));
     tmps.push(modTmp);
+    const { rewrittenTxt, copied } = copyLocalSiblingImports(fs.readFileSync(modTmp, 'utf8'), 'app.min.js');
+    fs.writeFileSync(modTmp, rewrittenTxt, 'utf8');
+    tmps.push(...copied);
     const modOut = path.join(DIST, '_lazy_build.js');
     run(ESB+' '+modTmp+' '+baseFlags.replace('--bundle=false', '--bundle --format=esm')+
         ' --external:./app.min.js --target=es2020 --platform=browser --outfile='+modOut);
@@ -283,7 +316,7 @@ for (const f of CF_JOBS) {
 log('HASH', 'SRI sha256');
 const SRI_FILES = [
   'app.min.js','db-manager.min.js','sw-bridge.min.js','placeholder-rotator.min.js',
-  'style.min.css','crypto-engine.min.js','crypto-bridge.min.js','storage-engine.min.js',
+  'style.min.css','crypto-engine.min.js','crypto-bridge.min.js',
   'crypto-worker.min.js','security.min.js',
 ];
 for (const f of SRI_FILES) {
@@ -303,7 +336,6 @@ html = html
   .replace(/src="placeholder-rotator\.js"/g, 'src="placeholder-rotator.min.js"')
   .replace(/src="crypto-engine\.js"/g,       'src="crypto-engine.min.js"')
   .replace(/src="crypto-bridge\.js"/g,       'src="crypto-bridge.min.js"')
-  .replace(/src="storage-engine\.js"/g,      'src="storage-engine.min.js"')
   .replace(/src="security\.js"/g,            'src="security.min.js"')
   .replace(/src="screen-guard\.js"/g,        'src="screen-guard.min.js"');
 

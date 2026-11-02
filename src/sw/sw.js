@@ -63,23 +63,6 @@ const PRECACHE_OPTIONAL = [
 /* ──────────────────────────────────────────
    ROUTE PATTERNS
 ────────────────────────────────────────── */
-const FIREBASE_HOSTS = [
-  'firestore.googleapis.com',
-  'firebase.googleapis.com',
-  'identitytoolkit.googleapis.com',
-  'securetoken.googleapis.com',
-  'firebaseinstallations.googleapis.com',
-];
-const FONT_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com'];
-const CDN_HOSTS  = ['cdn.jsdelivr.net', 'cdnjs.cloudflare.com'];
-// Firebase SDK scripts come from gstatic but must be treated as network-only (not cached)
-// so they always get fresh copies and are never intercepted with stale CSP contexts.
-const FIREBASE_SDK_HOST = 'www.gstatic.com';
-
-function isFirebase(url)  { return FIREBASE_HOSTS.some(h => url.hostname.includes(h)); }
-function isFont(url)      { return FONT_HOSTS.some(h => url.hostname.includes(h)); }
-function isCDN(url)       { return CDN_HOSTS.some(h => url.hostname.includes(h)); }
-function isFirebaseSDK(url) { return url.hostname === FIREBASE_SDK_HOST; }
 function isShell(url)     { return url.origin === self.location.origin; }
 function isImage(req)     { return req.destination === 'image'; }
 function isNavigation(req){ return req.mode === 'navigate'; }
@@ -227,18 +210,6 @@ self.addEventListener('fetch', event => {
 /* ──────────────────────────────────────────
    CACHING STRATEGIES
 ────────────────────────────────────────── */
-
-// Always go to network, no caching
-async function networkOnly(req) {
-  try {
-    return await fetch(req);
-  } catch {
-    return new Response('{"offline":true}', {
-      status: 503,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
 
 // Cache first, network fallback, optional TTL check
 async function cacheFirst(req, cacheName, { ttl } = {}) {
@@ -667,24 +638,5 @@ async function idbSet(key, value) {
     tx.oncomplete = resolve;
     tx.onerror    = e => reject(e.target.error);
   });
-}
-
-async function idbGet(key) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx  = db.transaction('kv', 'readonly');
-    const req = tx.objectStore('kv').get(key);
-    req.onsuccess = e => resolve(e.target.result?.value ?? null);
-    req.onerror   = e => reject(e.target.error);
-  });
-}
-
-/* ══════════════════════════════════════════
-   UTILITY
-══════════════════════════════════════════ */
-// Broadcast to all window clients
-async function broadcastToClients(message) {
-  const clients = await self.clients.matchAll({ type: 'window' });
-  clients.forEach(c => c.postMessage(message));
 }
 

@@ -12,11 +12,6 @@ const SKIP_COMPRESS_MIME = new Set([
 const _seenIVs = new Set();
 const _iksCache = new Map();
 
-async function _deriveBaseKey(roomCode) {
-  const raw = new TextEncoder().encode(roomCode);
-  return crypto.subtle.importKey('raw', raw, 'HKDF', false, ['deriveKey','deriveBits']);
-}
-
 async function _deriveMessageKey(baseKey, roomCode, epoch, timestamp, context) {
   const info = new TextEncoder().encode(`miutchat|${roomCode}|${epoch}|${timestamp}|${context}`);
   const salt = new Uint8Array(32);
@@ -79,9 +74,21 @@ function _checkIVUnique(iv) {
   }
 }
 
+// Deliberate duplicate of encodeB64 in b64.js (see tests/b64.test.js) —
+// crypto-engine.js is built with --bundle=false and no top-level imports
+// (same constraint as app.js; see _runBacklogSweepLoop's comment in
+// app.js for the full story), so it can't import that module directly.
+// If you change the logic here, mirror the change there too.
+//
+// Uses the native Uint8Array.prototype.toBase64() (Baseline 2025 —
+// Chrome/Edge 140+, Firefox 133+, Safari 18.2+) when available: it's
+// faster than both this hand-rolled loop AND a WASM equivalent would be
+// here, since it's the engine's own native string handling with no WASM
+// load/call overhead. Falls back to the original loop everywhere else.
 function _b64Fast(buf) {
-  let s = '';
   const u = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  if (typeof u.toBase64 === 'function') return u.toBase64();
+  let s = '';
   for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode(...u.subarray(i, i + 8192));
   return btoa(s);
 }
@@ -216,8 +223,11 @@ async function _deriveBaseKeyWithSalt(roomCode, epoch, saltBytes) {
   return crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey', 'deriveBits']);
 }
 
+// Deliberate duplicate of decodeB64 in b64.js — see _b64Fast above for why.
 function _b64FastDecode(s) {
-  return Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+  const normalized = s.replace(/-/g, '+').replace(/_/g, '/');
+  if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(normalized);
+  return Uint8Array.from(atob(normalized), c => c.charCodeAt(0));
 }
 
 async function encryptFile(file, metadata, roomCode, senderId, epoch, salt, onProgress) {

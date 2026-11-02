@@ -81,6 +81,22 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .sidebar .nx-anim{opacity:1;animation:none}
 .sidebar.open .nx-anim{animation:nx-in .38s cubic-bezier(.22,1,.36,1) var(--nx-d,0s) both}
 
+/* ── Native View Transitions (screen swaps) ──────────
+ * Only engaged when screen-transition.js's shouldUseViewTransition() says
+ * yes (supported browser, no reduced-motion request) — see showScreen()
+ * in app.js. The .screen/.morph-exit rules above remain the fallback for
+ * everyone else and are never active at the same time as this. */
+::view-transition-old(root),::view-transition-new(root){animation-duration:.32s;animation-timing-function:cubic-bezier(.22,1,.36,1)}
+::view-transition-old(root){animation-name:miut-vt-out}
+::view-transition-new(root){animation-name:miut-vt-in}
+@keyframes miut-vt-out{to{opacity:0;transform:scale(1.03) translateY(-10px)}}
+@keyframes miut-vt-in{from{opacity:0;transform:scale(.97) translateY(14px)}}
+/* The global prefers-reduced-motion rule above only matches *, *::before,
+ * *::after — it can't reach ::view-transition-* pseudo-elements, so they
+ * need their own override. Belt-and-suspenders: shouldUseViewTransition()
+ * already keeps this path from running at all in that case. */
+@media (prefers-reduced-motion:reduce){::view-transition-group(*),::view-transition-old(*),::view-transition-new(*){animation:none!important}}
+
 /* ── Ripple ───────────────────────────────────────── */
 
 /* ── Splash ───────────────────────────────────────── */
@@ -202,7 +218,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 
 /* ── App shell ────────────────────────────────────── */
 #app{flex-direction:row}
-.sidebar{width:var(--sw);flex-shrink:0;background:#0e1a19;border-right:1px solid var(--border);backdrop-filter:none;display:flex;flex-direction:column;z-index:20;transition:transform .3s cubic-bezier(.4,0,.2,1),box-shadow .3s ease;will-change:transform}
+.sidebar{width:var(--sw);flex-shrink:0;background:#0e1a19;border-right:1px solid var(--border);backdrop-filter:none;display:flex;flex-direction:column;z-index:20;transition:transform .3s cubic-bezier(.4,0,.2,1),box-shadow .3s ease;will-change:transform;contain:layout style}
 .sidebar-header{display:flex;align-items:center;gap:8px;padding:0 12px 0 16px;height:var(--hh);flex-shrink:0;border-bottom:1px solid var(--border)}
 .sidebar-title-wrap{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center}
 .app-name{font-family:var(--fui);font-size:.86rem;font-weight:800;letter-spacing:5px;color:#fff;line-height:1}
@@ -258,7 +274,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .count-badge{background:var(--teal);color:var(--bg);border-radius:100px;padding:1px 8px;font-size:.55rem;font-family:var(--fui);font-weight:700;transition:transform var(--fast) var(--spring)}
 .count-badge:empty{display:none}
 .members-list{display:flex;flex-direction:column;gap:2px;padding:0 8px 8px}
-.member-item{display:flex;align-items:center;gap:10px;padding:10px;border-radius:var(--r);cursor:pointer;animation:mem-in var(--med) var(--out) both;transition:background var(--fast) ease}
+.member-item{display:flex;align-items:center;gap:10px;padding:10px;border-radius:var(--r);cursor:pointer;animation:mem-in var(--med) var(--out) both;transition:background var(--fast) ease;contain:layout style}
 @keyframes mem-in{from{opacity:0;transform:translateX(-10px)}to{opacity:1;transform:none}}
 .member-item:hover{background:var(--teal-dim)}
 .member-item:active{background:rgba(78,205,196,.14)}
@@ -423,12 +439,6 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 /* Action strip */
 .msg-action-strip{position:absolute;bottom:calc(100% + 10px);z-index:80;display:flex;flex-direction:column;gap:0;background:var(--glass2);border:1px solid var(--border);border-radius:22px;padding:6px;box-shadow:var(--sh-glass);min-width:248px;max-width:295px;opacity:0;transform:scale(.84) translateY(14px);transition:opacity .17s ease,transform .22s var(--spring);pointer-events:none;backdrop-filter:blur(12px) saturate(1.4);-webkit-backdrop-filter:blur(12px) saturate(1.4);contain:layout style paint}
 .msg-action-strip.visible{opacity:1;transform:none;pointer-events:all}
-.msg-wrapper.sent .msg-action-strip{right:0;left:auto;transform-origin:bottom right}
-.msg-wrapper.received .msg-action-strip{left:0;right:auto;transform-origin:bottom left}
-.msg-wrapper:nth-child(-n+3) .msg-action-strip{bottom:auto;top:calc(100% + 10px);transform:scale(.84) translateY(-14px)}
-.msg-wrapper:nth-child(-n+3) .msg-action-strip.visible{transform:none}
-.msg-wrapper:nth-child(-n+3).sent .msg-action-strip{transform-origin:top right}
-.msg-wrapper:nth-child(-n+3).received .msg-action-strip{transform-origin:top left}
 .strip-emojis{display:flex;gap:2px;padding:6px 4px 8px;align-items:center;overflow-x:auto;scrollbar-width:none}
 .strip-emojis::-webkit-scrollbar{display:none}
 /* Each quick-react button */
@@ -485,7 +495,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .msg-wrapper.sent .msg-sig-badge.verified{color:rgba(5,13,12,.6)}
 
 /* ── Media ────────────────────────────────────────── */
-.msg-media{position:relative;border-radius:16px;overflow:hidden;max-width:240px;cursor:pointer;background:var(--bg3);border:1px solid var(--border2);transition:transform var(--fast) var(--spring),box-shadow var(--fast) ease}
+.msg-media{position:relative;border-radius:16px;overflow:hidden;max-width:240px;cursor:pointer;background:var(--bg3);border:1px solid var(--border2);transition:transform var(--fast) var(--spring),box-shadow var(--fast) ease;contain:layout style}
 .msg-media:hover{transform:scale(1.016);box-shadow:0 8px 24px rgba(0,0,0,.44)}
 .msg-media img{width:100%;display:block;border-radius:16px;max-height:300px;object-fit:cover}
 .msg-media.loading{width:200px;height:140px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px}
@@ -576,6 +586,8 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .modal-header h3{font-family:var(--fui);font-size:.77rem;font-weight:800;letter-spacing:5px;color:var(--teal)}
 .modal-body{padding:14px 20px 22px;display:flex;flex-direction:column;gap:0}
 .setting-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 0;border-bottom:1px solid var(--border2)}
+.setting-warning{display:flex;align-items:center;gap:7px;margin:-4px 0 4px;padding:8px 10px;border-radius:var(--r);background:rgba(247,196,48,.08);border:1px solid rgba(247,196,48,.18);color:var(--typing);font-family:var(--fmono);font-size:.67rem;line-height:1.4}
+.setting-warning svg{flex-shrink:0}
 .setting-item:last-of-type{border-bottom:none}
 .setting-label-group{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
 .setting-item > label{font-family:var(--fui);font-size:.67rem;font-weight:700;letter-spacing:2px;color:var(--text)}

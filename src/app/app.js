@@ -1027,9 +1027,6 @@ function fmtTime(ts) {
     ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
-export function fmtBytes(b) {
-  return b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(1) + ' KB' : (b/1048576).toFixed(1) + ' MB';
-}
 export function ts_now() { return firebase.firestore.FieldValue.serverTimestamp(); }
 
 const AV_COLORS = ['#2dd4bf','#06b6d4','#3b82f6','#8b5cf6','#ec4899','#f43f5e','#f97316','#eab308','#22c55e','#14b8a6','#6366f1','#a855f7'];
@@ -1372,23 +1369,36 @@ function showScreen(id) {
       closeSidebar();
     }
   }
-  // Morph-exit the currently active screen
-  document.querySelectorAll('.screen.active').forEach(s => {
-    if (s.id === id) return;
-    s.classList.add('morph-exit');
-    s.classList.remove('active');
-    setTimeout(() => s.classList.remove('morph-exit'), 350);
-  });
-  // Small delay so exit animation registers before enter
-  requestAnimationFrame(() => {
-    next.classList.add('active');
-    // Re-trigger nx-anim children so stagger replays each time
-    next.querySelectorAll('.nx-anim').forEach(el => {
-      el.style.animation = 'none';
-      el.style.opacity   = '';
-      requestAnimationFrame(() => { el.style.animation = ''; });
+  const active = document.querySelectorAll('.screen.active');
+  const vt = window.MiutScreenTransition;
+  const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+  // Native View Transitions give a smooth cross-fade/morph between the old
+  // and new screen with no extra animation code — used when the browser
+  // supports it and the user hasn't asked for reduced motion. Everything
+  // else (older/non-Chromium browsers, reduced motion) keeps the app's
+  // original morph-exit CSS animation exactly as before.
+  if (vt && vt.shouldUseViewTransition(document, reducedMotion)) {
+    document.startViewTransition(() => vt.applyScreenSwitch(document, id, next, active, false));
+  } else if (vt) {
+    vt.applyScreenSwitch(document, id, next, active, true);
+  } else {
+    // screen-transition.min.js failed to load/attach — fall back inline
+    // rather than leave showScreen() silently broken.
+    active.forEach(s => {
+      if (s.id === id) return;
+      s.classList.add('morph-exit');
+      s.classList.remove('active');
+      setTimeout(() => s.classList.remove('morph-exit'), 350);
     });
-  });
+    requestAnimationFrame(() => {
+      next.classList.add('active');
+      next.querySelectorAll('.nx-anim').forEach(el => {
+        el.style.animation = 'none';
+        el.style.opacity   = '';
+        requestAnimationFrame(() => { el.style.animation = ''; });
+      });
+    });
+  }
 }
 
 function setupSidebar() {
@@ -2436,9 +2446,30 @@ function _purgeExpiredDoc(code, docId, data, onDeleted) {
 
 function _startExpirySweep() {
   if (_expiryTimer) clearInterval(_expiryTimer);
-  _expiryTimer = setInterval(() => { _runExpirySweep(); }, 5000); // check every 5s for accurate countdowns — chunk-group sweeping now lives entirely inside file-transfer.js's own timer, started once that module loads
+  _expiryTimer = setInterval(() => { _runBackground(_runExpirySweep); }, 5000); // check every 5s for accurate countdowns — deprioritized via scheduler.postTask so this DOM walk never jumps ahead of pending input/render work; chunk-group sweeping now lives entirely inside file-transfer.js's own timer, started once that module loads
 }
 
+
+// Pure helper, deliberately NOT imported from src/app/scheduling.js — same
+// --bundle=false / zero-top-level-imports constraint as _runBacklogSweepLoop
+// above (see that function's comment for the full story). This is a
+// deliberate duplicate of runBackground in scheduling.js — that file stays
+// around purely so tests/scheduling.test.js can unit test it in Node. If
+// you change the logic here, mirror the change there too.
+//
+// Runs `fn` via the Scheduler API's 'background' priority when available,
+// so periodic housekeeping (the TTL sweep below, the presence heartbeat)
+// queues behind any pending user-blocking/user-visible task — typing,
+// clicks, incoming-message render — instead of competing with it for the
+// main thread. Falls back to a plain macrotask where unsupported.
+function _runBackground(fn) {
+  if (globalThis.scheduler?.postTask) {
+    const result = globalThis.scheduler.postTask(fn, { priority: 'background' });
+    if (result?.catch) result.catch(() => {});
+    return result;
+  }
+  return setTimeout(fn, 0);
+}
 
 function _runExpirySweep() {
   if (!_roomTtlMs || !state.roomCode) return;
@@ -3244,11 +3275,6 @@ export function stopChatListeners() {
   showTypingUI([]);
 }
 
-function startListeners() {
-  startPresenceListener();
-  startChatListeners();
-}
-
 function stopListeners() {
   stopChatListeners();
   if (_unsubMembers) { try { _unsubMembers(); } catch {} _unsubMembers = null; }
@@ -3552,10 +3578,17 @@ async function _checkRoomExpiry(code, db, knownSnap) {
     const data = snap.data() || {};
     const expiry = data.autoDeleteAt?.toMillis?.() || 0;
     if (expiry && expiry < Date.now()) {
-      // Room expired — wipe and send user back to join screen
+      // Room expired — wipe and send user back to join screen. Client first
+      // (instant, no network round-trip) — it only actually succeeds when
+      // we happen to be the room's own creator/admin (Firestore rules
+      // require it for the final room-doc delete; see wipeRoom's comment),
+      // same convention as the "last member left" wipes above. Only ask
+      // the server (admin SDK, works regardless of role) when that fails,
+      // so a non-admin hitting an expired room isn't also attempting —
+      // and failing, with a logged warning — the exact delete the other
+      // path is about to do anyway.
       toast('Room expired', 'This room has expired after inactivity.', 'clock');
-      _requestServerExpire(code);
-      await wipeRoom(code, db).catch(() => {});
+      if (!(await wipeRoom(code, db))) _requestServerExpire(code);
       clearCacheForRoom(code).catch(() => {});
       localStorage.removeItem(CONFIG.SESSION_KEY);
       localStorage.removeItem(CONFIG.ROOM_KEY);
@@ -3748,49 +3781,6 @@ function _wireLongPress(wrap, docId) {
   });
 }
 
-// ── TTL progress bar (replaces timer text) ───────────────────────────────────
-function _updateTtlBars() {
-  if (!_roomTtlMs) return;
-  const now = Date.now();
-  document.querySelectorAll('.msg-wrapper[data-ts]').forEach(w => {
-    const ts       = parseInt(w.dataset.ts || '0', 10);
-    if (!ts) return;
-    const age      = now - ts;
-    const timeLeft = _roomTtlMs - age;
-    if (timeLeft <= 0) return;
-    const pct = Math.max(0, Math.min(100, (timeLeft / _roomTtlMs) * 100));
-    let bar = w.querySelector('.msg-ttl-bar');
-    if (!bar) {
-      bar = document.createElement('div');
-      bar.className = 'msg-ttl-bar';
-      const fill = document.createElement('div');
-      fill.className = 'msg-ttl-fill';
-      bar.appendChild(fill);
-      // Insert after .msg-inner
-      const inner = w.querySelector('.msg-inner');
-      if (inner) inner.after(bar);
-    }
-    const fill = bar.querySelector('.msg-ttl-fill');
-    if (fill) {
-      fill.style.width = pct + '%';
-      fill.style.background = pct < 20 ? 'var(--danger)' : pct < 50 ? '#f7c430' : 'var(--teal)';
-    }
-    // Remove the old text timer if present
-    w.querySelector('.msg-ttl-timer')?.remove();
-  });
-}
-
-// ── Stray dot fix — room-code-pill empty state ───────────────────────────────
-// The pill shows '····' when no room is active. Fine. But ensure it's not
-// briefly showing a real period from the room code validation regex edge case.
-
-// ── Override ._runExpirySweep to also update TTL bars ────────────────────────
-const _origRunExpirySweep = typeof _runExpirySweep !== 'undefined' ? _runExpirySweep : null;
-
-// ── Patch the expiry sweep to call bar updater ───────────────────────────────
-
-// ── Override showInlineActions to check select mode ─────────────────────────
-
 // wipeRoom accepts an explicit Firestore instance to avoid using the global `db`
 // which may point to a different shard if getDb() was called for another room.
 async function wipeRoom(code, fsInstance) {
@@ -3831,10 +3821,14 @@ async function wipeRoom(code, fsInstance) {
 function startHeartbeat() {
   clearInterval(_heartbeat);
   _heartbeat = setInterval(() => {
-    if (!state.roomCode || !state.me) return;
-    if (document.hidden) return;
-    db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
-      .update({ online: true, lastSeen: ts_now() }).catch(() => {});
+    // Deprioritized (background priority) — a presence ping has no
+    // deadline worth preempting typing/clicks/message render for.
+    _runBackground(() => {
+      if (!state.roomCode || !state.me) return;
+      if (document.hidden) return;
+      db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
+        .update({ online: true, lastSeen: ts_now() }).catch(() => {});
+    });
   }, CONFIG.HEARTBEAT_MS);
 }
 
@@ -5290,18 +5284,32 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     strip.appendChild(delRow);
   }
 
-  // Smart positioning: right/left based on sender, above/below based on viewport space
-  strip.dataset.side = isMine ? 'sent' : 'received';
-  wrap.style.position = 'relative';
-  wrap.appendChild(strip);
-  requestAnimationFrame(() => {
-    strip.classList.add('visible');
-    // Measure available space and flip if strip would go off-screen
-    const wrapRect  = wrap.getBoundingClientRect();
-    const stripH    = strip.offsetHeight || 200;
-    const vpH       = window.innerHeight;
+  // Positioned and appended to document.body rather than inside `wrap`, and
+  // in viewport px (position:fixed) rather than CSS percentages relative to
+  // the message. .msg-wrapper carries content-visibility:auto for long-list
+  // scroll performance, which implies strict paint containment — anything
+  // positioned to visually overflow a contained ancestor's own box (exactly
+  // what this strip does, appearing above/below the bubble) gets silently
+  // clipped to nothing inside it: built, marked .visible, present in the
+  // DOM, zero visible pixels. Portaling it out to body sidesteps that
+  // entirely, without giving up containment (and its real perf win) on
+  // every message in the list just for this one popup.
+  strip.style.position = 'fixed';
+  document.body.appendChild(strip);
+
+  // Smart positioning: right/left based on sender, above/below based on
+  // viewport space. Replicates what used to be the .msg-wrapper.sent/
+  // .received descendant-combinator CSS (now dead — see the note where
+  // those rules were removed from style.css — since the strip is no
+  // longer a descendant of .msg-wrapper at all).
+  const place = () => {
+    const wrapRect = wrap.getBoundingClientRect();
+    const stripH   = strip.offsetHeight || 200;
+    const stripW   = strip.offsetWidth  || 248;
+    const vpH = window.innerHeight, vpW = window.innerWidth;
     const spaceAbove = wrapRect.top;
     const spaceBelow = vpH - wrapRect.bottom;
+
     // Flip below whenever below is the better fit — not just when above
     // fails AND below fully fits. The old check left the strip anchored
     // above (its default) whenever below didn't have "enough" room too,
@@ -5310,9 +5318,11 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     // taller than either gap) — meaning it could still get clipped by
     // #messages-area's own overflow boundary at the top, invisible and
     // unclickable, for a message anywhere near the top of the scroll view.
+    strip.style.maxHeight = '';
+    strip.style.overflowY = '';
     if (spaceAbove < stripH + 20 && spaceBelow > spaceAbove) {
+      strip.style.top    = (wrapRect.bottom + 8) + 'px';
       strip.style.bottom = 'auto';
-      strip.style.top    = 'calc(100% + 8px)';
       strip.style.transformOrigin = isMine ? 'top right' : 'top left';
       // If even the better side can't fully fit it, cap the height and let
       // it scroll internally rather than spill past the viewport edge.
@@ -5321,16 +5331,23 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
         strip.style.maxHeight = Math.max(160, fits - 24) + 'px';
         strip.style.overflowY = 'auto';
       }
+    } else {
+      strip.style.top    = Math.max(8, wrapRect.top - stripH - 10) + 'px';
+      strip.style.bottom = 'auto';
+      strip.style.transformOrigin = isMine ? 'bottom right' : 'bottom left';
     }
-    // Horizontal: prevent strip from going off left edge
-    const stripRect = strip.getBoundingClientRect();
-    if (stripRect.left < 8) {
-      strip.style.left  = '0';
-      strip.style.right = 'auto';
-    } else if (stripRect.right > window.innerWidth - 8) {
-      strip.style.right = '0';
-      strip.style.left  = 'auto';
-    }
+
+    // Horizontal: anchor to the message's side, then clamp into viewport.
+    let left = isMine ? wrapRect.right - stripW : wrapRect.left;
+    left = Math.min(Math.max(left, 8), vpW - stripW - 8);
+    strip.style.left  = left + 'px';
+    strip.style.right = 'auto';
+  };
+
+  place(); // initial placement, before any paint
+  requestAnimationFrame(() => {
+    strip.classList.add('visible');
+    place(); // re-measure — .visible's real padding/size can shift stripH/stripW
   });
 
   const close = e => {
@@ -5347,14 +5364,6 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     document.addEventListener('touchstart', close, { passive: true });
     document.addEventListener('keydown', closeKey);
   }, 60);
-}
-
-function showReactionPicker(wrap, docId) {
-  const ts    = parseInt(wrap.dataset.ts || '0') || 0;
-  const mine  = wrap.classList.contains('sent');
-  const bubble = wrap.querySelector('.msg-bubble');
-  const plain  = bubble ? (bubble.innerText || null) : null;
-  showInlineActions(wrap, docId, plain, ts, mine);
 }
 
 function fmtEditSecs(s) {
@@ -6030,8 +6039,13 @@ function openSettings() {
 
   if (ap && _canManage() && state.roomCode) {
     ap.checked = false;
+    _setApprovalWarning(false);
     db.collection('rooms').doc(state.roomCode).get()
-      .then(s => { if (ap) ap.checked = s.data()?.approvalRequired === true; })
+      .then(s => {
+        const required = s.data()?.approvalRequired === true;
+        if (ap) ap.checked = required;
+        _setApprovalWarning(required);
+      })
       .catch(() => {});
   }
   $('settings-modal').style.display = 'flex';
@@ -6105,9 +6119,20 @@ function toggleMembersManage() {
     .catch(() => { const t = $('members-manage-toggle'); if (t) t.checked = !on; });
 }
 
+// Shows/hides the "anyone can join without approval" warning in the
+// settings panel. `required` mirrors approvalRequired: true (gate on) ->
+// hidden, false (gate off) -> shown, since that's exactly the state
+// where an admin could join-link-share without realizing approval isn't
+// actually gating entry.
+function _setApprovalWarning(required) {
+  const w = $('approval-warning');
+  if (w) w.style.display = required ? 'none' : 'flex';
+}
+
 function toggleApprovalGate() {
   if (!_canManage() || !state.roomCode) return;
   const on = $('approval-toggle')?.checked ?? false;
+  _setApprovalWarning(on); // optimistic — flip immediately, don't wait on the network round-trip
   db.collection('rooms').doc(state.roomCode)
     .update({ approvalRequired: on })
     .then(() => toast(
@@ -6115,7 +6140,12 @@ function toggleApprovalGate() {
       on ? 'New members must be approved' : 'Anyone with the code can join freely',
       on ? 'lock' : '🔓'
     ))
-    .catch(() => {});
+    .catch(() => {
+      // revert on failure — both the toggle and the warning it drives
+      const t = $('approval-toggle');
+      if (t) t.checked = !on;
+      _setApprovalWarning(!on);
+    });
 }
 
 

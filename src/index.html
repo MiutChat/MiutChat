@@ -177,7 +177,6 @@
             <button class="ttl-opt" data-ttl="300">5m</button>
             <button class="ttl-opt" data-ttl="3600">1h</button>
             <button class="ttl-opt" data-ttl="86400">24h</button>
-            <button class="ttl-opt" data-ttl="604800">7d</button>
           </div>
         </div>
         <button class="btn-join" id="btn-create">
@@ -557,6 +556,10 @@
           <label for="approval-toggle" class="toggle"></label>
         </div>
       </div>
+      <div id="approval-warning" class="setting-warning" style="display:none">
+        <svg viewBox="0 0 20 20" fill="none" width="14" height="14"><path d="M10 2.5 18 17H2L10 2.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M10 8v3.5M10 14v.01" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span>Anyone with the room code can join without approval</span>
+      </div>
       <div id="members-manage-row" class="setting-item" style="display:none">
         <div class="setting-label-group">
           <label>MEMBER CONTROLS</label>
@@ -596,7 +599,6 @@
           <option value="300000">5 min</option>
           <option value="3600000">1 hour</option>
           <option value="86400000">24 hours</option>
-          <option value="604800000">7 days</option>
         </select>
       </div>
 
@@ -824,10 +826,10 @@
 <script src="security.min.js" defer></script>
 <script src="crypto-engine.min.js" defer></script>
 <script src="crypto-bridge.min.js" defer></script>
+<script src="screen-transition.min.js" defer></script>
 <script type="module" src="app.min.js"></script>
 <script src="sw-bridge.min.js" defer></script>
 <script src="placeholder-rotator.js" defer></script>
-<script src="storage-engine.min.js" defer></script>
 
 </body>
 </html>

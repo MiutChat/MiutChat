@@ -29,6 +29,8 @@ import {
   showScrollFab, _placeMsg, _notifyRoomOfNewMessage, track,
   _roomEpoch, _roomSalt, setRoomSalt, _lazyDataMap, _lruMap,
 } from '../app.js';
+import { wireImageSwap } from './media-swap.js';
+import { encodeB64, decodeB64, decodeB64Into } from '../../crypto/b64.js';
 
 export const CHUNK_TIMING = {
   healDelaysMs: [2500, 7000, 15000],
@@ -124,11 +126,7 @@ export async function encBytes(file, code, opts = {}) {
     out.set(epochBuf, 0);
     out.set(iv, 4);
     out.set(ctBytes, 16);
-    let s = '';
-    for (let i = 0; i < out.length; i += 16384) {
-      s += String.fromCharCode(...out.subarray(i, i + 16384));
-    }
-    return 'b:' + btoa(s);
+    return 'b:' + encodeB64(out);
   } catch (e) { throw e; }
 }
 
@@ -144,7 +142,7 @@ async function _b64ToBytes(input) {
   chars -= 2;
   const last = parts[parts.length - 1];
   const pad = last.endsWith('==') ? 2 : last.endsWith('=') ? 1 : 0;
-  if (chars % 4 !== 0) return Uint8Array.from(atob(parts.join('').slice(2)), c => c.charCodeAt(0));
+  if (chars % 4 !== 0) return decodeB64(parts.join('').slice(2));
   const out = new Uint8Array((chars / 4) * 3 - pad);
   let o = 0, carry = '';
   for (let i = 0; i < parts.length; i++) {
@@ -153,8 +151,7 @@ async function _b64ToBytes(input) {
     carry = str.slice(cut);
     str = str.slice(0, cut);
     for (let k = 0; k < str.length; k += 196608) {
-      const bin = atob(str.slice(k, k + 196608));
-      for (let n = 0; n < bin.length; n++) out[o++] = bin.charCodeAt(n);
+      o += decodeB64Into(out.subarray(o), str.slice(k, k + 196608));
     }
     if (parts.length > 1 || str.length > 262144) await _yieldToMain();
   }
@@ -617,7 +614,14 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
 
   if (type === 'image') {
     const img = document.createElement('img');
-    img.src = url; img.alt = 'image'; img.loading = 'lazy'; img.style.cursor = 'pointer';
+    const hint = document.createElement('div');
+    hint.className = 'media-tap-hint'; hint.textContent = 'Tap to expand';
+    // Swap only on 'load' — see media-swap.js for why: removing .loading
+    // (and its fixed placeholder box) the instant img.src is set, before
+    // the image has actually decoded, causes a collapse-then-expand
+    // layout shift on every image message.
+    wireImageSwap(img, el, hint);
+    img.alt = 'image'; img.loading = 'lazy'; img.style.cursor = 'pointer';
     img.addEventListener('click', () => openViewer('img', url));
     img.addEventListener('error', () => {
       el.classList.remove('loading');
@@ -629,10 +633,7 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
         decryptAndShow(encData, mime, type, fileName, domId);
       });
     }, { once: true });
-    const hint = document.createElement('div');
-    hint.className = 'media-tap-hint'; hint.textContent = 'Tap to expand';
-    el.innerHTML = ''; el.appendChild(img); el.appendChild(hint);
-    el.classList.remove('loading');
+    img.src = url;
   } else if (type === 'video') {
     const thumb = document.createElement('div');
     thumb.className = 'video-thumb';
