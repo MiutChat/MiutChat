@@ -29,8 +29,18 @@
  * sharding-how-it-works.md for the full setup walkthrough.
  *
  * DATA MODEL (two tiny collections, nothing else):
- *   bindings/{roomCode}     → { db: "miut-db1" }
+ *   bindings/{roomCode}     → { db: "miut-db1", expired?: true, expiredAt?: epochMs }
  *   shardLoad/{shardName}   → { count: 12, degradedUntil: 0|epochMs }
+ *
+ * `expired`/`expiredAt` are optional and only ever set by the `expire`
+ * action below (merge-write, never touches `db`). They exist so that once
+ * ANY client has paid the cost of reading the room's actual doc on its
+ * shard and found its TTL has passed, every OTHER client's registry lookup
+ * — the cheap, edge-cached one below — can reject the room immediately
+ * too, instead of each client repeating that same shard round-trip to
+ * discover the same fact. A full document replace (resolve/bind, both via
+ * restSetDoc) always clears these fields, so a room code that gets reused
+ * after expiry starts clean.
  *
  * `count` is a LIFETIME cumulative total, not a daily one — it never
  * resets. Least-count-wins placement only actually equalizes totals
@@ -177,6 +187,21 @@ async function restSetDoc(projectId, token, path, obj) {
   if (!res.ok) throw new Error(`REST PATCH ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
 }
 
+// Partial write via updateMask — merges the given fields into the existing document instead of replacing it, so
+// writing { expired: true } here can never clobber the `db` field a concurrent/earlier write already set.
+async function restMergeDoc(projectId, token, path, obj) {
+  const mask = Object.keys(obj).map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join('&');
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${path}?${mask}`,
+    {
+      method: 'PATCH',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: encodeFields(obj) }),
+    }
+  );
+  if (!res.ok) throw new Error(`REST PATCH(merge) ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
+}
+
 async function restCreateDocIfAbsent(projectId, token, path, obj) {
   const res = await fetch(
     `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${path}?currentDocument.exists=false`,
@@ -309,7 +334,7 @@ function ctEq(a, b) {
 // unauthenticated and each call costs a Firestore REST read/write on the registry project. A copy of the bucket maths
 // lives here on purpose (importing a helper into Pages Functions is fine, but this file already keeps its
 // dependencies inline). KV is not used: 1,000 writes/day account-wide.
-const REG_LIMITS = { lookup: [40, 90], resolve: [10, 20], confirm: [10, 20], bind: [6, 10], 'report-error': [3, 6], status: [6, 20], migrate: [10, 30] };
+const REG_LIMITS = { lookup: [40, 90], resolve: [10, 20], confirm: [10, 20], bind: [6, 10], expire: [6, 10], 'report-error': [3, 6], status: [6, 20], migrate: [10, 30] };
 const _regBuckets = new Map();
 function regTake(ip, action) {
   const [burst, perMin] = REG_LIMITS[action] || [6, 20];
@@ -351,7 +376,7 @@ async function handleGetLookup(request, env, waitUntil) {
   try { rec = await findBinding(projectId, token, { id: await bindingIdOf(env, h), codeHash: h, legacyCode: null }, env, names); }
   catch (e) { return json({ error: 'registry read failed: ' + e.message }, 502); }
   if (!rec) return json({ found: false, legacy: legacyEnabled(env) });
-  const res = new Response(JSON.stringify({ db: rec.db, found: true }), {
+  const res = new Response(JSON.stringify({ db: rec.db, found: true, expired: !!rec.expired }), {
     status: 200, headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Cache-Control': 'public, max-age=30, s-maxage=60' },
   });
   if (cache) { const p = cache.put(cacheKey, res.clone()).catch(() => {}); if (typeof waitUntil === 'function') waitUntil(p); else await p; }
@@ -393,7 +418,7 @@ export async function onRequest(ctx) {
     let existing = null;
     try { existing = await findBinding(projectId, token, ident, env, names); }
     catch (e) { return json({ error: 'registry read failed: ' + e.message }, 502); }
-    if (existing?.db) return json({ db: existing.db, found: true });
+    if (existing?.db) return json({ db: existing.db, found: true, expired: !!existing.expired });
     // `legacy` tells a hash-only client that retrying with the plaintext code can still find an old binding.
     return json({ found: false, legacy: legacyEnabled(env) && !ident.legacyCode });
   }
@@ -502,6 +527,25 @@ export async function onRequest(ctx) {
     try {
       await restSetDoc(projectId, token, `bindings/${ident.id}`, { db });
     } catch (e) { return json({ error: 'registry write failed: ' + e.message }, 502); }
+    return json({ ok: true });
+  }
+
+  // ── expire: a client already read this room's actual doc on its shard and
+  //    found its TTL has passed. Persist that onto the registry binding —
+  //    merge-only, so `db` is never touched — so every OTHER client's cheap
+  //    GET lookup above rejects the room immediately too, instead of each
+  //    one separately paying the shard round-trip to learn the same thing.
+  //    `db` must match the binding's current shard, so a stale/racing
+  //    report (e.g. for a since-recreated room on a different shard) is a
+  //    silent no-op rather than mismarking the new room. ──
+  if (action === 'expire') {
+    const ident = await identify(body, env), db = body?.db;
+    if (ident.error) return json({ error: ident.error }, 400);
+    if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
+    try {
+      const cur = await restGetDoc(projectId, token, `bindings/${ident.id}`);
+      if (cur?.db === db) await restMergeDoc(projectId, token, `bindings/${ident.id}`, { expired: true, expiredAt: Date.now() });
+    } catch { /* best-effort — a missed mark just costs other clients one extra shard round-trip, harmless */ }
     return json({ ok: true });
   }
 
