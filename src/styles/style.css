@@ -43,8 +43,10 @@
   --r2:   22px;
   --r3:   30px;
   /* Type */
-  --fui:   'Syne', sans-serif;
-  --fmono: 'Space Mono', monospace;
+  /* Emoji fonts are listed explicitly BEFORE the generic family: Syne and Space Mono are downloaded web fonts with no emoji
+     glyphs, and on Android/WebView the browser does not reliably fall back per character for a downloaded font. */
+  --fui:   'Syne', "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","Twemoji Mozilla", sans-serif;
+  --fmono: 'Space Mono', "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","Twemoji Mozilla", monospace;
   /* Easing */
   --spring: cubic-bezier(.34,1.56,.64,1);
   --out:    cubic-bezier(.25,.46,.45,.94);
@@ -408,7 +410,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 /* Force emoji font — prevents monospace font overriding system emoji glyphs */
 .reaction-emoji{font-size:1rem;line-height:1;display:inline-block}
 /* Also fix emoji in the quick-react strip and grid */
-.strip-emoji,.strip-emoji-grid-btn,.reaction-emoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol","Noto Color Emoji","Twemoji Mozilla",sans-serif!important;font-variant-emoji:emoji}
+.strip-emoji,.strip-emoji-grid-btn,.reaction-emoji,.ann-react-emoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol","Noto Color Emoji","Twemoji Mozilla",sans-serif!important;font-variant-emoji:emoji}
 .reaction-count{font-family:var(--fui);font-size:.6rem;font-weight:700;color:var(--text2);min-width:10px}
 .reaction-chip.mine .reaction-count{color:var(--teal)}
 .msg-actions{display:flex;flex-direction:column;gap:4px;opacity:0;flex-shrink:0;margin:0 4px;transition:opacity var(--fast) ease}
