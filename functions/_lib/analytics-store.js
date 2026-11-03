@@ -100,6 +100,15 @@ export function buildIncrements(items) {
     add(`ev.${it.event}`, n);
     const dims = it.dims && typeof it.dims === 'object' ? it.dims : {};
     for (const d of spec) add(`${d}.${DIMS[d](dims[d])}`, n);
+    // rating.sum is the one additive counter that makes an average rating
+    // derivable (sum / count) without ever storing a precomputed "average"
+    // field — averages aren't atomically incrementable the way a count is,
+    // so a stored one would need a read-modify-write and would drift under
+    // concurrent writes. sum is just another increment, same as rating.r4.
+    if (it.event === 'feedback') {
+      const m = /^r([1-5])$/.exec(DIMS.rating(dims.rating));
+      if (m) add('rating.sum', Number(m[1]) * n);
+    }
     if (it.event === 'app_open' && it.country) {
       const cc = /^[A-Za-z]{2}$/.test(it.country) ? it.country.toLowerCase() : 'xx';
       add(`geo.${cc}`, 1);
@@ -123,7 +132,9 @@ export function registryAdmin(env) {
   } catch { return null; }
 }
 
-function api(reg, fetchImpl) {
+// Exported (not just used internally) so feedback-migrate.js can reuse the
+// exact same registry-write plumbing instead of a second copy of it.
+export function api(reg, fetchImpl) {
   const root = `projects/${reg.projectId}/databases/(default)/documents`;
   const base = `https://firestore.googleapis.com/v1/${root}`;
   async function call(path, init = {}) {
@@ -137,9 +148,9 @@ function api(reg, fetchImpl) {
   return { root, call };
 }
 
-const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);
+export const dayKey = (d = new Date()) => d.toISOString().slice(0, 10);
 
-function incWrite(root, docPath, marker, inc) {
+export function incWrite(root, docPath, marker, inc) {
   return {
     update: { name: `${root}/${docPath}`, fields: { [marker[0]]: { stringValue: marker[1] } } },
     updateMask: { fieldPaths: [marker[0]] },
@@ -262,6 +273,17 @@ function sumEv(days, n) {
   return out;
 }
 
+/** Derived, never stored: average = sum / count, computed fresh from
+ *  whatever rating.* fields a totals-shaped object has (missing ones are 0).
+ *  Returns null rather than 0 when there's no feedback yet, so a chart can
+ *  tell "no data" apart from "a real average of zero" (which can't happen
+ *  anyway — ratings are 1..5 — but null-for-empty is the honest value either way). */
+export function avgRating(statsLikeFields) {
+  const r = (statsLikeFields && statsLikeFields.rating) || {};
+  const count = (r.r1 || 0) + (r.r2 || 0) + (r.r3 || 0) + (r.r4 || 0) + (r.r5 || 0);
+  return count ? Math.round((r.sum || 0) / count * 100) / 100 : null;
+}
+
 /** Totals + the most recent `days` daily docs (1 + N reads). */
 export async function readStats(env, days = 30, fetchImpl = fetch) {
   const reg = registryAdmin(env);
@@ -276,13 +298,23 @@ export async function readStats(env, days = 30, fetchImpl = fetch) {
       limit: N,
     } }) }),
   ]);
-  if (!(tRes.ok || tRes.status === 404) || !dRes.ok) throw new Error(`analytics read failed (${tRes.status}/${dRes.status})`);
+  if (!(tRes.ok || tRes.status === 404) || !dRes.ok) {
+    // Capture Firestore's actual error body, not just the two status codes —
+    // without this, a failure here is undiagnosable: diagnose() doesn't
+    // exercise this :runQuery call at all, so "(200/400)" with no body text
+    // is the only signal anyone ever gets, in logs or otherwise.
+    const [tDetail, dDetail] = await Promise.all([
+      tRes.ok || tRes.status === 404 ? '' : tRes.text().catch(() => ''),
+      dRes.ok ? '' : dRes.text().catch(() => ''),
+    ]);
+    throw new Error(`analytics read failed (${tRes.status}/${dRes.status})` + (dDetail ? ` — days query: ${dDetail.slice(0, 500)}` : '') + (tDetail ? ` — totals read: ${tDetail.slice(0, 500)}` : ''));
+  }
   const totals = tRes.ok ? decodeFields((await tRes.json()).fields) : {};
   const rows = (await dRes.json()).filter(r => r.document).map(r => decodeFields(r.document.fields));
   const byDay = {};
   for (const r of rows) if (r.day) byDay[r.day] = r;
   const list = rows.filter(r => r.day);
-  return { totals, days: byDay, rollup: { last7: sumEv(list, 7), last30: sumEv(list, 30) } };
+  return { totals, days: byDay, rollup: { last7: sumEv(list, 7), last30: sumEv(list, 30) }, avgRating: avgRating(totals) };
 }
 
 // ── One-off import of the old KV counters ───────────────────────────────────

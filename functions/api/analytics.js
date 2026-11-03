@@ -23,11 +23,20 @@
  * MIGRATE POST /api/analytics?action=migrate&cursor=…   (Bearer ADMIN_ACCESS)
  *        One-off import of the old KV counters. Repeat with the returned
  *        `cursor` until it reports done:true. Safe to re-run.
+ * MIGRATE-FEEDBACK
+ *        POST /api/analytics?action=migrate-feedback    (Bearer ADMIN_ACCESS)
+ *        Backfills each shard's raw `feedback` collection into the rating.*
+ *        counters, bucketed by the day each one was actually submitted (not
+ *        today). No cursor param — it's tracked server-side per shard.
+ *        Repeat the same call until every shard in the response reports
+ *        done:true. Safe to re-run (idempotent). See
+ *        functions/_lib/feedback-migrate.js for the full design.
  */
 
 'use strict';
 
 import { CLIENT_EVENTS, recordEvents, readStats, migrateKv, registryAdmin, diagnose } from '../_lib/analytics-store.js';
+import { migrateFeedback } from '../_lib/feedback-migrate.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 const JSON_HDR = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS };
@@ -72,7 +81,7 @@ export async function onRequest(ctx) {
           source: 'firestore',
           room_created: s.totals?.ev?.room_created || 0,          // same fields the old endpoint returned
           message_sent: s.totals?.ev?.message_sent || 0,
-          totals: s.totals, days: s.days, rollup: s.rollup,
+          totals: s.totals, days: s.days, rollup: s.rollup, avgRating: s.avgRating,
           ts: new Date().toISOString(),
         });
       } catch (e) {
@@ -101,6 +110,20 @@ export async function onRequest(ctx) {
         const r = await migrateKv(env, url.searchParams.get('cursor') || '');
         return json(r.body, r.status);
       } catch { return json({ error: 'migrate_failed' }, 502); }
+    }
+
+    // ── POST ?action=migrate-feedback — backfill raw per-shard `feedback`
+    //    docs into the registry's rating.* counters, bucketed by the date
+    //    each one was actually submitted (admin only). Resumable: re-POST
+    //    the same URL (no cursor to pass — it's tracked server-side) until
+    //    every shard in the response reports done:true. See
+    //    functions/_lib/feedback-migrate.js for the full design/cost notes. ─
+    if (url.searchParams.get('action') === 'migrate-feedback') {
+      if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
+      try {
+        const r = await migrateFeedback(env);
+        return json(r.body, r.status);
+      } catch (e) { return json({ error: 'migrate_feedback_failed', detail: String(e && e.message || e) }, 502); }
     }
 
     // ── POST — record an event ──────────────────────────────────────────────
