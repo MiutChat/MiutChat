@@ -6,6 +6,12 @@
 <p align="center"><strong>End-to-end encrypted, anonymous, self-destructing chat rooms. No accounts. No phone number. No trace.</strong></p>
 
 <p align="center">
+  <a href="https://github.com/MiutChat/MiutChat/actions/workflows/build-check.yml"><img src="https://github.com/MiutChat/MiutChat/actions/workflows/build-check.yml/badge.svg" alt="Build check"/></a>
+  <a href="https://github.com/MiutChat/MiutChat/actions/workflows/bump-version.yml"><img src="https://github.com/MiutChat/MiutChat/actions/workflows/bump-version.yml/badge.svg" alt="Bump version"/></a>
+  <a href="https://github.com/MiutChat/MiutChat/actions/workflows/cleanup.yml"><img src="https://github.com/MiutChat/MiutChat/actions/workflows/cleanup.yml/badge.svg" alt="Cleanup expired rooms & messages"/></a>
+</p>
+
+<p align="center">
   <a href="https://miutchat.pages.dev">Live app</a> ·
   <a href="https://miutchat.pages.dev/about.html">About</a> ·
   <a href="https://miutchat.pages.dev/privacy.html">Privacy Policy</a> ·
@@ -19,7 +25,7 @@
 
 MiutChat is a free, anonymous, end-to-end encrypted chat room app. You create a room, share a short code with whoever you want to talk to, and start chatting — no sign-up, no email, no phone number. Messages are encrypted **on your device** before they're ever sent, using a key derived from the room code itself, so the server (Firestore) only ever stores ciphertext it cannot read.
 
-Rooms are ephemeral by design: once everyone leaves, the room and everything in it is deleted, on a timer the room's admin controls (instantly, after 5 minutes by default, after an hour, after a day, or never).
+Rooms are ephemeral by design: once everyone leaves, the room and everything in it is deleted, on a timer the room's admin controls (instantly, after 5 minutes by default, after an hour, after a day, or up to 7 days).
 
 ## Table of contents
 
@@ -39,8 +45,8 @@ Rooms are ephemeral by design: once everyone leaves, the room and everything in 
 
 - **End-to-end encryption** — AES-256-GCM, keys derived client-side via PBKDF2 from the room code. The server never sees plaintext.
 - **No accounts, no identity** — join with just a room code; a random display name is generated per session.
-- **Self-destructing rooms** — admin-configurable expiry (Instant / 5 min / 1 hour / 24 hours / Never), counted from the moment the room becomes empty.
-- **Self-destructing messages** — optional per-message auto-vanish (30s up to 7 days), independent of room expiry.
+- **Self-destructing rooms** — admin-configurable expiry (Instant / 5 min / 30 min / 1 hour / 24 hours / 7 days), counted from the moment the room becomes empty.
+- **Self-destructing messages** — optional per-message auto-vanish (30s up to 24 hours, 24 hours by default), independent of room expiry.
 - **Reactions, replies, editing, and soft-delete** — deleted messages become a "This message was deleted" tombstone visible to everyone, rather than silently vanishing.
 - **Image & video sharing** — encrypted client-side, chunked for large files, reassembled and decrypted lazily as messages scroll into view.
 - **Read receipts & delivery ticks**, typing indicators, emoji reactions.
@@ -50,6 +56,9 @@ Rooms are ephemeral by design: once everyone leaves, the room and everything in 
 - **Installable PWA** with offline-readable cached history (IndexedDB) via a service worker.
 - **Fully static + serverless** — no backend server to run; deploys as a static site plus a handful of Cloudflare Pages Functions.
 - **Horizontally sharded across multiple Firebase projects** — rooms are spread across any number of independent Firestore "shards" (each its own Firebase project, free Spark tier) to stay within per-project quotas as traffic grows, with a dedicated server-side registry tracking which shard each room lives on. See [Multi-shard architecture](#multi-shard-architecture).
+- **Server-side expiry enforcement** — a scheduled sweep (`functions/api/cleanup.js`, run hourly via GitHub Actions) and an entry-time check (`functions/api/expire-room.js`) delete rooms past their TTL using a Firebase service account, since the client-facing security rules deliberately don't allow a non-admin's browser to do this itself.
+- **Anonymous, aggregate-only usage analytics** — counters only (room/message/feedback event counts, coarse platform/country buckets); no room codes, user ids, IPs, or message content are ever stored. See `functions/_lib/analytics-store.js`.
+- **Automated CI** — every pull request is build-verified before merge; version bumps and expired-room cleanup both run on a schedule via GitHub Actions. See [CI/CD](#cicd).
 
 ## Tech stack
 
@@ -68,22 +77,40 @@ There is intentionally no framework, no npm-dependency-heavy UI layer, and no se
 
 ```
 MiutChat/
+├── .github/workflows/             GitHub Actions — see CI/CD below
+│   ├── build-check.yml             Builds every PR against main; catches a broken build before merge
+│   ├── bump-version.yml            Auto-bumps package.json's version on every push to main
+│   └── cleanup.yml                 Scheduled (hourly): calls /api/cleanup, since Cloudflare Pages has no native cron
 ├── src/                          Everything that gets built
 │   ├── index.html                 The app itself (chat UI)
 │   ├── app/
 │   │   ├── app.js                 Core client (ES module): rooms, messages, reactions, UI wiring
+│   │   ├── backlog-sweep.js       Pure, DOM-free sweep of a whole (possibly paginated) backlog of expired
+│   │   │                          messages — app.js's other expiry paths only ever see messages already
+│   │   │                          loaded into the client, so an older TTL'd message further back than that
+│   │   │                          would otherwise never get queried or deleted
+│   │   ├── scheduling.js          Pure helper for running periodic housekeeping (TTL sweep, presence
+│   │   │                          heartbeat) off the main thread via the Scheduler API's 'background'
+│   │   │                          priority, with a graceful fallback where that API doesn't exist
+│   │   ├── screen-transition.js   Picks the native View Transitions API vs. the app's hand-built CSS morph
+│   │   │                          for screen swaps — honors prefers-reduced-motion either way
 │   │   └── lazy/                  Loaded on demand with dynamic import()
 │   │       ├── file-transfer.js    Attach, chunking, decrypt, media viewer
-│   │       └── feedback.js         Post-leave survey and "report a problem"
+│   │       ├── feedback.js         Post-leave survey and "report a problem"
+│   │       ├── announcement.js     Admin-authored in-app announcements: Firestore stores one plain-text
+│   │       │                       config string (admins never write HTML), this parses/validates/renders it
+│   │       └── media-swap.js       Swaps a decrypted image into place only once it has actually loaded,
+│   │                               so the placeholder's box doesn't collapse and reflow (avoids layout shift)
 │   ├── core/
 │   │   ├── db-manager.js          Multi-shard Firestore resolution (registry lookup, caches, cross-shard probe)
 │   │   ├── security.js            Replay protection, nonce tracking, timestamp validation, canaries
-│   │   ├── storage-engine.js      Chunked encrypted file read/write against Firestore
 │   │   └── placeholder-rotator.js Input-placeholder rotation on the join screen
 │   ├── crypto/
 │   │   ├── crypto-engine.js       AES-256-GCM, key derivation, signing primitives
 │   │   ├── crypto-bridge.js       Glue between the UI and crypto-engine / crypto-worker
-│   │   └── crypto-worker.js       Web Worker offload for heavier crypto
+│   │   ├── crypto-worker.js       Web Worker offload for heavier crypto
+│   │   └── b64.js                 Base64 encode/decode — native Uint8Array.toBase64/fromBase64 where the
+│   │                              browser has it, the original manual-loop version as fallback otherwise
 │   ├── sw/
 │   │   ├── sw.js                  Service worker (cache-first shell, offline fallback)
 │   │   └── sw-bridge.js           Main-thread bridge to the service worker
@@ -96,16 +123,28 @@ MiutChat/
 │   └── icons/
 ├── config/
 │   └── firestore.rules            Security rules for the chat shards — committed here and published
-├── functions/api/                Cloudflare Pages Functions (must stay at the repo root)
-│   ├── health.js  rate-limit.js  cleanup.js  canary.js  validate-room.js
-│   ├── csp-report.js  analytics.js  notify.js
-│   ├── config.js                  Tells the client which Firebase shard projects are active
-│   └── shard-registry.js          Authoritative "which shard is this room on" service
+├── functions/                    Cloudflare Pages Functions (must stay at the repo root)
+│   ├── _middleware.js             Runs in front of every request: maintenance-mode gate with a signed
+│   │                              admin-bypass cookie (/access?key=...), crawler/bot passthrough, CORS
+│   ├── _lib/                      Shared server-side helpers, not routes themselves
+│   │   ├── firebase-admin.js       Service-account-based Firestore access that bypasses the security
+│   │   │                          rules entirely — the plain anonymous-auth REST path (e.g. in cleanup.js)
+│   │   │                          can't list or delete other people's rooms because the rules forbid it;
+│   │   │                          this is what actually lets cleanup.js and expire-room.js find and wipe them
+│   │   └── analytics-store.js      Schema, validation and Firestore writes for the anonymous usage
+│   │                              counters — see "Anonymous usage analytics" below
+│   └── api/
+│       ├── health.js  rate-limit.js  canary.js  validate-room.js  csp-report.js  notify.js
+│       ├── config.js              Tells the client which Firebase shard projects are active
+│       ├── shard-registry.js      Authoritative "which shard is this room on" service
+│       ├── analytics.js           HTTP endpoint for the anonymous usage counters (functions/_lib/analytics-store.js)
+│       ├── cleanup.js             Scheduled sweep (via cleanup.yml): deletes rooms/messages past their TTL,
+│       │                          across every shard, using firebase-admin.js
+│       └── expire-room.js         Entry-time deletion: someone opening an already-expired room triggers
+│                                  server-side deletion right then, instead of waiting for the next sweep
 ├── scripts/
 │   ├── build.js                   Build pipeline (esbuild + custom transforms)
 │   └── version.js                 Single source of truth for the app version
-├── archive/                      Not built and not referenced by the app (kept for review)
-│   ├── notify.js  miut-protocol.js
 ├── build.js                      Two-line shim so `node build.js` (Cloudflare build command) keeps working
 ├── wrangler.toml                  Cloudflare Pages config (KV namespaces, env vars, rate-limit tuning)
 └── package.json
@@ -133,8 +172,8 @@ Key rotation ("epochs"): an admin can force a new key to be derived (e.g. after 
 
 Two independent expiry systems:
 
-- **Room expiry** (`inactivityTtlMs` on the room doc) — how long the *entire room* persists after the last member leaves. Configured by the admin in Settings (Instant / 5 min / 1 hour / 24 hours / Never). Tracked client-side via presence listeners and enforced server-side by a scheduled Cloudflare Pages Function ([`functions/api/cleanup.js`](./functions/api/cleanup.js)) that sweeps for rooms whose `autoDeleteAt` has passed.
-- **Message expiry** (`msgTtlMs` on the room doc) — optional per-message auto-vanish, independent of the room itself expiring.
+- **Room expiry** (`inactivityTtlMs` on the room doc) — how long the *entire room* persists after the last member leaves. Configured by the admin in Settings (Instant / 5 min / 30 min / 1 hour / 24 hours / 7 days). Tracked client-side via presence listeners and enforced server-side by a scheduled Cloudflare Pages Function ([`functions/api/cleanup.js`](./functions/api/cleanup.js)) that sweeps for rooms whose `autoDeleteAt` has passed. `-1` ("Never") is no longer offered in the UI but is still honored if read on a room created before this change — see `_fmtRoomTtl`/`_handleRoomBecameEmpty` in `app.js`.
+- **Message expiry** (`msgTtlMs` on the room doc) — optional per-message auto-vanish, independent of the room itself expiring. Defaults to 24 hours for newly created rooms (Off / 30s / 5 min / 1 hour / 24 hours).
 
 ### Large file transfer
 
@@ -188,10 +227,10 @@ Whatever your deploy path — Cloudflare's Git integration running `node build.j
 
 The app version is a single source of truth: the `version` field in `package.json`. Every other place a version appears — `app.js`, `sw.js`, `index.html`'s meta tag, `manifest.json`, `wrangler.toml`, and the footer of the marketing pages — is stamped in at build time by `build.js` reading through [`version.js`](./scripts/version.js). None of those are meant to be hand-edited.
 
-**Bump scheme** (a deliberate product decision, not strict semver): the patch number increments normally and caps at `25`; the next bump after that rolls into the minor version instead of continuing past 25:
+**Bump scheme** (a deliberate product decision, not strict semver): the patch number increments normally and caps at `50`; the next bump after that rolls into the minor version instead of continuing past 50:
 
 ```
-1.0.24 → 1.0.25 → 1.1.0 → 1.1.1 → ...
+1.0.49 → 1.0.50 → 1.1.0 → 1.1.1 → ...
 ```
 
 **When it bumps, and where:** automatically, on every push to `main`, via the GitHub Action at [`.github/workflows/bump-version.yml`](./.github/workflows/bump-version.yml). That workflow is the actual source of the bump — it runs `node scripts/version.js patch` and **commits the result back to the repository**.

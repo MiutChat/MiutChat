@@ -45,8 +45,8 @@ The codebase is plain JavaScript (no TypeScript, no JSX) targeting modern evergr
 
 - `scripts/build.js` is the only build step (the root `build.js` is a shim so `node build.js` still works) — no webpack/vite config to learn. It uses `esbuild` for bundling/minification and a few custom string-transform passes (see the `prepTmp` helper) for things like stamping the app version into files at build time.
 - **Never hand-edit a version number** in `app.js`, `sw.js`, `manifest.json`, `wrangler.toml`, `index.html`'s meta tag, or `functions/api/health.js`. All of those are overwritten by `build.js` from the single source of truth in `package.json` (via `version.js`) every time it runs. If you need to bump the version deliberately (e.g. for a release), use `node scripts/version.js minor` (or `major`) — see [README → Versioning](./README.md#versioning).
-- **While iterating locally, run `SKIP_VERSION_BUMP=1 node build.js`** so you're not bumping the version on every test build. A plain `node build.js` (no flag) *will* bump it — that's intentional default behavior for real deploys, but it means it's easy to accidentally burn through version numbers while just testing locally if you forget the flag.
-- Run a full build (`node build.js`, or `SKIP_VERSION_BUMP=1 node build.js` while testing) before opening a PR, and make sure it completes with no errors. A change that doesn't build isn't ready for review.
+- **`node build.js` never bumps the version, locally or anywhere else** — there's no flag needed to prevent it. The only thing that bumps `package.json`'s version is the GitHub Action at [`.github/workflows/bump-version.yml`](./.github/workflows/bump-version.yml) (`node scripts/version.js patch`), triggered on push to `main`, or running `node scripts/version.js [patch|minor|major]` yourself on purpose. `build.js` only *reads* whatever version is already there and stamps it into the built files.
+- Run a full build (`node build.js`) before opening a PR, and make sure it completes with no errors. A change that doesn't build isn't ready for review.
 
 ## Architecture notes for contributors
 
@@ -76,9 +76,9 @@ A few things that aren't obvious from reading any single file in isolation:
 
 ## Testing your change
 
-There's no automated test suite in this repository yet (a good first contribution, if you're looking for one, would be introducing one). Until then:
+There's no automated test suite in this repository yet (a good first contribution, if you're looking for one, would be introducing one — there's already an empty `npm test` script wired up for it in `package.json`). The [Build check](./.github/workflows/build-check.yml) GitHub Action runs `node build.js` automatically on every pull request, so a build that's broken will be flagged on the PR itself before it can reach `main` — but that only catches build failures, not logic bugs, so you still need to verify the change actually works:
 
-- **Always run a full build** (`SKIP_VERSION_BUMP=1 node build.js`) and confirm it completes with no errors.
+- **Always run a full build** (`node build.js`) and confirm it completes with no errors.
 - **Manually exercise the change** in a real browser against a real (or emulated) Firestore backend — this app leans heavily on Firestore's realtime listener behavior, timestamp semantics (`serverTimestamp()` resolution timing has directly caused bugs before), and security rules, none of which a quick code read reliably substitutes for.
 - **Test with at least two simultaneous "members"** (two browser tabs/profiles) for anything touching messages, reactions, presence, or room state — bugs in this codebase have repeatedly turned out to only manifest from a *second* participant's perspective (e.g. a new member's view, or what another member sees after you delete something).
 - **If you touch crypto code**, verify round-trip correctness explicitly (encrypt then decrypt, across the exact code paths you changed) rather than trusting that it "looks right."
@@ -87,7 +87,7 @@ There's no automated test suite in this repository yet (a good first contributio
 
 Before requesting review, confirm:
 
-- [ ] `SKIP_VERSION_BUMP=1 node build.js` completes with no errors
+- [ ] `node build.js` completes with no errors
 - [ ] No version numbers were hand-edited (see [Working with the build/version pipeline](#working-with-the-buildversion-pipeline))
 - [ ] User-controlled content passed through `esc()` (or an equivalent) before being interpolated into HTML
 - [ ] Any new Firestore write is reflected somewhere in `patchMsg()`/the relevant live listener, so other members see it in real time — not just the person who made the change

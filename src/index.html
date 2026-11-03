@@ -172,11 +172,11 @@
         <div class="field-group" style="margin-bottom:0">
           <label>MESSAGE EXPIRY <span class="label-opt">— messages auto-delete after</span></label>
           <div class="ttl-selector" id="create-ttl-selector">
-            <button class="ttl-opt active" data-ttl="0">Off</button>
+            <button class="ttl-opt" data-ttl="0">Off</button>
             <button class="ttl-opt" data-ttl="30">30s</button>
             <button class="ttl-opt" data-ttl="300">5m</button>
             <button class="ttl-opt" data-ttl="3600">1h</button>
-            <button class="ttl-opt" data-ttl="86400">24h</button>
+            <button class="ttl-opt active" data-ttl="86400">24h</button>
           </div>
         </div>
         <button class="btn-join" id="btn-create">
@@ -598,7 +598,7 @@
           <option value="30000">30s</option>
           <option value="300000">5 min</option>
           <option value="3600000">1 hour</option>
-          <option value="86400000">24 hours</option>
+          <option value="86400000" selected>24 hours</option>
         </select>
       </div>
 
@@ -613,7 +613,7 @@
           <option value="1800000">30 min</option>
           <option value="3600000">1 hour</option>
           <option value="86400000">24 hours</option>
-          <option value="-1">Never</option>
+          <option value="604800000">7 days</option>
         </select>
       </div>
 

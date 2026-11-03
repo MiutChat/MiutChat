@@ -1,0 +1,40 @@
+name: Build check
+
+# Verifies every pull request still builds before it reaches main, since
+# nothing else in this repo does: Cloudflare Pages only runs `node build.js`
+# AFTER a PR is merged, as part of deploying it — by then a broken build is
+# already live-broken, not just rejected on review. This catches it earlier.
+#
+# Read-only and side-effect-free: it only builds, it never commits, pushes,
+# or deploys anything (contrast with bump-version.yml and cleanup.yml, which
+# both write back to the repo / call production). `node build.js` itself
+# never bumps the version either way — see CONTRIBUTING.md.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: node build.js

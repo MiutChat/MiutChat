@@ -33,7 +33,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Bump version (patch, with 25→next-minor rollover)
+      - name: Bump version (patch, with 50→next-minor rollover)
         run: node scripts/version.js patch
 
       - name: Commit and push the bumped version

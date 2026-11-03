@@ -35,8 +35,8 @@
       "operatingSystem": "Any (Web-based PWA)",
       "browserRequirements": "Requires JavaScript. Works on all modern browsers.",
       "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-      "description": "MiutChat is a free anonymous encrypted chat application. No account, no phone number, no email, and no data storage. Messages are encrypted client-side with AES-256-GCM before transmission. Rooms auto-delete once everyone leaves, on an admin-configurable timer (instant, 5 minutes by default, 1 hour, 24 hours, or never).",
-      "featureList": ["End-to-end encryption with AES-256-GCM","No accounts or identity required","No data stored on servers","Ephemeral self-destructing chat rooms","Admin-configurable room expiry (instant to never)","Per-message auto-vanish timers","Open-source and auditable"],
+      "description": "MiutChat is a free anonymous encrypted chat application. No account, no phone number, no email, and no data storage. Messages are encrypted client-side with AES-256-GCM before transmission. Rooms auto-delete once everyone leaves, on an admin-configurable timer (instant, 5 minutes by default, 1 hour, 24 hours, or up to 7 days).",
+      "featureList": ["End-to-end encryption with AES-256-GCM","No accounts or identity required","No data stored on servers","Ephemeral self-destructing chat rooms","Admin-configurable room expiry (instant to 7 days)","Per-message auto-vanish timers","Open-source and auditable"],
       "screenshot": "https://miutchat.pages.dev/icons/icon-512.png",
       "softwareVersion": "{{APP_VERSION}}",
       "author": { "@type": "Organization", "name": "MiutChat", "url": "https://github.com/MiutChat/MiutChat" },
@@ -332,7 +332,7 @@ footer{padding:48px 6% 32px;background:var(--bg2);border-top:1px solid var(--bdr
     <div class="fcard">
       <div class="ficon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M12 2L2 7l10 5 10-5-10-5z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>
       <div class="ftit">Ephemeral Rooms</div>
-      <div class="fdesc">Rooms self-destruct once the last member leaves — instantly, 5 minutes later by default, or on whatever schedule the admin sets. Messages can also auto-vanish after 30 seconds, 5 minutes, or up to 7 days.</div>
+      <div class="fdesc">Rooms self-destruct once the last member leaves — instantly, 5 minutes later by default, or on whatever schedule the admin sets, up to 7 days. Messages can also auto-vanish after 30 seconds, 5 minutes, 1 hour, or 24 hours (the default).</div>
     </div>
     <div class="fcard">
       <div class="ficon"><svg viewBox="0 0 24 24" fill="none" width="22" height="22"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>
@@ -370,7 +370,7 @@ footer{padding:48px 6% 32px;background:var(--bg2);border-top:1px solid var(--bdr
         </div>
         <div class="pitem">
           <div class="piico"><svg viewBox="0 0 20 20" fill="none" width="16" height="16"><path d="M4 6h12M6 6V4a2 2 0 012-2h4a2 2 0 012 2v2M8 11v4M12 11v4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M5 6l1 12h8l1-12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-          <div class="pitext"><strong>Auto-wipe on empty</strong><span>When the last person leaves, the room admin's expiry setting decides what happens next — delete instantly, wait 5 minutes (the default), 1 hour, 24 hours, or never. Once it fires, all messages, members, and room data are permanently deleted. No admin can recover them.</span></div>
+          <div class="pitext"><strong>Auto-wipe on empty</strong><span>When the last person leaves, the room admin's expiry setting decides what happens next — delete instantly, wait 5 minutes (the default), 1 hour, 24 hours, or up to 7 days. Once it fires, all messages, members, and room data are permanently deleted. No admin can recover them.</span></div>
         </div>
       </div>
     </div>
