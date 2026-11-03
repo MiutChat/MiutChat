@@ -290,11 +290,26 @@ export async function readStats(env, days = 30, fetchImpl = fetch) {
   if (!reg) return null;
   const { call } = api(reg, fetchImpl);
   const N = Math.min(90, Math.max(1, Math.floor(Number(days)) || 30));
+  // Document IDs are the day string itself (YYYY-MM-DD — see dayKey below),
+  // so "the last N calendar days" is a plain >= range on __name__, ASCENDING.
+  // That's Firestore's automatic single-field index, always present, no
+  // composite index to create or wait on — unlike the ORDER BY __name__
+  // DESCENDING this replaces, which needs an explicit composite index
+  // Firestore won't build for you automatically (that's the exact error this
+  // fixes: "The query requires an index ... create_composite=..."). A range
+  // also means a day with zero events (nothing ever ran to write that doc)
+  // comes back as a real gap instead of silently being skipped and backfilled
+  // by an extra older day to keep the count at N — "last 30 days" now always
+  // means the literal last 30 calendar days, not "the last 30 days that
+  // happened to have data".
+  const since = new Date(Date.now() - (N - 1) * 86400000).toISOString().slice(0, 10);
   const [tRes, dRes] = await Promise.all([
     call('/analytics_meta/totals'),
     call(':runQuery', { method: 'POST', body: JSON.stringify({ structuredQuery: {
       from: [{ collectionId: 'analytics_daily' }],
-      orderBy: [{ field: { fieldPath: '__name__' }, direction: 'DESCENDING' }],
+      where: { fieldFilter: { field: { fieldPath: '__name__' }, op: 'GREATER_THAN_OR_EQUAL',
+                              value: { referenceValue: docRefPath(reg, since) } } },
+      orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
       limit: N,
     } }) }),
   ]);
@@ -313,8 +328,13 @@ export async function readStats(env, days = 30, fetchImpl = fetch) {
   const rows = (await dRes.json()).filter(r => r.document).map(r => decodeFields(r.document.fields));
   const byDay = {};
   for (const r of rows) if (r.day) byDay[r.day] = r;
-  const list = rows.filter(r => r.day);
+  const list = rows.filter(r => r.day).sort((a, b) => (a.day < b.day ? 1 : -1)); // newest first, to match the old DESCENDING order callers relied on
   return { totals, days: byDay, rollup: { last7: sumEv(list, 7), last30: sumEv(list, 30) }, avgRating: avgRating(totals) };
+}
+
+/** Full resource-name reference value for a day doc, for a >= range on __name__. */
+function docRefPath(reg, day) {
+  return `projects/${reg.projectId}/databases/(default)/documents/analytics_daily/${day}`;
 }
 
 // ── One-off import of the old KV counters ───────────────────────────────────
