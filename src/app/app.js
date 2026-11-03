@@ -3638,13 +3638,40 @@ function _ttlBucket(sec) { return sec <= 0 ? 'off' : sec <= 30 ? 's30' : sec <= 
 // Message analytics are batched: the ping goes out after every 2nd message (n = 2) instead of after each one. Each ping
 // costs the server 2 KV reads + 2 KV writes against a 1,000-writes/day budget, so this halves that cost without losing
 // counts. The not-yet-sent remainder is kept in localStorage so a reload doesn't drop it.
+//
+// A lone odd message (the person sends exactly 1, never a 2nd) used to just
+// sit in that pending count forever — if they then closed the tab, it was
+// never flushed and silently undercounted real usage. Two independent
+// flushes now cover that: a 30s timer (in case they keep the tab open but
+// stop sending) and a flush the moment the tab is hidden / the page is
+// being left (in case they close it right away) — whichever happens first.
 const _ANALYTICS_EVERY = 2;
+const _MSG_FLUSH_MS = 30000;
 let _msgPending = (() => { try { return Math.min(_ANALYTICS_EVERY - 1, Math.max(0, parseInt(localStorage.getItem('miut_msg_pending'), 10) || 0)); } catch { return 0; } })();
+let _msgFlushTimer = null;
+function _flushMsgPending() {
+  if (_msgFlushTimer) { clearTimeout(_msgFlushTimer); _msgFlushTimer = null; }
+  if (_msgPending <= 0) return;
+  const n = _msgPending; _msgPending = 0;
+  try { localStorage.setItem('miut_msg_pending', '0'); } catch {}
+  _ping('message_sent', n);   // keepalive: true (see _ping) — survives the page unload this often fires from
+}
 function _countMessageForAnalytics() {
   _msgPending++;
-  if (_msgPending >= _ANALYTICS_EVERY) { const n = _msgPending; _msgPending = 0; _ping('message_sent', n); }
-  try { localStorage.setItem('miut_msg_pending', String(_msgPending)); } catch {}
+  if (_msgPending >= _ANALYTICS_EVERY) { _flushMsgPending(); }
+  else {
+    try { localStorage.setItem('miut_msg_pending', String(_msgPending)); } catch {}
+    if (!_msgFlushTimer) _msgFlushTimer = setTimeout(_flushMsgPending, _MSG_FLUSH_MS);
+  }
 }
+// Leaving: hidden tab (most reliable signal on mobile — a backgrounded tab
+// can be killed outright with no further events) and pagehide (covers an
+// actual close/navigate that visibilitychange sometimes misses, e.g. some
+// desktop browsers on a fast navigation). beforeunload is deliberately NOT
+// used for this — it's unreliable on mobile Safari and would duplicate
+// pagehide's job anyway.
+document.addEventListener('visibilitychange', () => { if (document.hidden) _flushMsgPending(); });
+window.addEventListener('pagehide', _flushMsgPending);
 
 // ── Multi-select action bar ─────────────────────────────────────────────────
 function _enterSelectMode() {
