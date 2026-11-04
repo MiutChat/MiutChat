@@ -20,6 +20,10 @@
  * Until that grant exists on a given shard, calls here fail with 403 and
  * that shard's exact fields simply stay null — handled, never thrown.
  *
+ * DEBUGGING: when a shard's metrics cannot be read, the returned object also
+ * carries `diagnostic` ({ status, reason, message, hint, ... }) naming the
+ * exact cause. It is returned by /api/cleanup, never written to Firestore.
+ *
  * COST: free in practice at this app's scale. Cloud Monitoring's Read API
  * has a free allotment of 1,000,000 "time series returned" per month per
  * billing account; beyond that it's $0.50/million. 3 metrics x a handful of
@@ -37,6 +41,8 @@ const METRICS = {
   writesToday:  'firestore.googleapis.com/document/write_count',
   deletesToday: 'firestore.googleapis.com/document/delete_count',
 };
+
+const FATAL_STATUSES = new Set([401, 403, 404]);
 
 /**
  * Start of "today" in US Pacific time, as an ISO instant — matches
@@ -61,12 +67,57 @@ function pacificMidnightISO(now = new Date()) {
   return new Date(Date.UTC(y, m - 1, d, 0, 0, 0)).toISOString();
 }
 
-/**
- * One exact metric total for one shard, for the window [since, now).
- * ALIGN_SUM over a single alignment period spanning the whole window asks
- * Monitoring to do the summation server-side — one API call, one number,
- * instead of fetching per-minute deltas and summing them here.
- */
+function parseGoogleError(text) {
+  let body = null;
+  try { body = JSON.parse(text); } catch {}
+  const err = body && body.error ? body.error : null;
+  const details = err && Array.isArray(err.details) ? err.details : [];
+  const info = details.find(d => d && d.reason) || {};
+  const meta = info.metadata || {};
+  return {
+    googleStatus: err && err.status ? err.status : null,
+    reason: info.reason || null,
+    service: meta.service || null,
+    activationUrl: meta.activationUrl || null,
+    message: String((err && err.message) || text || '').slice(0, 300),
+  };
+}
+
+async function readTokenInfo(token, fetchImpl) {
+  try {
+    const res = await fetchImpl('https://oauth2.googleapis.com/tokeninfo', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'access_token=' + encodeURIComponent(token),
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    return { email: j.email || null, scope: String(j.scope || '') };
+  } catch { return null; }
+}
+
+function buildHint(failure, projectId, saEmail, tokenInfo) {
+  const { status, info } = failure;
+  const who = saEmail || 'the shard service account';
+  const apiUrl = info.activationUrl || `https://console.cloud.google.com/apis/library/monitoring.googleapis.com?project=${projectId}`;
+  if (info.reason === 'SERVICE_DISABLED' || /has not been used|is disabled/i.test(info.message)) {
+    return `Cloud Monitoring API is disabled on ${projectId}. Enable it: ${apiUrl}`;
+  }
+  if (info.reason === 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' || /insufficient authentication scopes/i.test(info.message)) {
+    return 'Access token is missing the monitoring.read scope.';
+  }
+  if (tokenInfo && tokenInfo.scope && !/monitoring/.test(tokenInfo.scope)) {
+    return `Token for ${who} has no monitoring scope (scopes: ${tokenInfo.scope}).`;
+  }
+  if (status === 403) {
+    return `API and scope look fine, so ${who} lacks permission monitoring.timeSeries.list on ${projectId}. Grant it roles/monitoring.viewer on THAT project.`;
+  }
+  if (status === 401) return 'Token rejected (401): the service-account key may be revoked, deleted or malformed.';
+  if (status === 404) return `Monitoring cannot find project ${projectId}: check project_id inside the service-account secret.`;
+  if (status === 429) return 'Monitoring API rate-limited this call. Retry later.';
+  return `Unexpected response ${status} from Cloud Monitoring.`;
+}
+
 async function fetchMetricTotal(projectId, token, metricType, since, fetchImpl) {
   const now = new Date();
   const windowSeconds = Math.max(60, Math.floor((now - new Date(since)) / 1000));
@@ -81,31 +132,54 @@ async function fetchMetricTotal(projectId, token, metricType, since, fetchImpl) 
   });
   const res = await fetchImpl(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) {
-    // 403 almost always means the Monitor Viewer role hasn't been granted on
-    // this project yet (see file header) — not an error worth throwing over.
-    return { ok: false, status: res.status };
+    let text = '';
+    try { text = await res.text(); } catch {}
+    return { ok: false, status: res.status, info: parseGoogleError(text) };
   }
   const body = await res.json();
   const points = body.timeSeries?.[0]?.points || [];
   let total = 0;
   for (const p of points) total += Number(p.value?.int64Value ?? p.value?.doubleValue ?? 0);
-  return { ok: true, total };
+  return { ok: true, total, series: (body.timeSeries || []).length };
 }
 
 /** Exact read/write/delete totals for one shard, since Pacific midnight. Never throws. */
-export async function fetchShardUsage(projectId, token, fetchImpl = fetch) {
+export async function fetchShardUsage(projectId, token, fetchImpl = fetch, saEmail = null) {
   const since = pacificMidnightISO();
   const out = { metricsAsOf: new Date().toISOString() };
-  let anyGranted = false, anyDenied = false;
+  let anyGranted = false, anyDenied = false, failure = null;
   for (const [field, metricType] of Object.entries(METRICS)) {
+    if (failure && FATAL_STATUSES.has(failure.status)) { out[field] = null; continue; }
     try {
       const r = await fetchMetricTotal(projectId, token, metricType, since, fetchImpl);
       if (r.ok) { out[field] = r.total; anyGranted = true; }
-      else { out[field] = null; if (r.status === 403) anyDenied = true; }
-    } catch { out[field] = null; }
+      else {
+        out[field] = null;
+        if (r.status === 403) anyDenied = true;
+        if (!failure) failure = { ...r, metric: metricType };
+      }
+    } catch (e) {
+      out[field] = null;
+      if (!failure) failure = { ok: false, status: 0, metric: metricType, info: { googleStatus: null, reason: 'NETWORK_ERROR', service: null, activationUrl: null, message: String(e && e.message || e).slice(0, 300) } };
+    }
   }
-  out.monitoringGranted = anyGranted;     // at least one metric came back — role is present
-  out.monitoringDenied = anyDenied && !anyGranted; // every metric 403'd — role is missing, not a transient failure
+  out.monitoringGranted = anyGranted;
+  out.monitoringDenied = anyDenied && !anyGranted;
+  if (failure && !anyGranted) {
+    const tokenInfo = failure.status === 403 || failure.status === 401 ? await readTokenInfo(token, fetchImpl) : null;
+    out.diagnostic = {
+      projectId,
+      serviceAccount: saEmail,
+      metric: failure.metric,
+      status: failure.status,
+      googleStatus: failure.info.googleStatus,
+      reason: failure.info.reason,
+      message: failure.info.message,
+      tokenEmail: tokenInfo ? tokenInfo.email : null,
+      tokenScopes: tokenInfo ? tokenInfo.scope : null,
+      hint: buildHint(failure, projectId, saEmail, tokenInfo),
+    };
+  }
   return out;
 }
 
@@ -138,5 +212,9 @@ export async function writeShardUsageToRegistry(reg, shardName, usage, fetchImpl
       updateMask: { fieldPaths: Object.keys(fields) },
     }] }),
   });
-  if (!res.ok) throw new Error('registry write ' + res.status);
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 300); } catch {}
+    throw new Error('registry write ' + res.status + (detail ? ': ' + detail : ''));
+  }
 }

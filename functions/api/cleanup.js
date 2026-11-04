@@ -143,6 +143,37 @@ async function cleanupShard(shard) {
   return { shard: shard.name, deleted, checked: paths.length };
 }
 
+async function collectUsage(env, admin) {
+  const reg = registryAdmin(env);
+  if (!reg) return [{ error: 'registry admin not configured', hint: 'FIREBASE_REGISTRY_SA_JSON is missing or invalid, or FIREBASE_REGISTRY_PROJECT_ID does not match it' }];
+  if (!admin.length) return [{ error: 'no admin shards configured', hint: 'add FIREBASE_SA_JSON / FIREBASE_DBn_SA_JSON service accounts' }];
+  const out = [];
+  const budget = new Budget(2 * admin.length);
+  for (const shard of admin) {
+    const entry = { shard: shard.name, projectId: shard.projectId };
+    if (budget.left < 1) { out.push({ ...entry, skipped: 'budget' }); continue; }
+    try {
+      budget.take();
+      const token = await getAccessTokenCached(shard.sa, fetch);
+      Object.assign(entry, await fetchShardUsage(shard.projectId, token, fetch, shard.sa.client_email));
+    } catch (e) {
+      entry.error = String(e && e.message || e);
+      out.push(entry);
+      console.warn('[usage]', shard.name, entry.error);
+      continue;
+    }
+    try {
+      await writeShardUsageToRegistry(reg, shard.name, entry, fetch);
+      entry.registryWrite = 'ok';
+    } catch (e) {
+      entry.registryWrite = String(e && e.message || e);
+    }
+    if (entry.diagnostic) console.warn('[usage]', shard.name, JSON.stringify(entry.diagnostic));
+    out.push(entry);
+  }
+  return out;
+}
+
 async function runCleanup(env, opts = {}) {
   // Shards with a service account use the rules-bypassing admin path (can list
   // rooms, delete subcollections, and sweep expired messages). Any shard
@@ -155,35 +186,14 @@ async function runCleanup(env, opts = {}) {
     return { error: 'No active shards configured (need FIREBASE_API_KEY/FIREBASE_PROJECT_ID at minimum)', deleted: 0 };
   }
 
+  if (opts.usageOnly) return { usage: await collectUsage(env, admin), ts: new Date().toISOString() };
+
   // Independent per shard — one project having a bad day (auth hiccup,
   // query failure) never blocks cleanup on the others.
   const adminResult = admin.length ? await runAdminCleanup(admin, { cursors: opts.cursors }) : null;
 
-  // Read-only, additive: fetches each shard's EXACT today-so-far Firestore
-  // read/write/delete counts from Cloud Monitoring (see monitoring.js for
-  // what this needs and why it's free at this scale) and writes them into
-  // NEW fields on shardLoad/{name}. Nothing reads these fields yet — room
-  // placement, degrade logic, and every other existing behaviour here is
-  // completely unchanged by this block. A shard without the Monitor Viewer
-  // IAM grant yet just gets monitoringDenied: true and null numbers; never
-  // breaks cleanup's own response.
-  const usageResult = [];
-  const reg = registryAdmin(env);
-  if (reg && admin.length) {
-    const usageBudget = new Budget(2 * admin.length); // 1 token (usually cached already) + up to a few Monitoring calls, generously bounded
-    for (const shard of admin) {
-      if (usageBudget.left < 1) { usageResult.push({ shard: shard.name, skipped: 'budget' }); continue; }
-      try {
-        usageBudget.take();
-        const token = await getAccessTokenCached(shard.sa, fetch);
-        const usage = await fetchShardUsage(shard.projectId, token, fetch);
-        await writeShardUsageToRegistry(reg, shard.name, usage, fetch);
-        usageResult.push({ shard: shard.name, ...usage });
-      } catch (e) {
-        usageResult.push({ shard: shard.name, error: String(e && e.message || e) });
-      }
-    }
-  }
+  const firstRound = !opts.cursors || Object.keys(opts.cursors).length === 0;
+  const usageResult = firstRound ? await collectUsage(env, admin) : [];
   const results = await Promise.all(legacy.map(cleanupShard));
 
   // Count what the server actually removed (anonymous totals — see analytics-store.js).
