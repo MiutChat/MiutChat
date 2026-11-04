@@ -44,7 +44,9 @@
 
 'use strict';
 
-import { discoverAdminShards, runAdminCleanup } from '../_lib/firebase-admin.js';
+import { discoverAdminShards, runAdminCleanup, getAccessTokenCached, Budget } from '../_lib/firebase-admin.js';
+import { registryAdmin } from '../_lib/analytics-store.js';
+import { fetchShardUsage, writeShardUsageToRegistry } from '../_lib/monitoring.js';
 import { recordEvents } from '../_lib/analytics-store.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
@@ -156,6 +158,32 @@ async function runCleanup(env, opts = {}) {
   // Independent per shard — one project having a bad day (auth hiccup,
   // query failure) never blocks cleanup on the others.
   const adminResult = admin.length ? await runAdminCleanup(admin, { cursors: opts.cursors }) : null;
+
+  // Read-only, additive: fetches each shard's EXACT today-so-far Firestore
+  // read/write/delete counts from Cloud Monitoring (see monitoring.js for
+  // what this needs and why it's free at this scale) and writes them into
+  // NEW fields on shardLoad/{name}. Nothing reads these fields yet — room
+  // placement, degrade logic, and every other existing behaviour here is
+  // completely unchanged by this block. A shard without the Monitor Viewer
+  // IAM grant yet just gets monitoringDenied: true and null numbers; never
+  // breaks cleanup's own response.
+  const usageResult = [];
+  const reg = registryAdmin(env);
+  if (reg && admin.length) {
+    const usageBudget = new Budget(2 * admin.length); // 1 token (usually cached already) + up to a few Monitoring calls, generously bounded
+    for (const shard of admin) {
+      if (usageBudget.left < 1) { usageResult.push({ shard: shard.name, skipped: 'budget' }); continue; }
+      try {
+        usageBudget.take();
+        const token = await getAccessTokenCached(shard.sa, fetch);
+        const usage = await fetchShardUsage(shard.projectId, token, fetch);
+        await writeShardUsageToRegistry(reg, shard.name, usage, fetch);
+        usageResult.push({ shard: shard.name, ...usage });
+      } catch (e) {
+        usageResult.push({ shard: shard.name, error: String(e && e.message || e) });
+      }
+    }
+  }
   const results = await Promise.all(legacy.map(cleanupShard));
 
   // Count what the server actually removed (anonymous totals — see analytics-store.js).
@@ -173,6 +201,7 @@ async function runCleanup(env, opts = {}) {
   return {
     deleted, checked, shards: results, ts: new Date().toISOString(),
     ...(adminResult ? { admin: adminResult.shards, cursors: adminResult.cursors, more: adminResult.more } : {}),
+    ...(usageResult.length ? { usage: usageResult } : {}),
   };
 }
 
