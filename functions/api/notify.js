@@ -56,6 +56,8 @@
 
 'use strict';
 
+import { ledgerAdd } from '../_lib/usage-ledger.js';
+
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 
 // ── base64url helpers ───────────────────────────────────────────────────
@@ -166,12 +168,14 @@ async function getServiceAccountToken(saJsonStr) {
 // List all member docs of a room via the Firestore REST API — rooms are
 // small (a handful to low hundreds of members), so a plain list beats the
 // complexity of a structured "field exists" query for this.
-async function listMembers(projectId, token, roomCode) {
+async function listMembers(projectId, token, roomCode, shardName) {
   const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${encodeURIComponent(roomCode)}/members?pageSize=200`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!res.ok) return [];
   const data = await res.json();
-  return data.documents || [];
+  const docs = data.documents || [];
+  ledgerAdd(shardName, 'notify', Math.max(1, docs.length));
+  return docs;
 }
 
 // Firestore REST documents use a typed-value wire format — unwrap the
@@ -298,7 +302,7 @@ async function runNotify(env, { roomCode, shard, senderId, senderName }) {
   // whole room's membership actually needs here.
   if (!s.saJson) return { error: `No service account configured for shard ${s.name} — set FIREBASE${s.name === 'miut-db0' ? '' : '_' + s.name.replace('miut-', '').toUpperCase()}_SA_JSON` };
   const token = await getServiceAccountToken(s.saJson);
-  const docs = await listMembers(s.projectId, token, roomCode);
+  const docs = await listMembers(s.projectId, token, roomCode, s.name);
   const privateKey = await importVapidPrivateKey(env.VAPID_PRIVATE_KEY, env.VAPID_PUBLIC_KEY);
 
   const targets = [];

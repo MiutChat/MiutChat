@@ -44,10 +44,9 @@
 
 'use strict';
 
-import { discoverAdminShards, runAdminCleanup, getAccessTokenCached, Budget } from '../_lib/firebase-admin.js';
-import { registryAdmin } from '../_lib/analytics-store.js';
-import { fetchShardUsage, writeShardUsageToRegistry } from '../_lib/monitoring.js';
+import { discoverAdminShards, runAdminCleanup } from '../_lib/firebase-admin.js';
 import { recordEvents } from '../_lib/analytics-store.js';
+import { flushLedger } from '../_lib/usage-store.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 
@@ -143,37 +142,6 @@ async function cleanupShard(shard) {
   return { shard: shard.name, deleted, checked: paths.length };
 }
 
-async function collectUsage(env, admin) {
-  const reg = registryAdmin(env);
-  if (!reg) return [{ error: 'registry admin not configured', hint: 'FIREBASE_REGISTRY_SA_JSON is missing or invalid, or FIREBASE_REGISTRY_PROJECT_ID does not match it' }];
-  if (!admin.length) return [{ error: 'no admin shards configured', hint: 'add FIREBASE_SA_JSON / FIREBASE_DBn_SA_JSON service accounts' }];
-  const out = [];
-  const budget = new Budget(2 * admin.length);
-  for (const shard of admin) {
-    const entry = { shard: shard.name, projectId: shard.projectId };
-    if (budget.left < 1) { out.push({ ...entry, skipped: 'budget' }); continue; }
-    try {
-      budget.take();
-      const token = await getAccessTokenCached(shard.sa, fetch);
-      Object.assign(entry, await fetchShardUsage(shard.projectId, token, fetch, shard.sa.client_email));
-    } catch (e) {
-      entry.error = String(e && e.message || e);
-      out.push(entry);
-      console.warn('[usage]', shard.name, entry.error);
-      continue;
-    }
-    try {
-      await writeShardUsageToRegistry(reg, shard.name, entry, fetch);
-      entry.registryWrite = 'ok';
-    } catch (e) {
-      entry.registryWrite = String(e && e.message || e);
-    }
-    if (entry.diagnostic) console.warn('[usage]', shard.name, JSON.stringify(entry.diagnostic));
-    out.push(entry);
-  }
-  return out;
-}
-
 async function runCleanup(env, opts = {}) {
   // Shards with a service account use the rules-bypassing admin path (can list
   // rooms, delete subcollections, and sweep expired messages). Any shard
@@ -186,14 +154,10 @@ async function runCleanup(env, opts = {}) {
     return { error: 'No active shards configured (need FIREBASE_API_KEY/FIREBASE_PROJECT_ID at minimum)', deleted: 0 };
   }
 
-  if (opts.usageOnly) return { usage: await collectUsage(env, admin), ts: new Date().toISOString() };
-
   // Independent per shard — one project having a bad day (auth hiccup,
   // query failure) never blocks cleanup on the others.
   const adminResult = admin.length ? await runAdminCleanup(admin, { cursors: opts.cursors }) : null;
 
-  const firstRound = !opts.cursors || Object.keys(opts.cursors).length === 0;
-  const usageResult = firstRound ? await collectUsage(env, admin) : [];
   const results = await Promise.all(legacy.map(cleanupShard));
 
   // Count what the server actually removed (anonymous totals — see analytics-store.js).
@@ -206,12 +170,13 @@ async function runCleanup(env, opts = {}) {
     if (items.length) await recordEvents(env, items).catch(() => {});
   }
 
+  await flushLedger(env, { force: true });
+
   const deleted = results.reduce((sum, r) => sum + r.deleted, 0);
   const checked = results.reduce((sum, r) => sum + r.checked, 0);
   return {
     deleted, checked, shards: results, ts: new Date().toISOString(),
     ...(adminResult ? { admin: adminResult.shards, cursors: adminResult.cursors, more: adminResult.more } : {}),
-    ...(usageResult.length ? { usage: usageResult } : {}),
   };
 }
 

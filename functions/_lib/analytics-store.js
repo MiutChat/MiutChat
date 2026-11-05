@@ -39,6 +39,7 @@
 'use strict';
 
 import { getAccessTokenCached, dropCachedToken } from './firebase-admin.js';
+import { ledgerAdd } from './usage-ledger.js';
 
 // ── Schema ──────────────────────────────────────────────────────────────────
 const ENUMS = {
@@ -181,7 +182,7 @@ export async function recordEvents(env, items, fetchImpl = fetch) {
       incWrite(root, `analytics_daily/${day}`, ['day', day], inc),
       incWrite(root, 'analytics_meta/totals',  ['kind', 'totals'], inc),
     ] }) });
-    if (res.ok) return { ok: true };
+    if (res.ok) { ledgerAdd('registry', 'analytics', 0, 2, 0); return { ok: true }; }
     const detail = await res.text().catch(() => '');
     console.error('[MIUT analytics] commit failed', res.status, detail.slice(0, 500));
     return { ok: false, reason: 'commit_' + res.status, detail: detail.slice(0, 500) };

@@ -10,6 +10,8 @@
  */
 
 const BYPASS_PATHS    = ['/maintenance.html','/404.html','/manifest.json','/robots.txt','/sitemap.xml','/security.txt'];
+import { flushSoon } from './_lib/usage-store.js';
+
 const BYPASS_PREFIXES = ['/api/','/icons/'];
 const BYPASS_EXT      = /\.(png|ico|svg|jpg|jpeg|webp|webmanifest|txt|xml|gz|br|woff2?|css|js|map)$/i;
 const CRAWLER_UA      = /googlebot|bingbot|yandexbot|duckduckbot|slurp|baiduspider|facebot|facebookexternalhit|twitterbot|linkedinbot|ia_archiver/i;
@@ -103,6 +105,8 @@ const API_LIMITS = [
   { p: '/api/validate-room',  m: '*',    name: 'validate',    burst: 20, perMin: 40 },
   { p: '/api/analytics',      m: 'POST', name: 'analytics-w', burst: 10, perMin: 20 },   // writes KV
   { p: '/api/analytics',      m: '*',    name: 'analytics-r', burst: 5,  perMin: 10 },   // admin read (Bearer secret)
+  { p: '/api/usage',          m: 'POST', name: 'usage-w',    burst: 20, perMin: 30 },
+  { p: '/api/usage',          m: '*',    name: 'usage-r',    burst: 5,  perMin: 10 },
   { p: '/api/notify',         m: '*',    name: 'notify',      burst: 20, perMin: 30 },
   { p: '/api/cleanup',        m: '*',    name: 'cleanup',     burst: 45, perMin: 60 },   // admin (Bearer secret). The GitHub Action calls it up to 40x back-to-back per run, so this must stay above that.
   { p: '/api/expire-room',    m: '*',    name: 'expire-room', burst: 5,  perMin: 10 },   // public; each call costs service-account reads
@@ -144,7 +148,7 @@ function apiRateLimit(request, path, env) {
   });
 }
 
-export async function onRequest(ctx) {
+async function handle(ctx) {
   const { request, env, next } = ctx;
   const url  = new URL(request.url);
   const path = url.pathname;
@@ -236,4 +240,14 @@ export async function onRequest(ctx) {
   }
 
   return next();
+}
+
+export async function onRequest(ctx) {
+  const res = await handle(ctx);
+  try {
+    if (new URL(ctx.request.url).pathname.startsWith('/api/') && typeof ctx.waitUntil === 'function') {
+      flushSoon(ctx.env, p => ctx.waitUntil(p));
+    }
+  } catch {}
+  return res;
 }

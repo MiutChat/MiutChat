@@ -198,6 +198,421 @@ function _setPersistedBinding(code, dbName) {
   } catch { /* localStorage full/unavailable — falls back to hash-only routing, not fatal */ }
 }
 
+/* ── Usage meter ──────────────────────────────────────────────── */
+const _usageMeter = (() => {
+  const KEY = 'miut_um1_';
+  const ENDPOINT = '/api/usage';
+  const BASE_MS = 300000;
+  const LIVE_MS = 150000;
+  const FLUSH_OPS = 1500;
+  const HIDE_GAP_MS = 45000;
+  const MAX_QUEUE = 20;
+  const SHARD_RE = /^miut-db\d{1,3}$/;
+  const tabId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  const store = (() => { try { return window.localStorage; } catch { return null; } })();
+  const ptFmt = (() => {
+    try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }); }
+    catch { return null; }
+  })();
+  let installed = false, buf = {}, ops = 0, queue = [], failures = 0, sending = false, hadKey = false, lastHideFlush = 0;
+  let flushTimer = null, soonTimer = null, persistTimer = null;
+
+  const args = a => Array.prototype.slice.call(a);
+  const today = () => { const n = Date.now(); return ptFmt ? ptFmt.format(n) : new Date(n).toISOString().slice(0, 10); };
+  const rid = () => {
+    try { const b = new Uint8Array(12); crypto.getRandomValues(b); return Array.from(b, x => x.toString(36).padStart(2, '0')).join(''); }
+    catch { return (Math.random().toString(36).slice(2) + Date.now().toString(36)).padEnd(12, '0').slice(0, 24); }
+  };
+  const shardOf = ref => { try { return ref.firestore.app.name; } catch { return null; } };
+  const hasKeys = o => Object.keys(o).length > 0;
+
+  function readCat(path, q) {
+    const p = String(path).split('/');
+    if (p[0] === 'rooms') {
+      if (p.length < 3) return 'room';
+      if (p[2] === 'messages') return 'messages';
+      if (p[2] === 'members') return q ? 'presence' : 'members';
+      if (p[2] === 'typing') return 'typing';
+      return 'other';
+    }
+    return p[0] === 'config' ? 'config' : p[0] === 'feedback' ? 'feedback' : p[0] === 'announcementPolls' ? 'polls' : 'other';
+  }
+
+  function writeCat(path, op, keys) {
+    const base = readCat(path, false);
+    if (base === 'messages') {
+      if (op === 'set' || op === 'add') return 'send';
+      if (keys.some(k => String(k).indexOf('readBy') === 0)) return 'readack';
+      if (keys.some(k => String(k).indexOf('reactions') === 0)) return 'react';
+      return 'messages';
+    }
+    if (base === 'members' && keys.indexOf('lastSeen') >= 0) return 'heartbeat';
+    return base;
+  }
+
+  function ruleDeps(cat, op) {
+    if (op === 'read') return cat === 'messages' || cat === 'typing' || cat === 'presence' ? ['m'] : [];
+    if (cat === 'messages') return op === 'delete' ? ['m', 'r'] : ['m'];
+    if (cat === 'send' || cat === 'readack' || cat === 'react') return ['m'];
+    if (cat === 'typing') return op === 'delete' ? [] : ['m'];
+    if (cat === 'room') return op === 'set' ? [] : ['r', 'm'];
+    if (cat === 'members') return op === 'set' ? ['r'] : [];
+    return [];
+  }
+
+  function keysOf(a) {
+    if (typeof a[0] === 'string') return a.filter((v, i) => i % 2 === 0 && typeof v === 'string');
+    return a[0] && typeof a[0] === 'object' ? Object.keys(a[0]) : [];
+  }
+
+  function add(shard, cat, r, w, d, x) {
+    if (!shard || !SHARD_RE.test(shard)) return;
+    const dk = today();
+    const day = buf[dk] || (buf[dk] = {});
+    const sh = day[shard] || (day[shard] = {});
+    const v = sh[cat] || (sh[cat] = [0, 0, 0, 0]);
+    v[0] += r; v[1] += w; v[2] += d; v[3] += x;
+    ops += r + w + d + x;
+    schedulePersist();
+    if (ops >= FLUSH_OPS) flushSoon();
+  }
+
+  function countOps(list) {
+    const seen = {};
+    for (const o of list) {
+      const shard = shardOf(o.ref);
+      if (!shard) continue;
+      const cat = writeCat(o.ref.path, o.op, o.keys);
+      const del = o.op === 'delete';
+      let x = 0;
+      for (const dep of ruleDeps(cat, o.op)) { const k = shard + dep; if (!seen[k]) { seen[k] = 1; x++; } }
+      add(shard, cat, 0, del ? 0 : 1, del ? 1 : 0, x);
+    }
+  }
+
+  function targetCat(t) {
+    try {
+      if (typeof t.path === 'string') return readCat(t.path, true);
+      return readCat(t._delegate._query.path.canonicalString(), true);
+    } catch { return 'other'; }
+  }
+
+  function onSnap(snap, ctx) {
+    const meta = snap.metadata;
+    if (!ctx.shard || (meta && meta.fromCache)) return;
+    if (typeof snap.docChanges !== 'function') {
+      if (meta && meta.hasPendingWrites) return;
+      const c = readCat(snap.ref.path, false);
+      add(ctx.shard, c, 1, 0, 0, ruleDeps(c, 'read').length);
+      return;
+    }
+    const per = {};
+    let n = 0;
+    for (const ch of snap.docChanges()) {
+      if (ch.type === 'removed' || (ch.doc.metadata && ch.doc.metadata.hasPendingWrites)) continue;
+      const c = readCat(ch.doc.ref.path, true);
+      per[c] = (per[c] || 0) + 1;
+      n++;
+    }
+    const first = ctx.first;
+    ctx.first = false;
+    if (!n && first) { per[ctx.cat] = 1; n = 1; }
+    if (!n) return;
+    Object.keys(per).forEach((c, i) => add(ctx.shard, c, per[c], 0, 0, i === 0 ? ruleDeps(c, 'read').length : 0));
+  }
+
+  function onGet(snap, target) {
+    const shard = shardOf(target);
+    if (!shard || (snap.metadata && snap.metadata.fromCache)) return;
+    if (typeof snap.docChanges !== 'function') {
+      const c = readCat(target.path, false);
+      add(shard, c, 1, 0, 0, ruleDeps(c, 'read').length);
+      return;
+    }
+    const per = {};
+    snap.docs.forEach(d => { const c = readCat(d.ref.path, true); per[c] = (per[c] || 0) + 1; });
+    if (!snap.docs.length) per[targetCat(target)] = 1;
+    Object.keys(per).forEach((c, i) => add(shard, c, per[c], 0, 0, i === 0 ? ruleDeps(c, 'read').length : 0));
+  }
+
+  function wrapMethod(proto, name, make) {
+    if (!proto || !Object.prototype.hasOwnProperty.call(proto, name)) return;
+    const orig = proto[name];
+    if (typeof orig !== 'function' || orig.__miutMetered) return;
+    const wrapped = make(orig);
+    wrapped.__miutMetered = true;
+    proto[name] = wrapped;
+  }
+
+  function wrapNext(fn, ctx) {
+    return function (snap) {
+      try { onSnap(snap, ctx); } catch {}
+      return fn.apply(this, arguments);
+    };
+  }
+
+  function listen(orig) {
+    return function () {
+      const a = args(arguments);
+      const ctx = { shard: shardOf(this), cat: targetCat(this), first: true };
+      const i = a[0] && typeof a[0] === 'object' && typeof a[0].next !== 'function' ? 1 : 0;
+      const t = a[i];
+      try {
+        if (typeof t === 'function') a[i] = wrapNext(t, ctx);
+        else if (t && typeof t.next === 'function') { const o = Object.create(t); o.next = wrapNext(t.next.bind(t), ctx); a[i] = o; }
+      } catch {}
+      return orig.apply(this, a);
+    };
+  }
+
+  function getter(orig) {
+    return function () {
+      const self = this;
+      const p = orig.apply(this, arguments);
+      try { p.then(s => { try { onGet(s, self); } catch {} }, () => {}); } catch {}
+      return p;
+    };
+  }
+
+  function writer(op) {
+    return function (orig) {
+      return function () {
+        const self = this;
+        const a = args(arguments);
+        const p = orig.apply(this, a);
+        try { p.then(() => { try { countOps([{ ref: self, op, keys: op === 'update' ? keysOf(a) : [] }]); } catch {} }, () => {}); } catch {}
+        return p;
+      };
+    };
+  }
+
+  function adder(orig) {
+    return function () {
+      const self = this;
+      const p = orig.apply(this, arguments);
+      try {
+        p.then(ref => { try { countOps([{ ref: ref || { firestore: self.firestore, path: self.path }, op: 'add', keys: [] }]); } catch {} }, () => {});
+      } catch {}
+      return p;
+    };
+  }
+
+  function patchBatch(b) {
+    if (!b || b.__miutBatch) return b;
+    b.__miutBatch = true;
+    const list = [];
+    ['set', 'update', 'delete'].forEach(op => {
+      const o = b[op];
+      if (typeof o !== 'function') return;
+      b[op] = function (ref) {
+        try { list.push({ ref, op, keys: op === 'update' ? keysOf(args(arguments).slice(1)) : [] }); } catch {}
+        return o.apply(this, arguments);
+      };
+    });
+    const commit = b.commit;
+    if (typeof commit === 'function') {
+      b.commit = function () {
+        const done = list.splice(0);
+        const p = commit.apply(this, arguments);
+        try { p.then(() => { try { countOps(done); } catch {} }, () => {}); } catch {}
+        return p;
+      };
+    }
+    return b;
+  }
+
+  function patchTx(tx, rec) {
+    tx.__miutRec = rec;
+    if (tx.__miutTx) return;
+    tx.__miutTx = true;
+    ['set', 'update', 'delete'].forEach(op => {
+      const o = tx[op];
+      if (typeof o !== 'function') return;
+      tx[op] = function (ref) {
+        try { this.__miutRec.ops.push({ ref, op, keys: op === 'update' ? keysOf(args(arguments).slice(1)) : [] }); } catch {}
+        return o.apply(this, arguments);
+      };
+    });
+    const get = tx.get;
+    if (typeof get === 'function') {
+      tx.get = function (ref) {
+        const p = get.apply(this, arguments);
+        try {
+          p.then(() => {
+            try { const c = readCat(ref.path, false); add(shardOf(ref), c, 1, 0, 0, ruleDeps(c, 'read').length); } catch {}
+          }, () => {});
+        } catch {}
+        return p;
+      };
+    }
+  }
+
+  function attach(fs) {
+    if (!fs || fs.__miutAttached) return;
+    fs.__miutAttached = true;
+    const batch = fs.batch;
+    if (typeof batch === 'function') fs.batch = function () { return patchBatch(batch.apply(this, arguments)); };
+    const run = fs.runTransaction;
+    if (typeof run === 'function') {
+      fs.runTransaction = function (fn, opts) {
+        let last = null;
+        const p = run.call(this, function (tx) {
+          last = { ops: [] };
+          patchTx(tx, last);
+          return fn.apply(this, arguments);
+        }, opts);
+        try { p.then(() => { try { if (last) countOps(last.ops); } catch {} }, () => {}); } catch {}
+        return p;
+      };
+    }
+  }
+
+  function persist() {
+    persistTimer = null;
+    if (!store) return;
+    try {
+      if (!queue.length && !hasKeys(buf)) { store.removeItem(KEY + tabId); hadKey = false; return; }
+      store.setItem(KEY + tabId, JSON.stringify({ t: Date.now(), q: queue, b: buf }));
+      hadKey = true;
+    } catch {}
+  }
+
+  function schedulePersist() { if (!persistTimer) persistTimer = setTimeout(persist, 2000); }
+
+  function toQueue() {
+    if (!hasKeys(buf)) return;
+    queue.push({ rid: rid(), d: buf });
+    buf = {};
+    ops = 0;
+    if (queue.length > MAX_QUEUE) queue.splice(0, queue.length - MAX_QUEUE);
+  }
+
+  function beacon(item) {
+    try {
+      return !!(navigator.sendBeacon && navigator.sendBeacon(ENDPOINT, new Blob([JSON.stringify({ v: 1, rid: item.rid, d: item.d })], { type: 'application/json' })));
+    } catch { return false; }
+  }
+
+  async function post(item) {
+    const body = JSON.stringify({ v: 1, rid: item.rid, d: item.d });
+    const res = await fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: body.length < 60000 });
+    return res.ok || res.status === 400 || res.status === 413;
+  }
+
+  function schedule() {
+    clearTimeout(flushTimer);
+    const delay = BASE_MS * Math.pow(2, Math.min(failures, 3)) * (0.8 + Math.random() * 0.4);
+    flushTimer = setTimeout(() => flush(false), delay);
+  }
+
+  function flushSoon() {
+    if (soonTimer) return;
+    soonTimer = setTimeout(() => { soonTimer = null; flush(false); }, 2000);
+  }
+
+  async function flush(unloading) {
+    toQueue();
+    if (unloading) {
+      queue = queue.filter(it => !beacon(it));
+      persist();
+      return;
+    }
+    if (sending || !queue.length) { persist(); return; }
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) { persist(); return; }
+    sending = true;
+    try {
+      while (queue.length) {
+        let ok = false;
+        try { ok = await post(queue[0]); } catch {}
+        if (!ok) { failures++; break; }
+        queue.shift();
+        failures = 0;
+      }
+    } finally {
+      sending = false;
+      persist();
+      schedule();
+    }
+  }
+
+  function adopt() {
+    if (!store) return;
+    const run = () => {
+      try {
+        const now = Date.now();
+        for (let i = store.length - 1; i >= 0; i--) {
+          const k = store.key(i);
+          if (!k || k.indexOf(KEY) !== 0 || k === KEY + tabId) continue;
+          let v = null;
+          try { v = JSON.parse(store.getItem(k)); } catch {}
+          if (v && now - v.t < LIVE_MS) continue;
+          store.removeItem(k);
+          if (!v) continue;
+          (v.q || []).forEach(it => queue.push(it));
+          if (v.b && hasKeys(v.b)) queue.push({ rid: rid(), d: v.b });
+        }
+        if (queue.length > MAX_QUEUE) queue.splice(0, queue.length - MAX_QUEUE);
+        if (queue.length) { persist(); flushSoon(); }
+      } catch {}
+    };
+    try {
+      if (navigator.locks && navigator.locks.request) navigator.locks.request('miut-um-adopt', run).catch(() => {});
+      else run();
+    } catch { run(); }
+  }
+
+  function dropIfAdopted() {
+    if (!hadKey || !store) return;
+    try {
+      if (store.getItem(KEY + tabId)) return;
+      buf = {}; queue = []; ops = 0; hadKey = false;
+    } catch {}
+  }
+
+  function lifecycle() {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        persist();
+        const n = Date.now();
+        if (n - lastHideFlush >= HIDE_GAP_MS) { lastHideFlush = n; flush(true); }
+      } else {
+        dropIfAdopted();
+        adopt();
+        flushSoon();
+      }
+    });
+    window.addEventListener('pagehide', () => { flush(true); });
+    document.addEventListener('freeze', () => { persist(); flush(true); });
+    document.addEventListener('resume', () => { dropIfAdopted(); });
+    window.addEventListener('online', () => flushSoon());
+    setInterval(() => { if (hasKeys(buf) || queue.length) persist(); }, 30000);
+  }
+
+  function install(fb) {
+    if (installed || !fb || !fb.firestore) return;
+    installed = true;
+    const ns = fb.firestore;
+    const doc = ns.DocumentReference && ns.DocumentReference.prototype;
+    const qry = ns.Query && ns.Query.prototype;
+    const col = ns.CollectionReference && ns.CollectionReference.prototype;
+    [doc, qry, col].forEach(p => { wrapMethod(p, 'onSnapshot', listen); wrapMethod(p, 'get', getter); });
+    ['set', 'update', 'delete'].forEach(op => wrapMethod(doc, op, writer(op)));
+    wrapMethod(col, 'add', adder);
+    adopt();
+    lifecycle();
+    schedule();
+  }
+
+  return {
+    install, attach,
+    flush: () => flush(false),
+    state: () => ({ buf, queue, ops, failures }),
+  };
+})();
+window.flushUsageMeter = () => _usageMeter.flush();
+window.getUsageMeterState = () => _usageMeter.state();
+/* ── end usage meter ─────────────────────────────────────────── */
+
 /* Initialised Firestore instances */
 const _instances = new Map();
 
@@ -218,7 +633,9 @@ function _initDb(cfg) {
     try { app = firebase.initializeApp(cfg.config, cfg.name); }
     catch (e2) { throw new Error(`Firebase initializeApp failed for "${cfg.name}": ${e2.message}`); }
   }
+  try { _usageMeter.install(firebase); } catch {}
   const fs = firebase.firestore(app);
+  try { _usageMeter.attach(fs); } catch {}
   fs.enablePersistence({ synchronizeTabs: true }).catch(() => {});
   _instances.set(cfg.name, fs);
   return fs;

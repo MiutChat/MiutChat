@@ -63,6 +63,8 @@
 
 'use strict';
 
+import { ledgerAdd } from '../_lib/usage-ledger.js';
+
 function discoverShards(env) {
   const shards = [{
     name:   'miut-db0',
@@ -169,8 +171,9 @@ async function restGetDoc(projectId, token, path) {
     `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${path}`,
     { headers: { 'Authorization': `Bearer ${token}` } }
   );
-  if (res.status === 404) return null;
+  if (res.status === 404) { ledgerAdd('registry', 'registry', 1); return null; }
   if (!res.ok) throw new Error(`REST GET ${path} → ${res.status}`);
+  ledgerAdd('registry', 'registry', 1);
   const doc = await res.json();
   return decodeFields(doc.fields);
 }
@@ -185,6 +188,7 @@ async function restSetDoc(projectId, token, path, obj) {
     }
   );
   if (!res.ok) throw new Error(`REST PATCH ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
+  ledgerAdd('registry', 'registry', 0, 1);
 }
 
 // Partial write via updateMask — merges the given fields into the existing document instead of replacing it, so
@@ -200,6 +204,7 @@ async function restMergeDoc(projectId, token, path, obj) {
     }
   );
   if (!res.ok) throw new Error(`REST PATCH(merge) ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
+  ledgerAdd('registry', 'registry', 0, 1);
 }
 
 async function restCreateDocIfAbsent(projectId, token, path, obj) {
@@ -211,7 +216,7 @@ async function restCreateDocIfAbsent(projectId, token, path, obj) {
       body: JSON.stringify({ fields: encodeFields(obj) }),
     }
   );
-  if (res.ok) return true;
+  if (res.ok) { ledgerAdd('registry', 'registry', 0, 1); return true; }
   const text = await res.text().catch(() => '');
   if (res.status === 409 || (res.status === 400 && /ALREADY_EXISTS|FAILED_PRECONDITION/.test(text))) return false;
   throw new Error(`REST PATCH ${path} → ${res.status}: ${text}`);
@@ -234,6 +239,7 @@ async function restIncrement(projectId, token, path, field) {
     }
   );
   if (!res.ok) throw new Error(`REST COMMIT ${path} → ${res.status}: ${await res.text().catch(() => '')}`);
+  ledgerAdd('registry', 'registry', 0, 1);
 }
 
 // ── Placement policy ────────────────────────────────────────────────────
@@ -294,6 +300,7 @@ async function restDeleteDoc(projectId, token, path) {
     { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } }
   );
   if (!res.ok && res.status !== 404) throw new Error(`REST DELETE ${path} -> ${res.status}`);
+  if (res.ok) ledgerAdd('registry', 'registry', 0, 0, 1);
 }
 
 async function restListDocs(projectId, token, collection, pageSize, pageToken) {
@@ -304,6 +311,7 @@ async function restListDocs(projectId, token, collection, pageSize, pageToken) {
   );
   if (!res.ok) throw new Error(`REST LIST ${collection} -> ${res.status}`);
   const j = await res.json();
+  ledgerAdd('registry', 'registry', Math.max(1, (j.documents || []).length));
   return { docs: (j.documents || []).map(d => ({ id: decodeURIComponent(d.name.split('/').pop()), data: decodeFields(d.fields) })), next: j.nextPageToken || null };
 }
 

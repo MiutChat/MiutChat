@@ -71,7 +71,7 @@ export async function onRequestPost(context) {
   const budget = new Budget(44);   // one shared budget: the platform limit is per invocation, not per shard
   try {
     for (const shard of shards) {
-      const client = makeClient(shard, budget);
+      const client = makeClient(shard, budget, undefined, 'expire');
       const room = await client.getRoom(code);
       if (!room) continue;
       sawRoom = true;

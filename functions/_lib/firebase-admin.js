@@ -22,6 +22,8 @@
 
 'use strict';
 
+import { ledgerAdd } from './usage-ledger.js';
+
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 // A single token carries both scopes. Requesting monitoring.read costs
 // nothing and breaks nothing even on a shard that hasn't been granted it —
@@ -130,7 +132,7 @@ export async function getAccessTokenCached(sa, fetchImpl = fetch) {
 export function dropCachedToken(sa) { _tokenCache.delete(_tokenKey(sa)); }
 
 // ── Firestore REST client ───────────────────────────────────────────────────
-export function makeClient(shard, budget, fetchImpl = fetch) {
+export function makeClient(shard, budget, fetchImpl = fetch, cat = 'cleanup') {
   const root = `projects/${shard.projectId}/databases/(default)/documents`;
   const base = `https://firestore.googleapis.com/v1/${root}`;
   let token = null;
@@ -148,8 +150,9 @@ export function makeClient(shard, budget, fetchImpl = fetch) {
     /** GET rooms/{code} → decoded fields or null if it doesn't exist. */
     async getRoom(code) {
       const res = await call(`${base}/rooms/${encodeURIComponent(code)}`);
-      if (res.status === 404) return null;
+      if (res.status === 404) { ledgerAdd(shard.name, cat, 1); return null; }
       if (!res.ok) throw new Error('getRoom ' + res.status);
+      ledgerAdd(shard.name, cat, 1);
       return (await res.json()).fields || {};
     },
 
@@ -158,7 +161,9 @@ export function makeClient(shard, budget, fetchImpl = fetch) {
       const url = `${base}${parent ? '/' + parent : ''}:runQuery`;
       const res = await call(url, { method: 'POST', body: JSON.stringify({ structuredQuery }) });
       if (!res.ok) throw new Error('runQuery ' + res.status);
-      return (await res.json()).filter(r => r.document);
+      const rows = (await res.json()).filter(r => r.document);
+      ledgerAdd(shard.name, cat, Math.max(1, rows.length));
+      return rows;
     },
 
     /** Delete up to 500 documents (full resource names) in one request. */
@@ -169,12 +174,17 @@ export function makeClient(shard, budget, fetchImpl = fetch) {
           body: JSON.stringify({ writes: names.slice(i, i + 500).map(n => ({ delete: n })) }),
         });
         if (!res.ok) throw new Error('batchWrite ' + res.status);
+        const chunk = Math.min(500, names.length - i);
+        const results = await res.json().catch(() => null);
+        const failed = results && Array.isArray(results.status) ? results.status.filter(s => s && s.code).length : 0;
+        ledgerAdd(shard.name, cat, 0, 0, chunk - failed);
       }
     },
 
     async deleteDoc(path) {
       const res = await call(`${base}/${path}`, { method: 'DELETE' });
       if (!res.ok && res.status !== 404) throw new Error('deleteDoc ' + res.status);
+      if (res.ok) ledgerAdd(shard.name, cat, 0, 0, 1);
     },
   };
 }
