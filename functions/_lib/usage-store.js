@@ -69,6 +69,27 @@ async function commitDays(env, days, fetchImpl) {
 
 export const recordUsage = (env, report, fetchImpl = fetch) => commitDays(env, report.days, fetchImpl);
 
+export function shardQuotaPct(dayFields, shard) {
+  const cats = (dayFields && dayFields.s && dayFields.s[fieldKey(shard)]) || {};
+  let r = 0, w = 0, d = 0, x = 0;
+  for (const c of Object.values(cats)) { r += c.r || 0; w += c.w || 0; d += c.d || 0; x += c.x || 0; }
+  return {
+    reads: 100 * (r + x) / LIMITS.reads,
+    writes: 100 * w / LIMITS.writes,
+    deletes: 100 * d / LIMITS.deletes,
+  };
+}
+
+export async function readTodayUsage(env, fetchImpl = fetch, now = Date.now()) {
+  const reg = registryAdmin(env);
+  if (!reg) return null;
+  const { call } = api(reg, fetchImpl);
+  const res = await call('/usage_daily/' + pacificDay(now));
+  if (res.status === 404) return {};
+  if (!res.ok) return null;
+  return decodeFields((await res.json()).fields);
+}
+
 const seen = new Map();
 export function claimRid(rid, now = Date.now()) {
   for (const [k, t] of seen) {

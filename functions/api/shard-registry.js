@@ -64,6 +64,8 @@
 'use strict';
 
 import { ledgerAdd } from '../_lib/usage-ledger.js';
+import { registryAdmin } from '../_lib/analytics-store.js';
+import { readTodayUsage, shardQuotaPct } from '../_lib/usage-store.js';
 
 function discoverShards(env) {
   const shards = [{
@@ -95,35 +97,6 @@ function json(obj, status) {
 // relied upon: a cold isolate just signs up fresh, same as before. This is
 // purely a latency/account-proliferation optimization, not a correctness
 // dependency — nothing here assumes the cache survives.
-const PENDING_PICK_MS = 20000;
-const _pendingPicks = new Map();
-
-function pendingCount(name) {
-  const now = Date.now();
-  const live = (_pendingPicks.get(name) || []).filter(t => t > now);
-  _pendingPicks.set(name, live);
-  return live.length;
-}
-
-function reservePick(name) {
-  const token = Date.now() + PENDING_PICK_MS;
-  const list = _pendingPicks.get(name) || [];
-  list.push(token);
-  _pendingPicks.set(name, list);
-  return token;
-}
-
-function releasePick(name, token) {
-  const list = _pendingPicks.get(name) || [];
-  const i = list.indexOf(token);
-  if (i >= 0) list.splice(i, 1);
-}
-
-function settlePick(name) {
-  const list = _pendingPicks.get(name) || [];
-  list.sort((a, b) => a - b).shift();
-}
-
 let _cachedToken = null, _cachedTokenExp = 0;
 
 async function getFirebaseToken(apiKey) {
@@ -247,6 +220,11 @@ async function restIncrement(projectId, token, path, field) {
 // unrelated to the (now non-resetting) room count, just a safety valve so a
 // shard doesn't stay excluded forever if nothing ever re-checks it.
 const DEGRADED_MS = 8 * 3600 * 1000;
+
+// A shard at/above this % of its Spark daily quota (reads, writes or deletes
+// — whichever hits first) is skipped for new placements until usage_daily
+// rolls to the next Pacific day and the % drops back to 0 on its own.
+const QUOTA_CUTOFF_PCT = 90;
 
 
 // ── Hashed bindings ──────────────────────────────────────────────────────
@@ -438,7 +416,7 @@ export async function onRequest(ctx) {
 
     const replace = body?.replace === true;
 
-    const [existing, scored] = await Promise.all([
+    const [existing, scored, dayUsage] = await Promise.all([
       replace ? null : findBinding(projectId, token, ident, env, names).catch(() => null),
       Promise.all(shards.map(async s => {
         let load = null;
@@ -447,39 +425,37 @@ export async function onRequest(ctx) {
         const degraded = !!(load && load.degradedUntil && load.degradedUntil > Date.now());
         return { name: s.name, count, degraded, prevLoad: load };
       })),
+      readTodayUsage(env).catch(() => null),
     ]);
     if (existing?.db && names.has(existing.db)) {
       return json({ db: existing.db, isNew: false });
     }
 
-    const live = scored.map(s => ({ ...s, count: s.count + pendingCount(s.name) }));
-    const healthy = live.filter(s => !s.degraded);
-    const pool = healthy.length ? healthy : live; // every shard degraded → still answer with the least-bad option
-    // Array.sort is stable, so a naive pool[0] after sorting always breaks
-    // ties toward whichever shard appears first in `shards` — which is
-    // always miut-db0. Since `confirm` (below) is fire-and-forget and not
-    // awaited before the next room can be created, back-to-back creates
-    // routinely see a tie (the previous room's confirm hasn't landed yet),
-    // so that deterministic tie-break meant db0 could win every single
-    // time under normal rapid use, not just occasionally. Pick uniformly
-    // at random among whichever shards are tied for the lowest count
-    // instead, so ties actually spread load rather than piling onto one
-    // shard.
-    const minCount = Math.min(...pool.map(s => s.count));
-    const tied = pool.filter(s => s.count === minCount);
-    const chosen = tied[Math.floor(Math.random() * tied.length)];
-    const reservation = reservePick(chosen.name);
+    const live = scored.map(s => {
+      const pct = dayUsage ? shardQuotaPct(dayUsage, s.name) : { reads: 0, writes: 0, deletes: 0 };
+      const pressure = Math.max(pct.reads, pct.writes, pct.deletes);
+      return { ...s, pct, pressure, nearQuota: pressure >= QUOTA_CUTOFF_PCT };
+    });
+    // Least read/write pressure today wins, among whichever tier is
+    // available (not degraded and under quota, else not degraded, else
+    // anyone). Ties — including every shard at 0% on a fresh Pacific
+    // day, or with no usage data at all — keep the first strictly-lower
+    // shard found, which is miut-db0, so a quiet day starts there same
+    // as before; from then on the actual usage decides.
+    const pickLeast = pool => pool.reduce((best, s) => (s.pressure < best.pressure ? s : best));
+    const notDegraded = live.filter(s => !s.degraded);
+    const underQuota = notDegraded.filter(s => !s.nearQuota);
+    const chosen = pickLeast(underQuota.length ? underQuota : notDegraded.length ? notDegraded : live);
 
     try {
       if (replace) {
         await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name });
       } else if (!(await restCreateDocIfAbsent(projectId, token, `bindings/${ident.id}`, { db: chosen.name }))) {
         const winner = await restGetDoc(projectId, token, `bindings/${ident.id}`).catch(() => null);
-        if (winner?.db && names.has(winner.db)) { releasePick(chosen.name, reservation); return json({ db: winner.db, isNew: false }); }
+        if (winner?.db && names.has(winner.db)) { return json({ db: winner.db, isNew: false }); }
         await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name });
       }
     } catch (e) {
-      releasePick(chosen.name, reservation);
       // Do NOT return { db: chosen.name } here — that would tell the client
       // "this room is on shard X" while the registry's own record of that
       // fact doesn't exist. A later resolve() for this same room (this
@@ -518,7 +494,6 @@ export async function onRequest(ctx) {
     const ident = await identify(body, env), db = body?.db;
     if (ident.error) return json({ error: ident.error }, 400);
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
-    settlePick(db);
     try {
       await restIncrement(projectId, token, `shardLoad/${db}`, 'count');
     } catch { /* best-effort — a missed confirm just slightly under-counts that shard, harmless */ }
@@ -579,14 +554,18 @@ export async function onRequest(ctx) {
 
   // ── status: current per-shard health, for the admin/debug console ──
   if (action === 'status') {
+    const dayUsage = await readTodayUsage(env).catch(() => null);
     const status = await Promise.all(shards.map(async s => {
       let load = null;
       try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
+      const pct = dayUsage ? shardQuotaPct(dayUsage, s.name) : { reads: 0, writes: 0, deletes: 0 };
       return {
         name: s.name,
         roomsTotal: load?.count || 0,
         degraded: !!(load && load.degradedUntil && load.degradedUntil > Date.now()),
         degradedUntil: (load && load.degradedUntil > Date.now()) ? load.degradedUntil : null,
+        quotaPct: pct,
+        nearQuota: pct.reads >= QUOTA_CUTOFF_PCT || pct.writes >= QUOTA_CUTOFF_PCT || pct.deletes >= QUOTA_CUTOFF_PCT,
       };
     }));
     return json({ shards: status });
