@@ -25,14 +25,7 @@
 import { ledgerAdd } from './usage-ledger.js';
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
-// A single token carries both scopes. Requesting monitoring.read costs
-// nothing and breaks nothing even on a shard that hasn't been granted it —
-// IAM is checked per API call, not at token-mint time, so every existing
-// Firestore call (writes, deletes, count()) keeps working exactly as before
-// whether or not a given shard's service account has the Monitor Viewer
-// role. Only an actual Monitoring API call on an ungranted shard will fail
-// (handled in monitoring.js), never this.
-const SCOPE     = 'https://www.googleapis.com/auth/datastore https://www.googleapis.com/auth/monitoring.read';
+const SCOPE     = 'https://www.googleapis.com/auth/datastore';
 const PAGE      = 300;   // docs per query/batch (Firestore batchWrite max is 500)
 
 export class BudgetExceeded extends Error {
@@ -212,8 +205,7 @@ export function isInstantExpiry(room) {
   return !!f && (f.integerValue === '0' || f.doubleValue === 0);
 }
 
-/** Any member flagged online whose heartbeat is fresh (heartbeat is every 30 s; 4 missed beats = gone). */
-export async function hasRecentlyOnlineMember(client, code, windowMs = 120000) {
+export async function hasRecentlyOnlineMember(client, code, windowMs = 480000) {
   const rows = await client.runQuery(`rooms/${encodeURIComponent(code)}`, {
     from: [{ collectionId: 'members' }],
     where: { fieldFilter: { field: { fieldPath: 'online' }, op: 'EQUAL', value: { booleanValue: true } } },

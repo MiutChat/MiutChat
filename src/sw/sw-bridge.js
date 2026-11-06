@@ -224,6 +224,9 @@ async function saveSubscriptionForRoom(sub) {
     await database.collection('rooms').doc(st.roomCode)
       .collection('members').doc(st.me.id)
       .update({ pushSubscription: sub.toJSON() });
+    const me = st.me.id;
+    const indexed = window.getRoomPushUids?.();
+    if (!Array.isArray(indexed) || indexed.indexOf(me) < 0) window.syncPushRoomIndex?.();
     return { ok: true, reason: null };
   } catch (e) {
     const reason = e?.code || e?.message || String(e);
@@ -328,7 +331,12 @@ window.disablePush = async function() {
   const database = window.db || null;
   if (st?.me?.id && st?.roomCode && database) {
     database.collection('rooms').doc(st.roomCode).collection('members').doc(st.me.id)
-      .update({ pushSubscription: null }).catch(() => {});
+      .update({ pushSubscription: null })
+      .then(() => {
+        const u = window.getRoomPushUids?.();
+        if (!Array.isArray(u) || u.indexOf(st.me.id) >= 0) window.syncPushRoomIndex?.();
+      })
+      .catch(() => {});
   }
 };
 

@@ -88,10 +88,12 @@ export const CONFIG = {
   SESSION_KEY:        'miut_session_v2',
   ROOM_KEY:           'miut_room_v1',
   PREFS_KEY:          'miut_prefs_v1',
-  TYPING_WRITE_MS:    4000,
+  TYPING_WRITE_MS:    6000,
   TYPING_EXPIRE_MS:   9000,
   TYPING_IDLE_MS:     3500,
-  HEARTBEAT_MS:       30000,   // presence is read as online while lastSeen < 90s (see _staleMs) — keep >= 3x this
+  HEARTBEAT_MS:       90000,
+  HEARTBEAT_SOLO_MS:  180000,
+  PRESENCE_STALE_MS:  300000,
   MAX_FILE_BYTES:     25 * 1024 * 1024,
 
 
@@ -416,6 +418,7 @@ async function clearCacheForRoom(room) {
 export let _roomEpoch   = 0;
 export let _roomSalt    = /** @type {string|null} */ (null); // null = legacy deterministic salt
 let _unsubRoom   = null;
+let _roomPushUids = null;
 
 const _importedPubKeys = _lruMap(200);  // b64 → CryptoKey
 
@@ -1671,6 +1674,7 @@ async function handleEnter() {
       // D7: check if the room has approval required (stored on room doc)
       const roomData          = roomSnap.data();
       const approvalRequired  = roomData?.approvalRequired === true;
+      _setRoomPush(roomData);
 
       if (approvalRequired) {
         // Gate — register as pending and show waiting screen
@@ -2278,6 +2282,8 @@ function startRoomListener() {
         return;
       }
       const d = snap.data() || {};
+      _roomPushUids = Array.isArray(d.pushUids) ? d.pushUids : null;
+      _roomAutoDeleteSet = d.autoDeleteAt != null;
       const _mgr = d.membersCanManage === true;
       if (_mgr !== _membersCanManage) { _membersCanManage = _mgr; _refreshManageUI(); }
       if (state.me?.id && Array.isArray(d.blockedUsers) && d.blockedUsers.includes(state.me.id)) {
@@ -2424,7 +2430,49 @@ function _isMsgExpired(data, ttlMs = _roomTtlMs) {
 
 // Delete an already-expired message (all chunks if it is a chunked file) from
 // Firestore and the local IDB cache. Never renders it.
+const _purgeTimers = new Map();
+
+function _isPurger() {
+  const me = state.me?.id;
+  if (!me || !_lastMembersSnap) return true;
+  let min = null;
+  _lastMembersSnap.docs.forEach(d => {
+    if (d.data()?.online && (min === null || d.id < min)) min = d.id;
+  });
+  return min === null || min === me;
+}
+
+function _cancelPurge(docId) {
+  const t = _purgeTimers.get(docId);
+  if (!t) return;
+  clearTimeout(t);
+  _purgeTimers.delete(docId);
+}
+
+function _clearPurgeTimers() {
+  _purgeTimers.forEach(t => clearTimeout(t));
+  _purgeTimers.clear();
+}
+
+function _dropCachedMsg(docId) {
+  openIDB().then(db2 => new Promise(res => {
+    const tx = db2.transaction('msgs', 'readwrite');
+    tx.objectStore('msgs').delete(docId);
+    tx.oncomplete = res; tx.onerror = res;
+  })).catch(() => {});
+}
+
 function _purgeExpiredDoc(code, docId, data, onDeleted) {
+  if (_isPurger()) { _purgeExpiredNow(code, docId, data, onDeleted); return; }
+  _dropCachedMsg(docId);
+  if (_purgeTimers.has(docId)) return;
+  _purgeTimers.set(docId, setTimeout(() => {
+    _purgeTimers.delete(docId);
+    _purgeExpiredNow(code, docId, data, onDeleted);
+  }, 20000 + Math.floor(Math.random() * 10000)));
+}
+
+function _purgeExpiredNow(code, docId, data, onDeleted) {
   try {
     const col = db.collection('rooms').doc(code).collection('messages');
     const gid = data && data.groupId;
@@ -2437,11 +2485,7 @@ function _purgeExpiredDoc(code, docId, data, onDeleted) {
     p.then(() => { _log('debug', '[MIUT ttl] purged expired message:', docId); if (onDeleted) onDeleted(); })
      .catch(e => _log('warn', '[MIUT ttl] expired purge rejected (check Firestore rules):', docId, e));
   } catch (e) {}
-  openIDB().then(db2 => new Promise(res => {
-    const tx = db2.transaction('msgs', 'readwrite');
-    tx.objectStore('msgs').delete(docId);
-    tx.oncomplete = res; tx.onerror = res;
-  })).catch(() => {});
+  _dropCachedMsg(docId);
 }
 
 function _startExpirySweep() {
@@ -2569,6 +2613,7 @@ async function _runBacklogSweepLoop(fetchPage, deletePage, pageSize, maxPages = 
 
 async function _sweepExpiredBacklog(code, ttlMs) {
   if (!ttlMs || ttlMs <= 0 || !code || !db) return;
+  if (!_isPurger()) return;
   if (_backlogSweepInFlight) return; // avoid overlapping sweeps (boot + listener firing close together)
   _backlogSweepInFlight = true;
   try {
@@ -2971,13 +3016,13 @@ function startPresenceListener() {
       // Only wipe if NO approved members exist at all (not just online ones)
       // so offline-but-approved members don't lose their room.
       // Count truly-online members: online:true AND heartbeat within 90s
-      const _staleMs = Date.now() - 90000;
+      const _staleMs = Date.now() - CONFIG.PRESENCE_STALE_MS;
       let _realOnlineCount = 0;
       snap.docs.forEach(d => {
         const md = d.data();
         if (!md.online) return;
         const hb = md.lastSeen?.toMillis ? md.lastSeen.toMillis() : (md.lastSeen || 0);
-        if (hb > _staleMs) _realOnlineCount++;
+        if (d.id === state.me?.id || hb > _staleMs) _realOnlineCount++;
       });
 
       if (_presenceSettled && _realOnlineCount === 0 && state.me) {
@@ -3164,6 +3209,7 @@ export function startChatListeners() {
         : true;
       let hasNew = false;
       for (const ch of snap.docChanges()) {
+        if (ch.type === 'removed') { _cancelPurge(ch.doc.id); continue; }
         if (ch.type === 'modified') { patchMsg(ch.doc.id, ch.doc.data()); continue; }
         if (ch.type !== 'added') continue;
         const id = ch.doc.id, data = ch.doc.data();
@@ -3276,6 +3322,10 @@ export function stopChatListeners() {
 }
 
 function stopListeners() {
+  _roomPushUids = null;
+  _roomAutoDeleteSet = false;
+  _ackedIds = new Set();
+  _clearPurgeTimers();
   stopChatListeners();
   if (_unsubMembers) { try { _unsubMembers(); } catch {} _unsubMembers = null; }
   if (_unsubRoom)    { try { _unsubRoom();    } catch {} _unsubRoom    = null; }
@@ -3518,15 +3568,22 @@ function _unblurScreen() {
  * startPresenceListener when the room is actually detected as empty — not
  * here; while people are chatting, nothing should be scheduled at all. */
 let _extendTimer = null;
+let _lastTtlWrite = 0;
+let _roomAutoDeleteSet = false;
+
 function _extendRoomTtl() {
   if (!state.roomCode || !db) return;
-  if (_extendTimer) return;           // already scheduled this second
+  if (_extendTimer) return;
+  const ttl = _roomExpiryMs > 0 ? _roomExpiryMs : 300000;
+  const gap = _roomAutoDeleteSet ? 0 : Math.min(60000, Math.floor(ttl / 5));
+  const wait = Math.max(2000, gap - (Date.now() - _lastTtlWrite));
   _extendTimer = setTimeout(() => {
     _extendTimer = null;
+    _lastTtlWrite = Date.now();
     db.collection('rooms').doc(state.roomCode)
       .update({ autoDeleteAt: null, lastActivity: ts_now() })
       .catch(() => {});
-  }, 2000);                          // debounce 2s so rapid typing = 1 write
+  }, wait);
 }
 
 /**
@@ -3845,18 +3902,24 @@ async function wipeRoom(code, fsInstance) {
   }
 }
 
+function _heartbeatDelay() {
+  return _onlineCount > 1 ? CONFIG.HEARTBEAT_MS : CONFIG.HEARTBEAT_SOLO_MS;
+}
+
 function startHeartbeat() {
-  clearInterval(_heartbeat);
-  _heartbeat = setInterval(() => {
-    // Deprioritized (background priority) — a presence ping has no
-    // deadline worth preempting typing/clicks/message render for.
-    _runBackground(() => {
-      if (!state.roomCode || !state.me) return;
-      if (document.hidden) return;
-      db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
-        .update({ online: true, lastSeen: ts_now() }).catch(() => {});
-    });
-  }, CONFIG.HEARTBEAT_MS);
+  clearTimeout(_heartbeat);
+  const schedule = () => {
+    _heartbeat = setTimeout(() => {
+      _runBackground(() => {
+        if (!state.roomCode || !state.me) return;
+        if (document.hidden) return;
+        db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
+          .update({ online: true, lastSeen: ts_now() }).catch(() => {});
+      });
+      schedule();
+    }, _heartbeatDelay());
+  };
+  schedule();
 }
 
 // Brief tab/app switches (notification shade, app switcher) don't need the live
@@ -4097,8 +4160,10 @@ async function sendSys(text, roomCodeOverride, meOverride) {
 // We batch-write receipts every 1.5s to avoid per-message Firestore writes.
 // Senders watch `patchMsg` which detects readBy changes and updates the ✓✓ UI.
 
+let _ackedIds = new Set();
+
 function _queueReadAck(docId) {
-  if (!docId || !state.me?.id) return;
+  if (!docId || !state.me?.id || _ackedIds.has(docId)) return;
   _pendingReadAcks.add(docId);
   if (_readReceiptTimer) return; // already scheduled
   _readReceiptTimer = setTimeout(_flushReadAcks, 1500);
@@ -4125,7 +4190,8 @@ async function _flushReadAcks() {
     batch.update(ref, { [`readBy.${state.me.id}`]: Date.now() });
     count++;
   }
-  if (count) batch.commit().catch(() => {});
+  ids.forEach(id => _ackedIds.add(id));
+  if (count) batch.commit().catch(() => { ids.forEach(id => _ackedIds.delete(id)); });
 
   if (_pendingReadAcks.size && !_readReceiptTimer) {
     _readReceiptTimer = setTimeout(_flushReadAcks, 300);
@@ -4205,6 +4271,7 @@ function handleTyping(el) {
   handleMentionInput(el);
   updateActionBtn();
   if (!state.roomCode || !state.me) return;
+  if (_onlineCount <= 1) return;
 
   const now = Date.now();
   if (!_isTyping || now - _lastTypeWrite >= CONFIG.TYPING_WRITE_MS) {
@@ -4355,6 +4422,7 @@ function _scheduleDecryptRetry(wrap, data, docId, onHealed) {
 }
 
 export async function renderMsg(data, docId, insertBeforeEl) {
+  if (data?.readBy && state.me?.id && data.readBy[state.me.id]) _ackedIds.add(docId);
   const area = $('messages-area'); if (!area) return;
 
   // Hide the empty-room welcome/skeleton state as soon as ANY message
@@ -5820,6 +5888,7 @@ async function joinFromInvite() {
       bootApp();
     } else {
       const approvalRequired = roomSnap.data()?.approvalRequired === true;
+      _setRoomPush(roomSnap.data());
       if (approvalRequired) {
         await registerPresence('member', false, !prevData, prevData);
         _notifyRoomEvent('join-request'); // admins only — see functions/api/notify.js
@@ -6322,8 +6391,19 @@ function setupActionBtn() {
 // when an ADMIN's approval is what finalizes someone ELSE's join: the
 // notification should be about the new member, not the admin who
 // clicked approve.
+function _setRoomPush(data) {
+  _roomPushUids = Array.isArray(data?.pushUids) ? data.pushUids : null;
+}
+
+function _nobodyToPush() {
+  if (!Array.isArray(_roomPushUids)) return false;
+  const me = state.me?.id;
+  return !_roomPushUids.some(u => u !== me);
+}
+
 function _notifyRoomEvent(type, extra = {}) {
   if (!state.roomCode) return;
+  if (type !== 'sync' && _nobodyToPush()) return;
   try {
     fetch('/api/notify', {
       method:  'POST',
@@ -6332,6 +6412,7 @@ function _notifyRoomEvent(type, extra = {}) {
         roomCode:   state.roomCode,
         shard:      db?.app?.name || 'miut-db0',
         type,
+        indexCount: Array.isArray(_roomPushUids) ? _roomPushUids.length : null,
         senderId:   state.me?.id   || '',
         senderName: state.me?.name || '',
         ...extra,
@@ -6339,6 +6420,13 @@ function _notifyRoomEvent(type, extra = {}) {
     }).catch(() => {});
   } catch {}
 }
+
+window.getRoomPushUids = () => _roomPushUids;
+window.syncPushRoomIndex = () => {
+  const me = state.me?.id;
+  if (!me || !state.roomCode) return;
+  _notifyRoomEvent('sync');
+};
 
 export function _notifyRoomOfNewMessage() {
   if (!state.me?.id) return;
