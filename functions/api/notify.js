@@ -2,8 +2,11 @@
  * MIUT — /functions/api/notify.js
  *
  * Fires real Web Push notifications (RFC 8291 aes128gcm encryption +
- * RFC 8292 VAPID) to every OTHER member of a room who has an active push
- * subscription, whenever a new message is sent. Called fire-and-forget by
+ * RFC 8292 VAPID) to every OTHER approved member of a room who has an active
+ * push subscription, whenever a new message is sent. Also handles
+ * type 'join-request' (admins only), 'member-joined' (everyone else) and
+ * 'sync' (recompute rooms/{code}.pushUids, the list of subscribed members the
+ * client checks so it never calls this endpoint when nobody could receive). Called fire-and-forget by
  * the client right after a message write succeeds — see sendMessage() in
  * app.js. Carries NO message content (title/body only say "New message
  * from <name>"), so E2EE is untouched: the push payload itself is still
@@ -57,6 +60,7 @@
 'use strict';
 
 import { ledgerAdd } from '../_lib/usage-ledger.js';
+import { getAccessTokenCached } from '../_lib/firebase-admin.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 
@@ -84,7 +88,7 @@ function concatBytes(...arrs) {
 
 // ── shard discovery — same pattern as cleanup.js ────────────────────────
 // Each shard now ALSO carries an optional `saJson` — a Google Cloud
-// service-account key JSON (see getServiceAccountToken below). This is a
+// service-account key JSON (exchanged for a token via getAccessTokenCached in firebase-admin.js). This is a
 // different, additive credential from apiKey/projectId: apiKey is still
 // used by config.js for the public client config, but this file no
 // longer authenticates with it (see why below).
@@ -111,71 +115,28 @@ function discoverShards(env) {
   return shards;
 }
 
-// Decodes a PEM block (standard base64, NOT base64url — PEM uses '+'/'/'
-// and '=' padding, which atob() already understands directly) into raw
-// DER bytes, for crypto.subtle.importKey('pkcs8', ...).
-function pemToBytes(pem) {
-  const b64 = pem.replace(/-----BEGIN [^-]+-----/g, '').replace(/-----END [^-]+-----/g, '').replace(/\s+/g, '');
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
+const DOCS = projectId => `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents`;
+const MEMBER_PAGE = 200;
 
-// Exchanges a Google Cloud service-account key for a short-lived OAuth2
-// access token (the standard JWT-bearer flow the Admin SDK uses under the
-// hood), scoped to Firestore (datastore). This is NOT the same thing as
-// signing in an end-user: this is an IAM-authenticated request, and
-// Firestore Security Rules are never evaluated for it — exactly like the
-// Admin SDK on a normal Node server, which is the whole point. We can't
-// use the actual firebase-admin npm package here (build.js bundles each
-// Function standalone with no npm deps — see the file header), so this
-// reimplements just the one JWT-bearer call it needs via native
-// crypto.subtle (RSASSA-PKCS1-v1_5/SHA-256, which every service-account
-// key uses).
-async function getServiceAccountToken(saJsonStr) {
-  const sa = JSON.parse(saJsonStr);
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const claims = {
-    iss:   sa.client_email,
-    scope: 'https://www.googleapis.com/auth/datastore',
-    aud:   'https://oauth2.googleapis.com/token',
-    iat:   now,
-    exp:   now + 3600,
-  };
-  const seg = o => bytesToB64url(new TextEncoder().encode(JSON.stringify(o)));
-  const signingInput = seg(header) + '.' + seg(claims);
-
-  const key = await crypto.subtle.importKey(
-    'pkcs8', pemToBytes(sa.private_key),
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false, ['sign']
-  );
-  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(signingInput));
-  const jwt = signingInput + '.' + bytesToB64url(new Uint8Array(sig));
-
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body:    'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + jwt,
-  });
-  if (!res.ok) throw new Error('Service-account token exchange failed: ' + res.status + ' ' + (await res.text()).slice(0, 200));
-  const data = await res.json();
-  return data.access_token;
-}
-
-// List all member docs of a room via the Firestore REST API — rooms are
-// small (a handful to low hundreds of members), so a plain list beats the
-// complexity of a structured "field exists" query for this.
 async function listMembers(projectId, token, roomCode, shardName) {
-  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${encodeURIComponent(roomCode)}/members?pageSize=200`;
+  const url = `${DOCS(projectId)}/rooms/${encodeURIComponent(roomCode)}/members?pageSize=${MEMBER_PAGE}`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) return [];
+  if (!res.ok) return null;
   const data = await res.json();
   const docs = data.documents || [];
   ledgerAdd(shardName, 'notify', Math.max(1, docs.length));
-  return docs;
+  return { docs, complete: !data.nextPageToken };
+}
+
+async function patchDoc(projectId, token, shardName, path, mask, fields, mustExist) {
+  const q = mask.map(m => 'updateMask.fieldPaths=' + encodeURIComponent(m)).join('&') + (mustExist ? '&currentDocument.exists=true' : '');
+  const res = await fetch(`${DOCS(projectId)}/${path}?${q}`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (res.ok) ledgerAdd(shardName, 'notify', 0, 1);
+  return res.ok;
 }
 
 // Firestore REST documents use a typed-value wire format — unwrap the
@@ -190,6 +151,10 @@ function fsValueToJs(v) {
     return out;
   }
   if ('nullValue' in v) return null;
+  if ('booleanValue' in v) return v.booleanValue;
+  if ('integerValue' in v) return Number(v.integerValue);
+  if ('doubleValue' in v) return v.doubleValue;
+  if ('arrayValue' in v) return (v.arrayValue.values || []).map(fsValueToJs);
   return v;
 }
 
@@ -280,60 +245,84 @@ async function sendWebPush(subscription, vapidPrivateKey, vapidPublicKeyB64url, 
   return { ok: res.ok, status: res.status };
 }
 
-async function runNotify(env, { roomCode, shard, senderId, senderName }) {
+const EVENT_TYPES = new Set(['message', 'join-request', 'member-joined', 'sync']);
+const SYNC_COOLDOWN_MS = 5000;
+const lastSync = new Map();
+
+function readMember(d) {
+  const fields = {};
+  for (const k of Object.keys(d.fields || {})) fields[k] = fsValueToJs(d.fields[k]);
+  const uid = (d.name || '').split('/').pop();
+  const eligible = fields.approved !== false && !fields.blocked && !fields.declined;
+  const sub = fields.pushSubscription && fields.pushSubscription.endpoint ? fields.pushSubscription : null;
+  return { uid, eligible, admin: fields.role === 'admin', sub };
+}
+
+function payloadFor(type, roomCode, senderName) {
+  const who = senderName || 'someone';
+  if (type === 'join-request') return { title: 'MIUT', body: `${who} wants to join the room`, roomCode, senderName: senderName || '', type };
+  if (type === 'member-joined') return { title: 'MIUT', body: `${who} joined the room`, roomCode, senderName: senderName || '', type };
+  return { title: 'MIUT', body: `New message from ${who}`, roomCode, senderName: senderName || '', type: 'message' };
+}
+
+function targetsFor(type, members, senderId) {
+  return members.filter(m => m.sub && m.eligible && m.uid !== senderId && (type !== 'join-request' || m.admin));
+}
+
+async function runNotify(env, { roomCode, shard, type, senderId, senderName, indexCount }) {
   const shards = discoverShards(env);
   const s = shards.find(x => x.name === shard) || shards[0];
   if (!s?.projectId) return { error: 'Unknown or unconfigured shard' };
-  if (!env.VAPID_PRIVATE_KEY || !env.VAPID_PUBLIC_KEY) return { error: 'VAPID keys not configured' };
-  // This used to sign in a brand-new anonymous Firebase user per call
-  // (getFirebaseToken(s.apiKey)) and read the members subcollection with
-  // THAT token. It silently returned zero members for every single
-  // call, on every room, no matter who sent the message — because that
-  // fresh anonymous user was never actually a member of the room, and
-  // firestore.rules only allows reading a room's members to the member
-  // themself or an already-approved member of that room. The REST call
-  // got rejected, listMembers() swallowed it and returned [], and
-  // runNotify reported a clean-looking `sent 0, total 0` with no error
-  // anywhere — impossible to tell apart from "nobody else is subscribed"
-  // without instrumenting the client the way we just did. A
-  // service-account token is an IAM-authenticated, Admin-SDK-equivalent
-  // credential — Firestore Security Rules are never evaluated for it, by
-  // design, which is exactly what server-side code reading across a
-  // whole room's membership actually needs here.
-  if (!s.saJson) return { error: `No service account configured for shard ${s.name} — set FIREBASE${s.name === 'miut-db0' ? '' : '_' + s.name.replace('miut-', '').toUpperCase()}_SA_JSON` };
-  const token = await getServiceAccountToken(s.saJson);
-  const docs = await listMembers(s.projectId, token, roomCode, s.name);
-  const privateKey = await importVapidPrivateKey(env.VAPID_PRIVATE_KEY, env.VAPID_PUBLIC_KEY);
+  if (!s.saJson) return { error: `No service account configured for shard ${s.name}` };
+  if (type !== 'sync' && (!env.VAPID_PRIVATE_KEY || !env.VAPID_PUBLIC_KEY)) return { error: 'VAPID keys not configured' };
 
-  const targets = [];
-  for (const d of docs) {
-    const uid = (d.name || '').split('/').pop();
-    if (uid === senderId) continue; // never notify the sender of their own message
-    const fields = {};
-    for (const k of Object.keys(d.fields || {})) fields[k] = fsValueToJs(d.fields[k]);
-    if (fields.pushSubscription?.endpoint) targets.push({ uid, sub: fields.pushSubscription });
+  if (type === 'sync') {
+    const key = `${s.name}|${roomCode}|${senderId}`;
+    const now = Date.now();
+    if (now - (lastSync.get(key) || 0) < SYNC_COOLDOWN_MS) return { skipped: 'cooldown' };
+    if (lastSync.size > 500) lastSync.clear();
+    lastSync.set(key, now);
   }
 
-  // senderName is carried as its own field now (not just baked into body
-  // text) so the client can prefill the Reply action with "@<name> "
-  // instead of just focusing an empty input — see sw.js's
-  // notificationclick handler and sw-bridge.js's FOCUS_REPLY handler.
-  const payload = { title: 'MIUT', body: `New message from ${senderName || 'someone'}`, roomCode, senderName: senderName || '', type: 'message' };
-  const results = await Promise.all(targets.map(t =>
-    sendWebPush(t.sub, privateKey, env.VAPID_PUBLIC_KEY, payload)
-      .then(r => ({ uid: t.uid, ...r }))
-      .catch(e => ({ uid: t.uid, ok: false, reason: e.message }))
-  ));
+  const token = await getAccessTokenCached(JSON.parse(s.saJson), fetch);
+  const listed = await listMembers(s.projectId, token, roomCode, s.name);
+  if (!listed) return { error: 'Could not list members' };
+  const members = listed.docs.map(readMember);
 
-  return { sent: results.filter(r => r.ok).length, total: targets.length, results };
+  const targets = type === 'sync' ? [] : targetsFor(type, members, senderId);
+  const dead = new Set();
+  let results = [];
+  if (targets.length) {
+    const privateKey = await importVapidPrivateKey(env.VAPID_PRIVATE_KEY, env.VAPID_PUBLIC_KEY);
+    const payload = payloadFor(type, roomCode, senderName);
+    results = await Promise.all(targets.map(t =>
+      sendWebPush(t.sub, privateKey, env.VAPID_PUBLIC_KEY, payload)
+        .then(r => ({ uid: t.uid, ...r }))
+        .catch(e => ({ uid: t.uid, ok: false, reason: e.message }))
+    ));
+    for (const r of results) if (r.status === 404 || r.status === 410) dead.add(r.uid);
+  }
+
+  for (const uid of dead) {
+    await patchDoc(s.projectId, token, s.name, `rooms/${encodeURIComponent(roomCode)}/members/${encodeURIComponent(uid)}`, ['pushSubscription'], { pushSubscription: { nullValue: null } }, true);
+  }
+
+  const uids = members.filter(m => m.sub && m.eligible && !dead.has(m.uid)).map(m => m.uid).sort();
+  const stale = indexCount !== undefined && (indexCount === null || indexCount !== uids.length);
+  let indexed = false;
+  if ((type === 'sync' || dead.size || stale) && listed.complete) {
+    indexed = await patchDoc(s.projectId, token, s.name, `rooms/${encodeURIComponent(roomCode)}`, ['pushUids'],
+      { pushUids: { arrayValue: { values: uids.map(u => ({ stringValue: u })) } } }, true);
+  }
+
+  return { type, sent: results.filter(r => r.ok).length, total: targets.length, pruned: dead.size, indexed };
 }
 
 export async function onRequest(ctx) {
   const { request, env } = ctx;
+  const reply = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...CORS } });
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
-  if (request.method !== 'POST') {
-    return new Response(JSON.stringify({ error: 'POST required' }), { status: 405, headers: { 'Content-Type': 'application/json', ...CORS } });
-  }
+  if (request.method !== 'POST') return reply({ error: 'POST required' }, 405);
 
   let body;
   try { body = await request.json(); } catch { body = {}; }
@@ -341,15 +330,13 @@ export async function onRequest(ctx) {
   const shard      = String(body.shard      || 'miut-db0').slice(0, 32);
   const senderId   = String(body.senderId   || '').slice(0, 128);
   const senderName = String(body.senderName || '').slice(0, 64);
+  const type       = EVENT_TYPES.has(body.type) ? body.type : 'message';
 
-  if (!roomCode || !senderId) {
-    return new Response(JSON.stringify({ error: 'roomCode and senderId required' }), { status: 400, headers: { 'Content-Type': 'application/json', ...CORS } });
-  }
+  if (!roomCode || !senderId) return reply({ error: 'roomCode and senderId required' }, 400);
 
   try {
-    const result = await runNotify(env, { roomCode, shard, senderId, senderName });
-    return new Response(JSON.stringify(result), { status: 200, headers: { 'Content-Type': 'application/json', ...CORS } });
+    return reply(await runNotify(env, { roomCode, shard, type, senderId, senderName, indexCount: 'indexCount' in body ? (Number.isInteger(body.indexCount) && body.indexCount >= 0 ? body.indexCount : null) : undefined }));
   } catch (e) {
-    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { 'Content-Type': 'application/json', ...CORS } });
+    return reply({ error: e.message }, 500);
   }
 }
