@@ -2956,7 +2956,12 @@ function _updateLoadEarlierBtn() {
 
 function startPresenceListener() {
   const code = state.roomCode;
-  if (_unsubMembers) _unsubMembers();
+  // Matches the equivalent teardown at line ~3280 (stopChatListeners): a
+  // stale unsubscribe can throw after a connection drop invalidates it, and
+  // without this try/catch that throw aborted startPresenceListener() before
+  // the new listener was ever attached — leaving presence silently dead for
+  // the rest of that session (an undercount, not a double-listen risk).
+  if (_unsubMembers) { try { _unsubMembers(); } catch {} }
 
   _unsubMembers = db.collection('rooms').doc(code)
     .collection('members').where('online', '==', true)

@@ -1,25 +1,39 @@
 'use strict';
 
+/**
+ * functions/_lib/placement.js
+ *
+ * Which shard should a new room go to? Reads utilization straight off the
+ * SAME shardLoad/{name} document shard-registry.js already fetches for
+ * count/degradedUntil (see usage-store.js's schema note for why reads/
+ * writes/deletes/usageDay live there now) — no separate shared usage
+ * document, no cache to invalidate; placement costs exactly the per-shard
+ * reads it already needed.
+ */
+
 import { LIMITS } from './usage-store.js';
 import { pacificDay } from './usage-ledger.js';
 
 export const HOT_UTIL = 0.8;
 export const DEFAULT_SAFETY = 1.25;
-const CACHE_MS = 60000;
 
 export function safetyOf(env) {
   const n = Number(env && env.USAGE_SAFETY);
   return n >= 1 && n <= 4 ? n : DEFAULT_SAFETY;
 }
 
-export function utilization(doc, shardName, safety = DEFAULT_SAFETY) {
-  const cats = doc && doc.s && doc.s[shardName.replace('-', '_')];
-  if (!cats) return 0;
-  let r = 0, w = 0, d = 0, x = 0;
-  for (const c of Object.values(cats)) {
-    r += Number(c.r) || 0; w += Number(c.w) || 0; d += Number(c.d) || 0; x += Number(c.x) || 0;
-  }
-  return Math.max((r + x) / LIMITS.reads, w / LIMITS.writes, d / LIMITS.deletes) * safety;
+/**
+ * `load` is the already-fetched shardLoad/{name} doc. A shard with no
+ * report yet today, or whose last report is from a previous Pacific day
+ * (usageDay mismatch — including the reset that happens lazily on that
+ * shard's next write), reads as 0 utilization: there's nothing live to
+ * measure yet, not a reason to treat the shard as unusually free OR
+ * unusually loaded.
+ */
+export function utilization(load, now = Date.now(), safety = DEFAULT_SAFETY) {
+  if (!load || load.usageDay !== pacificDay(now)) return 0;
+  const reads = Number(load.reads) || 0, writes = Number(load.writes) || 0, deletes = Number(load.deletes) || 0;
+  return Math.max(reads / LIMITS.reads, writes / LIMITS.writes, deletes / LIMITS.deletes) * safety;
 }
 
 export function pickShard(live, rng = Math.random) {
@@ -33,19 +47,3 @@ export function pickShard(live, rng = Math.random) {
   const tied = inBand.filter(s => s.count === fewest);
   return tied[Math.floor(rng() * tied.length)];
 }
-
-let cache = { at: 0, day: '', doc: null };
-
-export async function loadUsageDoc(readDoc, now = Date.now()) {
-  const day = pacificDay(now);
-  if (cache.day === day && now - cache.at < CACHE_MS) return cache.doc;
-  try {
-    const doc = await readDoc(day);
-    cache = { at: now, day, doc };
-    return doc;
-  } catch {
-    return cache.day === day ? cache.doc : null;
-  }
-}
-
-export const resetUsageCache = () => { cache = { at: 0, day: '', doc: null }; };

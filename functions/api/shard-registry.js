@@ -30,7 +30,11 @@
  *
  * DATA MODEL (two tiny collections, nothing else):
  *   bindings/{roomCode}     → { db: "miut-db1", expired?: true, expiredAt?: epochMs }
- *   shardLoad/{shardName}   → { count: 12, degradedUntil: 0|epochMs }
+ *   shardLoad/{shardName}   → { count: 12, degradedUntil: 0|epochMs,
+ *                                 reads, writes, deletes, usageDay — see
+ *                                 usage-store.js; written by client usage
+ *                                 reports and the server's own self-tracked
+ *                                 operations, read here for placement }
  *
  * `expired`/`expiredAt` are optional and only ever set by the `expire`
  * action below (merge-write, never touches `db`). They exist so that once
@@ -64,8 +68,7 @@
 'use strict';
 
 import { ledgerAdd } from '../_lib/usage-ledger.js';
-import { pickShard, utilization, loadUsageDoc, safetyOf } from '../_lib/placement.js';
-import { readUsageDay } from '../_lib/usage-store.js';
+import { pickShard, utilization, safetyOf } from '../_lib/placement.js';
 
 function discoverShards(env) {
   const shards = [{
@@ -440,8 +443,7 @@ export async function onRequest(ctx) {
 
     const replace = body?.replace === true;
 
-    const usageDoc = loadUsageDoc(day => readUsageDay(env, day));
-    const [existing, scored, usage] = await Promise.all([
+    const [existing, scored] = await Promise.all([
       replace ? null : findBinding(projectId, token, ident, env, names).catch(() => null),
       Promise.all(shards.map(async s => {
         let load = null;
@@ -450,14 +452,13 @@ export async function onRequest(ctx) {
         const degraded = !!(load && load.degradedUntil && load.degradedUntil > Date.now());
         return { name: s.name, count, degraded, prevLoad: load };
       })),
-      usageDoc,
     ]);
     if (existing?.db && names.has(existing.db)) {
       return json({ db: existing.db, isNew: false });
     }
 
     const safety = safetyOf(env);
-    const live = scored.map(s => ({ ...s, count: s.count + pendingCount(s.name), util: utilization(usage, s.name, safety) }));
+    const live = scored.map(s => ({ ...s, count: s.count + pendingCount(s.name), util: utilization(s.prevLoad, Date.now(), safety) }));
     const chosen = pickShard(live);
     const reservation = reservePick(chosen.name);
 
@@ -570,7 +571,6 @@ export async function onRequest(ctx) {
 
   // ── status: current per-shard health, for the admin/debug console ──
   if (action === 'status') {
-    const usage = await loadUsageDoc(day => readUsageDay(env, day));
     const safety = safetyOf(env);
     const isAdmin = !!env?.ADMIN_ACCESS && ctEq(request.headers.get('Authorization') || '', 'Bearer ' + env.ADMIN_ACCESS);
     const status = await Promise.all(shards.map(async s => {
@@ -578,7 +578,7 @@ export async function onRequest(ctx) {
       try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
       return {
         name: s.name,
-        ...(isAdmin ? { utilizationPct: Math.round(utilization(usage, s.name, safety) * 1000) / 10 } : {}),
+        ...(isAdmin ? { utilizationPct: Math.round(utilization(load, Date.now(), safety) * 1000) / 10 } : {}),
         roomsTotal: load?.count || 0,
         degraded: !!(load && load.degradedUntil && load.degradedUntil > Date.now()),
         degradedUntil: (load && load.degradedUntil > Date.now()) ? load.degradedUntil : null,

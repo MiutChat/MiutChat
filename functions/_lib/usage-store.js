@@ -1,7 +1,53 @@
 'use strict';
 
-import { registryAdmin, api, incWrite, decodeFields } from './analytics-store.js';
-import { ledgerAdd, ledgerTake, ledgerRestore, ledgerSize, pacificDay, shiftDay } from './usage-ledger.js';
+/**
+ * functions/_lib/usage-store.js
+ *
+ * Storage for the self-built Firestore read/write/delete ESTIMATE — see
+ * src/core/db-manager.js's _usageMeter for how it's measured client-side,
+ * and functions/_lib/placement.js for how room placement consumes it.
+ *
+ * SCHEMA (simplified — previously a separate usage_daily/{day} collection
+ * with a full category breakdown per shard; both are gone now):
+ *   shardLoad/{shardName} gains four fields, alongside the existing `count`
+ *   and `degradedUntil` placement already reads from that SAME document:
+ *     reads, writes, deletes   — running totals since usageDay started
+ *     usageDay                 — the Pacific calendar day these totals are
+ *                                 for (matches Firestore's own daily
+ *                                 free-quota reset boundary)
+ *   A write that finds usageDay is no longer today resets the three
+ *   counters to just that write's own delta rather than erroring or
+ *   requiring a separate cron pass — the reset happens inline, lazily, on
+ *   whichever report happens to land first after midnight.
+ *
+ * Category detail (messages/members/typing/...) still exists ONLY in the
+ * CLIENT's own wire format (CLIENT_CATS below) and the in-memory ledger —
+ * it's summed away at the point a delta is actually written to the
+ * registry, because nothing downstream (placement's utilization(), the
+ * admin view) ever needed anything finer than a per-shard total; the
+ * category breakdown was pure storage overhead for a number nobody read
+ * broken out that way.
+ *
+ * Two independent paths write here, both converging on the same
+ * applyUsageDeltas():
+ *   - Client reports (usage.js POST → recordUsage): infrequent (one per
+ *     tab every ~5 min, see db-manager.js), committed immediately.
+ *   - The server's OWN self-tracked operations (ledgerAdd calls scattered
+ *     through firebase-admin.js, shard-registry.js, notify.js,
+ *     analytics-store.js — unchanged by this file) accumulate in the
+ *     in-memory ledger (usage-ledger.js, untouched) and are flushed here
+ *     periodically (flushLedger), batched to avoid a registry write on
+ *     every single internal Firestore call.
+ *
+ * Concurrency: a write here is read-current → compute new totals →
+ * conditional PATCH pinned to the document's updateTime, retried once on a
+ * precondition conflict. Two concurrent writers to the SAME shard (a client
+ * report landing at the same moment as a ledger flush) converge correctly
+ * instead of one silently clobbering the other's delta.
+ */
+
+import { registryAdmin, api, decodeFields } from './analytics-store.js';
+import { ledgerAdd, ledgerTake, ledgerRestore, ledgerSize, pacificDay } from './usage-ledger.js';
 
 export { pacificDay };
 
@@ -9,65 +55,95 @@ export const CLIENT_CATS = ['room', 'messages', 'send', 'readack', 'react', 'mem
 export const LIMITS = { reads: 50000, writes: 20000, deletes: 20000 };
 export const MAX_BODY = 16384;
 
-const METRICS = ['r', 'w', 'd', 'x'];
-const SHARD_RE = /^miut-db\d{1,3}$/;
 const RID_RE = /^[A-Za-z0-9_-]{8,32}$/;
-const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_FIELD = 200000;
 const MIN_GAP_MS = 25000;
+const round1 = n => Math.round(n * 10) / 10;
 
-const bump = (map, key, n) => map.set(key, (map.get(key) || 0) + n);
-const fieldKey = shard => shard.replace('-', '_');
-
+/**
+ * Validates a client report and collapses it straight down to a per-shard
+ * delta: every CLIENT_CATS category summed together, and ONLY today's
+ * (Pacific) day considered — a report entry for any other day is dropped
+ * rather than risk corrupting a day's total that's either not started yet
+ * or already closed out. A late report (laptop asleep across midnight) can
+ * lose its stale-day counts this way; accepted tradeoff for a system that's
+ * explicitly an estimate, not a ledger of record.
+ */
 export function sanitizeReport(body, now = Date.now()) {
   if (!body || typeof body !== 'object' || body.v !== 1) return null;
   if (typeof body.rid !== 'string' || !RID_RE.test(body.rid)) return null;
   if (!body.d || typeof body.d !== 'object') return null;
   const today = pacificDay(now);
-  const oldest = shiftDay(today, -3);
-  const days = new Map();
-  let total = 0;
-  for (const [rawDay, shards] of Object.entries(body.d).slice(0, 8)) {
-    if (!DAY_RE.test(rawDay) || !shards || typeof shards !== 'object') continue;
-    const day = rawDay > today ? today : rawDay < oldest ? oldest : rawDay;
-    for (const [shard, cats] of Object.entries(shards).slice(0, 16)) {
-      if (!SHARD_RE.test(shard) || !cats || typeof cats !== 'object') continue;
-      for (const cat of CLIENT_CATS) {
-        const v = cats[cat];
-        if (!Array.isArray(v) || v.length !== 4) continue;
-        for (let i = 0; i < 4; i++) {
-          const n = Math.min(MAX_FIELD, Math.floor(Number(v[i])));
-          if (!(n > 0)) continue;
-          if (!days.has(day)) days.set(day, new Map());
-          bump(days.get(day), `s.${fieldKey(shard)}.${cat}.${METRICS[i]}`, n);
-          total += n;
-        }
+  const shards = body.d[today];
+  if (!shards || typeof shards !== 'object') return null;
+  const deltas = new Map();
+  for (const [shard, cats] of Object.entries(shards).slice(0, 16)) {
+    if (!cats || typeof cats !== 'object') continue;
+    const sum = [0, 0, 0, 0];
+    for (const cat of CLIENT_CATS) {
+      const v = cats[cat];
+      if (!Array.isArray(v) || v.length !== 4) continue;
+      for (let i = 0; i < 4; i++) {
+        const n = Math.min(MAX_FIELD, Math.floor(Number(v[i])));
+        if (n > 0) sum[i] += n;
       }
     }
+    if (sum[0] || sum[1] || sum[2] || sum[3]) deltas.set(shard, sum);
   }
-  return total ? { rid: body.rid, days } : null;
+  return deltas.size ? { rid: body.rid, deltas } : null;
 }
 
-async function commitDays(env, days, fetchImpl) {
+/** One shard's conditional read-modify-write, retried once on a precondition conflict. delta is [r, w, d, x]. */
+async function writeShardDelta(root, call, shard, delta, today) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let cur = null, updateTime;
+    try {
+      const res = await call('/shardLoad/' + shard);
+      if (res.status === 404) cur = null;
+      else if (res.ok) { const doc = await res.json(); cur = decodeFields(doc.fields); updateTime = doc.updateTime; }
+      else return false;
+    } catch { return false; }
+
+    const sameDay = cur && cur.usageDay === today;
+    const base = sameDay ? cur : {};
+    const fields = {
+      reads:    { integerValue: String((Number(base.reads) || 0) + delta[0] + delta[3]) }, // rule-dependency reads (x) are real billed reads too — folded in here, the one place that distinction still mattered
+      writes:   { integerValue: String((Number(base.writes) || 0) + delta[1]) },
+      deletes:  { integerValue: String((Number(base.deletes) || 0) + delta[2]) },
+      usageDay: { stringValue: today },
+    };
+    let res2;
+    try {
+      res2 = await call(':commit', { method: 'POST', body: JSON.stringify({ writes: [{
+        update: { name: `${root}/shardLoad/${shard}`, fields },
+        updateMask: { fieldPaths: ['reads', 'writes', 'deletes', 'usageDay'] },
+        updateTransforms: [{ fieldPath: 'usageUpdatedAt', setToServerValue: 'REQUEST_TIME' }],
+        currentDocument: cur ? { updateTime } : { exists: false },
+      }] }) });
+    } catch { return false; }
+    if (res2.ok) return true;
+    if (res2.status === 400 || res2.status === 409) continue; // precondition failed (someone else wrote first) — re-read and retry once
+    return false;
+  }
+  return false;
+}
+
+/** deltaMap: Map<shard, [r,w,d,x]>. Each shard is independent — one failing never blocks the others. */
+export async function applyUsageDeltas(env, deltaMap, fetchImpl = fetch, now = Date.now()) {
   const reg = registryAdmin(env);
   if (!reg) return { ok: false, reason: 'not_configured' };
-  try {
-    const { root, call } = api(reg, fetchImpl);
-    const writes = [];
-    for (const [day, inc] of days) {
-      const merged = new Map(inc);
-      bump(merged, 's.registry.usage.w', 1);
-      writes.push(incWrite(root, `usage_daily/${day}`, ['day', day], merged));
-    }
-    const res = await call(':commit', { method: 'POST', body: JSON.stringify({ writes }) });
-    if (res.ok) return { ok: true };
-    return { ok: false, reason: 'commit_' + res.status, detail: (await res.text().catch(() => '')).slice(0, 300) };
-  } catch (e) {
-    return { ok: false, reason: 'error', detail: String(e && e.message || e).slice(0, 300) };
+  if (!deltaMap || !deltaMap.size) return { ok: true, empty: true };
+  const { root, call } = api(reg, fetchImpl);
+  const today = pacificDay(now);
+  const failedShards = [];
+  for (const [shard, delta] of deltaMap) {
+    const ok = await writeShardDelta(root, call, shard, delta, today);
+    if (!ok) failedShards.push(shard);
   }
+  return { ok: failedShards.length === 0, failedShards };
 }
 
-export const recordUsage = (env, report, fetchImpl = fetch) => commitDays(env, report.days, fetchImpl);
+export const recordUsage = (env, report, fetchImpl = fetch) => applyUsageDeltas(env, report.deltas, fetchImpl);
 
 const seen = new Map();
 export function claimRid(rid, now = Date.now()) {
@@ -79,26 +155,34 @@ export function claimRid(rid, now = Date.now()) {
   seen.set(rid, now);
   return true;
 }
-
 export const releaseRid = rid => { seen.delete(rid); };
 
 let lastFlush = 0;
 let trailing = false;
 
+/** Collapses the ledger's accumulated (shard, cat, [r,w,d,x]) cells to per-shard totals for TODAY and commits them — everything else about the ledger (usage-ledger.js) is unchanged. */
 export async function flushLedger(env, { force = false, fetchImpl = fetch, now = Date.now() } = {}) {
   if (!ledgerSize()) return { ok: true, empty: true };
   if (!force && now - lastFlush < MIN_GAP_MS) return { ok: true, deferred: true, waitMs: MIN_GAP_MS - (now - lastFlush) };
   if (!registryAdmin(env)) { ledgerTake(); return { ok: false, reason: 'not_configured' }; }
   lastFlush = now;
-  const items = ledgerTake();
-  const days = new Map();
+  const items = ledgerTake(); // [{day, shard, cat, c:[r,w,d,x]}]
+  const today = pacificDay(now);
+  const byShard = new Map();
+  const itemsByShard = new Map(); // kept so a PARTIAL failure can restore only the shards that actually failed, not the whole flush
   for (const it of items) {
-    if (!days.has(it.day)) days.set(it.day, new Map());
-    const base = `s.${fieldKey(it.shard)}.${it.cat}`;
-    METRICS.forEach((m, i) => { if (it.c[i]) bump(days.get(it.day), `${base}.${m}`, it.c[i]); });
+    if (it.day !== today) continue; // a stray entry from a flush delayed across a midnight boundary — dropped, not corrupted into the wrong day's total
+    const d = byShard.get(it.shard) || [0, 0, 0, 0];
+    for (let i = 0; i < 4; i++) d[i] += it.c[i];
+    byShard.set(it.shard, d);
+    (itemsByShard.get(it.shard) || itemsByShard.set(it.shard, []).get(it.shard)).push(it);
   }
-  const res = await commitDays(env, days, fetchImpl);
-  if (!res.ok && ledgerSize() < 200) ledgerRestore(items);
+  const res = await applyUsageDeltas(env, byShard, fetchImpl, now);
+  if (!res.ok && ledgerSize() < 200) {
+    const toRestore = [];
+    for (const shard of res.failedShards || []) toRestore.push(...(itemsByShard.get(shard) || []));
+    if (toRestore.length) ledgerRestore(toRestore);
+  }
   return res;
 }
 
@@ -112,56 +196,33 @@ export function flushSoon(env, waitUntil) {
   }).catch(() => {}));
 }
 
-export async function readUsageDay(env, day, fetchImpl = fetch) {
-  const reg = registryAdmin(env);
-  if (!reg) return null;
-  const { call } = api(reg, fetchImpl);
-  const res = await call('/usage_daily/' + day);
-  ledgerAdd('registry', 'usage', 1);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error('usage read ' + res.status);
-  return decodeFields((await res.json()).fields);
-}
-
-const round1 = n => Math.round(n * 10) / 10;
-
-function summarize(s) {
-  const out = {};
-  for (const [shard, cats] of Object.entries(s || {})) {
-    const t = { reads: 0, ruleReads: 0, writes: 0, deletes: 0 };
-    for (const c of Object.values(cats || {})) {
-      t.reads += c.r || 0; t.writes += c.w || 0; t.deletes += c.d || 0; t.ruleReads += c.x || 0;
-    }
-    const billedReads = t.reads + t.ruleReads;
-    out[shard] = {
-      ...t,
-      billedReads,
-      pct: {
-        reads: round1(100 * billedReads / LIMITS.reads),
-        writes: round1(100 * t.writes / LIMITS.writes),
-        deletes: round1(100 * t.deletes / LIMITS.deletes),
-      },
-      byCategory: cats,
-    };
-  }
-  return out;
-}
-
-export async function readUsage(env, nDays = 7, fetchImpl = fetch, now = Date.now()) {
+/**
+ * Per-shard summary straight from shardLoad — the same document placement
+ * already reads for count/degradedUntil, now also holding the usage
+ * totals, so the admin view costs exactly one read per shard, same as
+ * before this feature existed.
+ */
+export async function readUsage(env, shardNames, fetchImpl = fetch, now = Date.now()) {
   const reg = registryAdmin(env);
   if (!reg) return { error: 'not_configured' };
-  const n = Math.min(14, Math.max(1, Math.floor(Number(nDays)) || 7));
   const { call } = api(reg, fetchImpl);
   const today = pacificDay(now);
-  const days = [];
-  for (let i = 0; i < n; i++) {
-    const day = shiftDay(today, -i);
-    const res = await call('/usage_daily/' + day);
-    if (res.status === 404) { days.push({ day, shards: {} }); continue; }
-    if (!res.ok) return { error: 'read_failed', status: res.status, day };
-    const doc = await res.json();
-    days.push({ day, shards: summarize(decodeFields(doc.fields).s) });
+  const shards = {};
+  for (const name of shardNames) {
+    let res;
+    try { res = await call('/shardLoad/' + name); } catch { shards[name] = { error: 'read_failed' }; continue; }
+    ledgerAdd('registry', 'usage', 1);
+    if (res.status === 404) { shards[name] = { reads: 0, writes: 0, deletes: 0, usageDay: null, stale: true, pct: { reads: 0, writes: 0, deletes: 0 } }; continue; }
+    if (!res.ok) { shards[name] = { error: 'read_failed', status: res.status }; continue; }
+    const doc = decodeFields((await res.json()).fields);
+    const stale = doc.usageDay !== today; // yesterday's totals (or no report at all yet today) — not a live number, but worth showing which it is
+    const reads = stale ? 0 : (Number(doc.reads) || 0);
+    const writes = stale ? 0 : (Number(doc.writes) || 0);
+    const deletes = stale ? 0 : (Number(doc.deletes) || 0);
+    shards[name] = {
+      reads, writes, deletes, usageDay: doc.usageDay || null, stale,
+      pct: { reads: round1(100 * reads / LIMITS.reads), writes: round1(100 * writes / LIMITS.writes), deletes: round1(100 * deletes / LIMITS.deletes) },
+    };
   }
-  ledgerAdd('registry', 'usage', n);
-  return { limits: LIMITS, resetsAt: 'midnight America/Los_Angeles', days, ts: new Date(now).toISOString() };
+  return { limits: LIMITS, resetsAt: 'midnight America/Los_Angeles', shards, ts: new Date(now).toISOString() };
 }

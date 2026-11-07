@@ -277,7 +277,12 @@ const _usageMeter = (() => {
     if (ops >= FLUSH_OPS) flushSoon();
   }
 
-  function countOps(list) {
+  // sign=1 counts a write/delete as having happened; sign=-1 rolls back a
+  // count that was taken OPTIMISTICALLY (see writer/adder/patchBatch below)
+  // once its promise is confirmed to have actually failed. Passing the SAME
+  // `list` to both calls makes the rollback exactly cancel the original —
+  // same categorisation, same rule-dependency reads undone 1:1.
+  function countOps(list, sign = 1) {
     const seen = {};
     for (const o of list) {
       const shard = shardOf(o.ref);
@@ -286,7 +291,7 @@ const _usageMeter = (() => {
       const del = o.op === 'delete';
       let x = 0;
       for (const dep of ruleDeps(cat, o.op)) { const k = shard + dep; if (!seen[k]) { seen[k] = 1; x++; } }
-      add(shard, cat, 0, del ? 0 : 1, del ? 1 : 0, x);
+      add(shard, cat, 0, sign * (del ? 0 : 1), sign * (del ? 1 : 0), sign * x);
     }
   }
 
@@ -374,13 +379,23 @@ const _usageMeter = (() => {
     };
   }
 
+  // Counted OPTIMISTICALLY, at call time, not after the write promise
+  // resolves. A write fired right before the tab is backgrounded/frozen can
+  // complete on Firestore's servers while this page's own microtask queue
+  // never runs again — under the old resolve-then-count design that write
+  // was never counted at all, which is why writes/deletes were undercounted
+  // far more than reads (the single most common pattern on mobile: send,
+  // then immediately background the app). Rolled back via countOps(item,-1)
+  // only on a CONFIRMED rejection, so a genuine failure still nets to zero.
   function writer(op) {
     return function (orig) {
       return function () {
         const self = this;
         const a = args(arguments);
+        const item = [{ ref: self, op, keys: op === 'update' ? keysOf(a) : [] }];
+        try { countOps(item); } catch {}
         const p = orig.apply(this, a);
-        try { p.then(() => { try { countOps([{ ref: self, op, keys: op === 'update' ? keysOf(a) : [] }]); } catch {} }, () => {}); } catch {}
+        try { p.catch(() => { try { countOps(item, -1); } catch {} }); } catch {}
         return p;
       };
     };
@@ -389,10 +404,15 @@ const _usageMeter = (() => {
   function adder(orig) {
     return function () {
       const self = this;
+      // The eventual doc's generated id isn't known yet at call time, but
+      // readCat()/writeCat() only inspect the COLLECTION-level path segments
+      // (indices 0 and 2), which self.path (the collection's own path)
+      // already carries in full — identical categorisation to the resolved
+      // doc ref's path, so counting optimistically here loses no accuracy.
+      const item = [{ ref: { firestore: self.firestore, path: self.path }, op: 'add', keys: [] }];
+      try { countOps(item); } catch {}
       const p = orig.apply(this, arguments);
-      try {
-        p.then(ref => { try { countOps([{ ref: ref || { firestore: self.firestore, path: self.path }, op: 'add', keys: [] }]); } catch {} }, () => {});
-      } catch {}
+      try { p.catch(() => { try { countOps(item, -1); } catch {} }); } catch {}
       return p;
     };
   }
@@ -411,10 +431,16 @@ const _usageMeter = (() => {
     });
     const commit = b.commit;
     if (typeof commit === 'function') {
+      // Same optimistic-then-rollback shape as writer()/adder() above. A
+      // batch commit is atomic (all-or-nothing) in real Firestore, so
+      // counting the WHOLE batch optimistically and rolling back the WHOLE
+      // batch together on a confirmed rejection stays exactly correct —
+      // never a partial count for a batch that partially "happened".
       b.commit = function () {
         const done = list.splice(0);
+        try { countOps(done); } catch {}
         const p = commit.apply(this, arguments);
-        try { p.then(() => { try { countOps(done); } catch {} }, () => {}); } catch {}
+        try { p.catch(() => { try { countOps(done, -1); } catch {} }); } catch {}
         return p;
       };
     }
@@ -513,7 +539,20 @@ const _usageMeter = (() => {
   async function flush(unloading) {
     toQueue();
     if (unloading) {
-      queue = queue.filter(it => !beacon(it));
+      // navigator.sendBeacon() returning true only means the BROWSER
+      // accepted the request for delivery — not that it ever reached the
+      // server (no ack, no retry, nothing). Removing the item from `queue`
+      // right here on that signal alone meant a beacon silently dropped by
+      // a flaky connection was gone for good. Items now stay in the
+      // persisted queue regardless of what beacon() returns; the next
+      // normal flush — on resume, on reload via adopt(), or the periodic
+      // timer — resends them through post(), which DOES get a real
+      // response. The server already dedupes by `rid` (claimRid/releaseRid
+      // in usage-store.js — the same mechanism this queue's own
+      // retry-after-failure path already depends on), so a beacon that
+      // actually did arrive and is later resent anyway is a no-op there,
+      // never a double count.
+      queue.forEach(it => { if (!it.beaconedAt) { beacon(it); it.beaconedAt = Date.now(); } });
       persist();
       return;
     }

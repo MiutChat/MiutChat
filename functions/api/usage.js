@@ -1,6 +1,7 @@
 'use strict';
 
 import { sanitizeReport, recordUsage, readUsage, claimRid, releaseRid, MAX_BODY } from '../_lib/usage-store.js';
+import { discoverAdminShards } from '../_lib/firebase-admin.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
@@ -24,7 +25,8 @@ export async function onRequest(ctx) {
 
   if (request.method === 'GET') {
     if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
-    const out = await readUsage(env, new URL(request.url).searchParams.get('days'));
+    const shardNames = discoverAdminShards(env).map(s => s.name);
+    const out = await readUsage(env, shardNames, fetch, Date.now());
     return json(out, out.error ? 502 : 200);
   }
 
