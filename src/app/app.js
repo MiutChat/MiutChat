@@ -3062,43 +3062,55 @@ function startPresenceListener() {
  *      Calling this directly from the leaving client, before it tears down,
  *      closes that gap.
  */
+async function _wipeOrScheduleEmptyRoom(code, roomRef, autoDeleteAt, immediate) {
+  let applied = false;
+  try {
+    await db.runTransaction(async tx => {
+      const txSnap = await tx.get(roomRef);
+      if (!txSnap.exists) return;
+      if (txSnap.data()?.emptyAt) return; // another tab already won
+      tx.update(roomRef, { emptyAt: ts_now(), autoDeleteAt });
+      applied = true;
+    });
+  } catch (_txErr) {
+    // Transaction denied (common for a non-admin member) — fall back to a
+    // plain update. Any approved member is allowed to set these two fields.
+    try {
+      const freshSnap = await roomRef.get();
+      if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
+        await roomRef.update({ emptyAt: ts_now(), autoDeleteAt });
+        applied = true;
+      }
+    } catch (_e2) { /* fail open — the server-side sweep still catches this room eventually via autoDeleteAt */ }
+  }
+  if (!applied) return;
+  if (immediate) {
+    // Best-effort right now — roomAutoExpired() in the Firestore rules
+    // means this succeeds for any signed-in client, admin or not, once
+    // autoDeleteAt has actually passed (it has, we just set it to "now").
+    await wipeRoom(code, db);
+    await clearCacheForRoom(code);
+  }
+  // Unconditional backstop, win or lose above: a dropped connection between
+  // the subcollection deletes and the room-doc delete, or between this call
+  // and clearCacheForRoom, should never leave the room un-wiped forever.
+  // The server re-verifies everything itself and deleting an already-deleted
+  // doc is a no-op, so nudging it here even after a clean local wipe costs
+  // nothing and closes any gap the client alone can't guarantee.
+  _requestServerExpire(code, 'empty');
+}
+
 async function _handleRoomBecameEmpty(code) {
   if (!code || !db) return;
   try {
     const allApproved = await db.collection('rooms').doc(code)
       .collection('members').where('approved', '==', true).get();
     const roomRef = db.collection('rooms').doc(code);
+    const nowTs = firebase.firestore.Timestamp.fromMillis(Date.now());
     if (allApproved.empty) {
       // Room was abandoned before anyone was ever properly approved —
-      // wipe immediately regardless of the Room Expiry setting. Guard
-      // against two clients/tabs both trying this at once: the first to
-      // set emptyAt wins.
-      let shouldWipe = false;
-      try {
-        await db.runTransaction(async tx => {
-          const txSnap = await tx.get(roomRef);
-          if (!txSnap.exists) return;
-          if (txSnap.data()?.emptyAt) return; // another tab already won
-          tx.update(roomRef, { emptyAt: ts_now() });
-          shouldWipe = true;
-        });
-      } catch (_txErr) {
-        // Transaction denied (non-admin member) — try direct update.
-        // Firestore rules allow creatorId to set emptyAt without admin doc.
-        try {
-          const freshSnap = await roomRef.get();
-          if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
-            await roomRef.update({ emptyAt: ts_now() });
-            shouldWipe = true;
-          }
-        } catch (_e2) { /* fail open */ }
-      }
-      if (shouldWipe) {
-        // A non-admin can't delete the room (Firestore rules) — wipeRoom then
-        // returns false and the server verifies emptiness and deletes it instead.
-        if (!(await wipeRoom(code, db))) _requestServerExpire(code, 'empty');
-        await clearCacheForRoom(code);
-      }
+      // wipe immediately regardless of the Room Expiry setting.
+      await _wipeOrScheduleEmptyRoom(code, roomRef, nowTs, true);
     } else if (!_roomWasEmpty) {
       // There ARE approved members — they've just all gone offline right
       // now. This is the "room emptied out" moment the configured Room
@@ -3107,46 +3119,16 @@ async function _handleRoomBecameEmpty(code) {
       //    0 (Instant) → wipe it right now, same as the fully-abandoned case
       //   >0            → schedule autoDeleteAt for that many ms from now;
       //                    the existing cleanup cron (functions/api/cleanup.js)
-      //                    picks it up naturally once that time passes
+      //                    and the entry-time check both pick it up once
+      //                    that time passes, via the exact same field.
       _roomWasEmpty = true;
       if (_roomExpiryMs === -1) {
         // never — nothing to schedule
       } else if (_roomExpiryMs === 0) {
-        let shouldWipe = false;
-        try {
-          await db.runTransaction(async tx => {
-            const txSnap = await tx.get(roomRef);
-            if (!txSnap.exists) return;
-            if (txSnap.data()?.emptyAt) return;
-            tx.update(roomRef, { emptyAt: ts_now() });
-            shouldWipe = true;
-          });
-        } catch { /* another tab likely won, or denied — skip */ }
-        if (shouldWipe) {
-          if (!(await wipeRoom(code, db))) _requestServerExpire(code, 'empty');
-          await clearCacheForRoom(code);
-        }
+        await _wipeOrScheduleEmptyRoom(code, roomRef, nowTs, true);
       } else {
-        let scheduled = false;
         const newAutoDeleteAt = firebase.firestore.Timestamp.fromMillis(Date.now() + _roomExpiryMs);
-        try {
-          await db.runTransaction(async tx => {
-            const txSnap = await tx.get(roomRef);
-            if (!txSnap.exists) return;
-            if (txSnap.data()?.emptyAt) return;
-            tx.update(roomRef, { emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
-            scheduled = true;
-          });
-        } catch (_txErr) {
-          try {
-            const freshSnap = await roomRef.get();
-            if (freshSnap.exists && !freshSnap.data()?.emptyAt) {
-              await roomRef.update({ emptyAt: ts_now(), autoDeleteAt: newAutoDeleteAt });
-              scheduled = true;
-            }
-          } catch (_e2) { /* fail open — worst case the room just doesn't get an expiry set this time */ }
-        }
-        if (!scheduled) { /* another tab already scheduled it, or write was denied — nothing more to do */ }
+        await _wipeOrScheduleEmptyRoom(code, roomRef, newAutoDeleteAt, false);
       }
     }
   } catch { /* silently skip on error */ }
@@ -3635,17 +3617,17 @@ async function _checkRoomExpiry(code, db, knownSnap) {
     const data = snap.data() || {};
     const expiry = data.autoDeleteAt?.toMillis?.() || 0;
     if (expiry && expiry < Date.now()) {
-      // Room expired — wipe and send user back to join screen. Client first
-      // (instant, no network round-trip) — it only actually succeeds when
-      // we happen to be the room's own creator/admin (Firestore rules
-      // require it for the final room-doc delete; see wipeRoom's comment),
-      // same convention as the "last member left" wipes above. Only ask
-      // the server (admin SDK, works regardless of role) when that fails,
-      // so a non-admin hitting an expired room isn't also attempting —
-      // and failing, with a logged warning — the exact delete the other
-      // path is about to do anyway.
+      // Room expired — block entry (for every role: creator, admin or plain
+      // member alike) and send the user back to the join screen. Client
+      // wipe first — the Firestore rules' roomAutoExpired() check means this
+      // now succeeds for anyone once autoDeleteAt has actually passed, admin
+      // or not. The server call fires regardless of whether that succeeded:
+      // deleting an already-deleted doc is a no-op there, so this is a free
+      // backstop against a dropped connection leaving the room half-wiped
+      // and rejoinable with its old history intact.
       toast('Room expired', 'This room has expired after inactivity.', 'clock');
-      if (!(await wipeRoom(code, db))) _requestServerExpire(code);
+      await wipeRoom(code, db);
+      _requestServerExpire(code);
       clearCacheForRoom(code).catch(() => {});
       localStorage.removeItem(CONFIG.SESSION_KEY);
       localStorage.removeItem(CONFIG.ROOM_KEY);

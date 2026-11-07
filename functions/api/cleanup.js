@@ -24,12 +24,23 @@
  *
  * WHAT IT DOES, per shard:
  *   Queries Firestore REST API for rooms where autoDeleteAt <= now, then
- *   deletes those documents via REST. Note: this only checks autoDeleteAt
- *   — it does NOT currently also match on a bare `emptyAt` with no
- *   autoDeleteAt set (an earlier version of this comment claimed it did;
- *   that was never actually implemented). If a room is wiped client-side
- *   but autoDeleteAt isn't also set at that point, it won't be caught
- *   here until/unless autoDeleteAt is set too.
+ *   deletes their messages/typing/members subcollections followed by the
+ *   room document itself, via REST. autoDeleteAt is the single signal for
+ *   every expiry path — scheduled inactivity, "last member left" with a
+ *   delay, AND instant/abandoned (the client sets it to "now" for those
+ *   too, see _handleRoomBecameEmpty in app.js) — so this one query catches
+ *   all of them, not just the scheduled-delay case.
+ *
+ *   The legacy anonymous-auth token this runs as is in no way special —
+ *   it is just a fresh signed-in session — so this only works because the
+ *   Firestore rules themselves grant delete on a room (and its
+ *   subcollections) once that room's own autoDeleteAt has passed
+ *   (roomAutoExpired() in config/firestore.rules), regardless of who is
+ *   asking. Without that rule this whole path is a silent no-op: the
+ *   query above succeeds (reads are open to any signed-in user) but every
+ *   delete call below comes back permission-denied and is swallowed by
+ *   the try/catch, so "cleaned" rooms stay fully intact in Firestore
+ *   forever — which is exactly the bug this file used to have.
  *
  * REQUIRED ENV VARS (Cloudflare Pages dashboard):
  *   FIREBASE_PROJECT_ID / FIREBASE_API_KEY           — primary shard (db0)
@@ -94,7 +105,58 @@ async function deleteDoc(projectId, token, path) {
   return res.ok || res.status === 404;
 }
 
-/** Query rooms where autoDeleteAt < now OR emptyAt exists */
+/** List document names in a room's subcollection, one page at a time. */
+async function listSubcollection(projectId, token, roomPath, collectionId, pageSize = 300) {
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${roomPath}:runQuery`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId }],
+        select: { fields: [{ fieldPath: '__name__' }] },
+        limit: pageSize,
+      },
+    }),
+  });
+  if (!res.ok) throw new Error('runQuery ' + res.status);
+  const rows = await res.json();
+  return rows.filter(r => r.document?.name).map(r => r.document.name);
+}
+
+/** Delete up to 500 full document names in one batched request. */
+async function batchDelete(projectId, token, names) {
+  for (let i = 0; i < names.length; i += 500) {
+    const res = await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:batchWrite`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ writes: names.slice(i, i + 500).map(n => ({ delete: n })) }),
+    });
+    if (!res.ok) throw new Error('batchWrite ' + res.status);
+  }
+}
+
+/**
+ * Fully delete one room via REST: subcollections first, room doc last — the
+ * same order as firebase-admin.js's wipeRoom, so a room never ends up with
+ * its doc gone but its messages/members/typing orphaned and still readable
+ * by whoever reuses the code next. Relies entirely on roomAutoExpired() in
+ * the Firestore rules; stops and reports the error rather than leaving the
+ * room half-deleted if any step is denied partway through.
+ */
+async function wipeRoomLegacy(projectId, token, roomPath) {
+  for (const collectionId of ['messages', 'typing', 'members']) {
+    for (;;) {
+      const names = await listSubcollection(projectId, token, roomPath, collectionId);
+      if (!names.length) break;
+      await batchDelete(projectId, token, names);
+      if (names.length < 300) break;
+    }
+  }
+  await deleteDoc(projectId, token, roomPath);
+}
+
+/** Query rooms whose autoDeleteAt has passed — the one signal every expiry path sets. */
 async function findStaleRooms(projectId, token) {
   const now  = new Date().toISOString();
   const url  = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
@@ -135,7 +197,7 @@ async function cleanupShard(shard) {
   let deleted = 0;
   for (const path of paths) {
     try {
-      await deleteDoc(shard.projectId, token, path);
+      await wipeRoomLegacy(shard.projectId, token, path);
       deleted++;
     } catch {}
   }

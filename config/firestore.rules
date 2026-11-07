@@ -56,6 +56,20 @@ service cloud.firestore {
         && request.time.toMillis() > resource.data.createdAt.toMillis() + ttl;
     }
 
+    // True once the room's OWN autoDeleteAt has passed. autoDeleteAt can only
+    // ever be set to a future timestamp by an approved member/admin (see
+    // autoDeleteNotPast below), so this is safe to grant to ANY signed-in
+    // client — not just the creator/admin. That is deliberate: it is what
+    // lets the member who notices a room is empty, the entry-time expiry
+    // check, and the server-side sweep (which may be running as a bare
+    // anonymous session with no service account configured) all actually
+    // delete an expired room and its subcollections, instead of only being
+    // able to detect expiry and then fail on the delete itself.
+    function roomAutoExpired(roomCode) {
+      let at = roomData(roomCode).get('autoDeleteAt', null);
+      return at is timestamp && at < request.time;
+    }
+
     // A non-admin may schedule autoDeleteAt only in the future (or clear it).
     // Without this, any member could back-date it and make the room count as
     // "expired", which the server cleanup and entry-time check delete.
@@ -166,7 +180,7 @@ service cloud.firestore {
           )
         );
 
-      allow delete: if isSignedIn() && (isRoomCreator(roomCode) || isRoomAdmin(roomCode));
+      allow delete: if isSignedIn() && (isRoomCreator(roomCode) || isRoomAdmin(roomCode) || roomAutoExpired(roomCode));
 
       match /messages/{msgId} {
         allow read: if isApprovedMember(roomCode);
@@ -194,11 +208,17 @@ service cloud.firestore {
             || isMemberMessageUpdate()
           );
 
-        allow delete: if isApprovedMember(roomCode)
+        allow delete: if isSignedIn()
           && (
-            resource.data.senderId == request.auth.uid
-            || isRoomAdmin(roomCode)
-            || messageExpired(roomCode)
+            roomAutoExpired(roomCode)
+            || (
+              isApprovedMember(roomCode)
+              && (
+                resource.data.senderId == request.auth.uid
+                || isRoomAdmin(roomCode)
+                || messageExpired(roomCode)
+              )
+            )
           );
       }
 
@@ -267,7 +287,7 @@ service cloud.firestore {
             )
           );
 
-        allow delete: if isSignedIn() && (request.auth.uid == memberId || isRoomAdmin(roomCode));
+        allow delete: if isSignedIn() && (request.auth.uid == memberId || isRoomAdmin(roomCode) || roomAutoExpired(roomCode));
       }
 
       match /typing/{typingId} {
@@ -277,7 +297,7 @@ service cloud.firestore {
           && request.auth.uid == typingId
           && request.resource.data.keys().hasOnly(['name','ts']);
 
-        allow delete: if isSignedIn() && (request.auth.uid == typingId || isRoomAdmin(roomCode));
+        allow delete: if isSignedIn() && (request.auth.uid == typingId || isRoomAdmin(roomCode) || roomAutoExpired(roomCode));
       }
     }
   }
