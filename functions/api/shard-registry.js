@@ -70,7 +70,7 @@
 import { ledgerAdd } from '../_lib/usage-ledger.js';
 import { pickShard, utilization, safetyOf } from '../_lib/placement.js';
 
-function discoverShards(env) {
+export function discoverShards(env) {
   const shards = [{
     name:   'miut-db0',
     active: !!(env.FIREBASE_API_KEY && env.FIREBASE_PROJECT_ID),

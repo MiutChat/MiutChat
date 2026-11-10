@@ -454,8 +454,17 @@ const _usageMeter = (() => {
     ['set', 'update', 'delete'].forEach(op => {
       const o = tx[op];
       if (typeof o !== 'function') return;
+      // tx.set/update/delete are synchronous local calls within a transaction (no network round trip per call --
+      // only the eventual runTransaction() commit is a real request), so -- unlike writer()/adder() below, which
+      // optimistically count right when a write is CALLED because there's nothing else to wait for -- these are
+      // counted right here too, immediately, rather than batched into `rec.ops` and counted only once `fn(tx)`
+      // returns. For an async updateFunction, `fn(tx)` returns a pending promise almost immediately, before any of
+      // its awaits have actually called tx.set/update/delete -- counting from `rec.ops` at that point would count
+      // nothing yet. Rollback (on retry or final failure, see runTransaction below) still works off `rec.ops`,
+      // which keeps growing with every call for exactly that purpose.
       tx[op] = function (ref) {
-        try { this.__miutRec.ops.push({ ref, op, keys: op === 'update' ? keysOf(args(arguments).slice(1)) : [] }); } catch {}
+        const item = { ref, op, keys: op === 'update' ? keysOf(args(arguments).slice(1)) : [] };
+        try { this.__miutRec.ops.push(item); countOps([item]); } catch {}
         return o.apply(this, arguments);
       };
     });
@@ -480,14 +489,22 @@ const _usageMeter = (() => {
     if (typeof batch === 'function') fs.batch = function () { return patchBatch(batch.apply(this, arguments)); };
     const run = fs.runTransaction;
     if (typeof run === 'function') {
+      // A transaction's updateFunction can run more than once if Firestore has to retry it under contention -- each
+      // attempt's writes are counted as they're made (in patchTx above); if a NEW attempt starts, the previous
+      // attempt's tentative writes never actually happened, so they're rolled back here before the next attempt's
+      // own counting begins. If the whole transaction ultimately fails, the LAST attempt's writes are rolled back
+      // the same way -- same optimistic-then-rollback-on-confirmed-failure shape as writer()/adder()/patchBatch().
       fs.runTransaction = function (fn, opts) {
         let last = null;
         const p = run.call(this, function (tx) {
+          if (last) { try { countOps(last.ops, -1); } catch {} }
           last = { ops: [] };
           patchTx(tx, last);
           return fn.apply(this, arguments);
         }, opts);
-        try { p.then(() => { try { if (last) countOps(last.ops); } catch {} }, () => {}); } catch {}
+        try {
+          p.then(() => { last = null; }, () => { if (last) { try { countOps(last.ops, -1); } catch {} } last = null; });
+        } catch {}
         return p;
       };
     }

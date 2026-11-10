@@ -1,7 +1,7 @@
 'use strict';
 
 import { sanitizeReport, recordUsage, readUsage, claimRid, releaseRid, MAX_BODY } from '../_lib/usage-store.js';
-import { discoverAdminShards } from '../_lib/firebase-admin.js';
+import { discoverShards } from './shard-registry.js';
 
 const CORS = { 'Access-Control-Allow-Origin': '*' };
 const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
@@ -25,7 +25,11 @@ export async function onRequest(ctx) {
 
   if (request.method === 'GET') {
     if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
-    const shardNames = discoverAdminShards(env).map(s => s.name);
+    // The configured (client-facing) shards, NOT discoverAdminShards(env) -- shardLoad lives in the registry
+    // project and is written using the registry's own credentials, so a shard needs no service account of its own
+    // to have usage data; discoverAdminShards only lists shards that happen to ALSO have one configured for
+    // cleanup/expire-room/feedback-migrate, which would silently drop any shard that lacks one from this view.
+    const shardNames = discoverShards(env).filter(s => s.active).map(s => s.name);
     const out = await readUsage(env, shardNames, fetch, Date.now());
     return json(out, out.error ? 502 : 200);
   }
