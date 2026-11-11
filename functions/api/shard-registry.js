@@ -328,11 +328,34 @@ async function findBinding(projectId, token, ident, env, names) {
     const oldPath = `bindings/${encodeURIComponent(ident.legacyCode)}`;
     const old = await restGetDoc(projectId, token, oldPath).catch(() => null);
     if (old?.db && names.has(old.db)) {
-      try { await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: old.db }); await restDeleteDoc(projectId, token, oldPath); } catch { /* best effort: next lookup retries */ }
+      try { await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: old.db, lastSeenAt: Date.now() }); await restDeleteDoc(projectId, token, oldPath); } catch { /* best effort: next lookup retries */ }
       return { db: old.db };
     }
   }
   return null;
+}
+
+// `bind` and `resolve{replace:true}` both let an unauthenticated caller who
+// merely knows a room's codeHash assert "this room's binding should be X" —
+// there is no way for the registry to independently verify that claim (it
+// never sees the plaintext code, by design — see the comment above
+// CODE_HASH_RE). Without a check here, anyone who knows a room's code
+// (any current or former member, or anyone who guessed/obtained it) could
+// silently repoint an ACTIVE room's binding to a different, unrelated
+// shard — breaking the room for every other member with a single
+// unauthenticated call. `lastSeenAt` is stamped on every binding write and
+// on every successful read of a found binding (see handleGetLookup and the
+// `lookup` action below), so a binding that real members are actually
+// using will always look "recently seen". Only a binding nobody has
+// touched in REBIND_GRACE_MS — the genuine stale/never-really-bound case
+// the self-heal flows exist for — may be silently overwritten.
+const REBIND_GRACE_MS = 10 * 60 * 1000;
+function bindingLooksStale(existing) {
+  if (!existing) return true;
+  return Date.now() - (Number(existing.lastSeenAt) || 0) >= REBIND_GRACE_MS;
+}
+function touchSeen(projectId, token, id) {
+  return restMergeDoc(projectId, token, `bindings/${id}`, { lastSeenAt: Date.now() }).catch(() => {});
 }
 
 function ctEq(a, b) {
@@ -392,7 +415,9 @@ async function handleGetLookup(request, env, waitUntil) {
   const res = new Response(JSON.stringify({ db: rec.db, found: true, expired: !!rec.expired }), {
     status: 200, headers: { 'Content-Type': 'application/json;charset=UTF-8', 'Cache-Control': 'public, max-age=30, s-maxage=60' },
   });
-  if (cache) { const p = cache.put(cacheKey, res.clone()).catch(() => {}); if (typeof waitUntil === 'function') waitUntil(p); else await p; }
+  const touch = touchSeen(projectId, token, await bindingIdOf(env, h));
+  if (cache) { const p = cache.put(cacheKey, res.clone()).catch(() => {}); if (typeof waitUntil === 'function') { waitUntil(p); waitUntil(touch); } else { await p; await touch; } }
+  else if (typeof waitUntil === 'function') waitUntil(touch); else await touch;
   return res;
 }
 
@@ -431,7 +456,10 @@ export async function onRequest(ctx) {
     let existing = null;
     try { existing = await findBinding(projectId, token, ident, env, names); }
     catch (e) { return json({ error: 'registry read failed: ' + e.message }, 502); }
-    if (existing?.db) return json({ db: existing.db, found: true, expired: !!existing.expired });
+    if (existing?.db) {
+      ctx.waitUntil ? ctx.waitUntil(touchSeen(projectId, token, ident.id)) : await touchSeen(projectId, token, ident.id);
+      return json({ db: existing.db, found: true, expired: !!existing.expired });
+    }
     // `legacy` tells a hash-only client that retrying with the plaintext code can still find an old binding.
     return json({ found: false, legacy: legacyEnabled(env) && !ident.legacyCode });
   }
@@ -444,7 +472,7 @@ export async function onRequest(ctx) {
     const replace = body?.replace === true;
 
     const [existing, scored] = await Promise.all([
-      replace ? null : findBinding(projectId, token, ident, env, names).catch(() => null),
+      findBinding(projectId, token, ident, env, names).catch(() => null),
       Promise.all(shards.map(async s => {
         let load = null;
         try { load = await restGetDoc(projectId, token, `shardLoad/${s.name}`); } catch {}
@@ -453,7 +481,9 @@ export async function onRequest(ctx) {
         return { name: s.name, count, degraded, prevLoad: load };
       })),
     ]);
-    if (existing?.db && names.has(existing.db)) {
+    // A binding that's recently been seen is honored even when the caller
+    // asked to replace it — see the comment above bindingLooksStale().
+    if (existing?.db && names.has(existing.db) && (!replace || !bindingLooksStale(existing))) {
       return json({ db: existing.db, isNew: false });
     }
 
@@ -464,11 +494,11 @@ export async function onRequest(ctx) {
 
     try {
       if (replace) {
-        await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name });
-      } else if (!(await restCreateDocIfAbsent(projectId, token, `bindings/${ident.id}`, { db: chosen.name }))) {
+        await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name, lastSeenAt: Date.now() });
+      } else if (!(await restCreateDocIfAbsent(projectId, token, `bindings/${ident.id}`, { db: chosen.name, lastSeenAt: Date.now() }))) {
         const winner = await restGetDoc(projectId, token, `bindings/${ident.id}`).catch(() => null);
         if (winner?.db && names.has(winner.db)) { releasePick(chosen.name, reservation); return json({ db: winner.db, isNew: false }); }
-        await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name });
+        await restSetDoc(projectId, token, `bindings/${ident.id}`, { db: chosen.name, lastSeenAt: Date.now() });
       }
     } catch (e) {
       releasePick(chosen.name, reservation);
@@ -524,8 +554,15 @@ export async function onRequest(ctx) {
     const ident = await identify(body, env), db = body?.db;
     if (ident.error) return json({ error: ident.error }, 400);
     if (!db || !names.has(db)) return json({ error: 'invalid db' }, 400);
+    let existing = null;
+    try { existing = await restGetDoc(projectId, token, `bindings/${ident.id}`); } catch {}
+    // See the comment above bindingLooksStale(): refuse to silently repoint
+    // a binding that looks like it's in active use pointing somewhere else.
+    if (existing?.db && names.has(existing.db) && existing.db !== db && !bindingLooksStale(existing)) {
+      return json({ ok: false, error: 'binding_recently_active', db: existing.db });
+    }
     try {
-      await restSetDoc(projectId, token, `bindings/${ident.id}`, { db });
+      await restSetDoc(projectId, token, `bindings/${ident.id}`, { db, lastSeenAt: Date.now() });
     } catch (e) { return json({ error: 'registry write failed: ' + e.message }, 502); }
     return json({ ok: true });
   }

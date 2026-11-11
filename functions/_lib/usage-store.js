@@ -56,7 +56,13 @@ export const LIMITS = { reads: 50000, writes: 20000, deletes: 20000 };
 export const MAX_BODY = 16384;
 
 const RID_RE = /^[A-Za-z0-9_-]{8,32}$/;
-const MAX_FIELD = 200000;
+// Generous ceiling for one real tab's ~5-minute report, not a limit anyone
+// legitimate gets near — kept tight because this endpoint is unauthenticated
+// and a forged report directly inflates the shardLoad numbers placement.js
+// uses to route new rooms, so a high ceiling here is a load-balancer
+// poisoning primitive, not just an inflated counter.
+const MAX_FIELD = 3000;
+const MAX_SHARD_DELTA = 6000; // hard per-shard-per-report ceiling across all categories combined, enforced in sanitizeReport below
 const MIN_GAP_MS = 25000;
 const round1 = n => Math.round(n * 10) / 10;
 
@@ -88,6 +94,7 @@ export function sanitizeReport(body, now = Date.now()) {
         if (n > 0) sum[i] += n;
       }
     }
+    for (let i = 0; i < 4; i++) sum[i] = Math.min(sum[i], MAX_SHARD_DELTA);
     if (sum[0] || sum[1] || sum[2] || sum[3]) deltas.set(shard, sum);
   }
   return deltas.size ? { rid: body.rid, deltas } : null;
