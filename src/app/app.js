@@ -2255,6 +2255,103 @@ function closeMemberDetail() {
   _mdCurrentUid = null;
 }
 
+function fmtBytes(b) {
+  return b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+}
+
+function _miRow(label, value, extraClass) {
+  const row = document.createElement('div');
+  row.className = 'md-row' + (extraClass ? ' ' + extraClass : '');
+  const l = document.createElement('span'); l.className = 'md-row-label'; l.textContent = label;
+  const v = document.createElement('span'); v.className = 'md-row-value'; v.textContent = value;
+  row.appendChild(l); row.appendChild(v);
+  return row;
+}
+
+const _miFmt = ms => new Date(ms).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+
+/**
+ * Opens the per-message info panel: sender, sent/edited time, type (plus
+ * file details for non-text messages), expiry, and who's read it so far.
+ * Shows the modal immediately with placeholders, then fills it in once the
+ * one-time fetch resolves — a single direct doc .get() (not a listener,
+ * not a query), the cheapest possible read for a deliberate, infrequent
+ * action like this, and the most reliable source for a field like readBy
+ * that keeps changing after the message first rendered.
+ */
+async function openMsgInfo(docId, wrap) {
+  const overlay = $('msg-info-modal');
+  if (!overlay || !docId || !state.roomCode || !db) return;
+
+  const rowsEl = $('mi-rows'), readersEl = $('mi-readers'), readLabelEl = $('mi-readby-label');
+  rowsEl.innerHTML = ''; readersEl.innerHTML = '';
+  readLabelEl.style.display = 'none';
+  rowsEl.appendChild(_miRow('Status', 'Loading…'));
+  overlay.style.display = 'flex';
+
+  let snap;
+  try { snap = await db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).get(); }
+  catch { rowsEl.innerHTML = ''; rowsEl.appendChild(_miRow('Status', "Couldn't load — try again")); return; }
+
+  if (!snap.exists) { rowsEl.innerHTML = ''; rowsEl.appendChild(_miRow('Status', 'No longer available')); return; }
+  const data = snap.data() || {};
+
+  const isMine  = data.senderId === state.me?.id;
+  const sender  = isMine ? 'You' : (data.senderName || _memberByUid.get(data.senderId)?.name || 'Unknown');
+  const sentMs  = data.createdAt?.toMillis?.() ?? data.ts ?? null;
+
+  rowsEl.innerHTML = '';
+  rowsEl.appendChild(_miRow('From', sender));
+  rowsEl.appendChild(_miRow('Sent', sentMs ? _miFmt(sentMs) : 'Unknown'));
+  if (data.edited) {
+    const editedMs = data.editedAt?.toMillis?.() ?? (typeof data.editedAt === 'number' ? data.editedAt : null);
+    rowsEl.appendChild(_miRow('Edited', editedMs ? _miFmt(editedMs) : 'Yes'));
+  }
+
+  const typeLabel = { text: 'Text', image: 'Image', video: 'Video', file: 'File' }[data.type] || data.type || 'Text';
+  rowsEl.appendChild(_miRow('Type', typeLabel + (data.fileName ? ' — ' + data.fileName : '')));
+  if (typeof data.fileSize === 'number') rowsEl.appendChild(_miRow('Size', fmtBytes(data.fileSize)));
+
+  if (sentMs && _roomTtlMs > 0) rowsEl.appendChild(_miRow('Expires', _miFmt(sentMs + _roomTtlMs)));
+  else rowsEl.appendChild(_miRow('Expires', 'Never'));
+
+  rowsEl.appendChild(_miRow('Encrypted with', 'AES-256-GCM'));
+
+  // Read by — everyone except the sender, newest read first.
+  const readBy = data.readBy || {};
+  const readers = Object.keys(readBy)
+    .filter(uid => uid !== data.senderId)
+    .map(uid => ({ uid, at: readBy[uid], m: _memberByUid.get(uid) }))
+    .sort((a, b) => (b.at || 0) - (a.at || 0));
+
+  readLabelEl.style.display = '';
+  if (!readers.length) {
+    const empty = document.createElement('div');
+    empty.className = 'mi-empty';
+    empty.textContent = 'Not read yet';
+    readersEl.appendChild(empty);
+  } else {
+    for (const r of readers) {
+      const name = r.uid === state.me?.id ? 'You' : (r.m?.name || 'Former member');
+      const row = document.createElement('div');
+      row.className = 'mi-reader';
+      const av = document.createElement('div');
+      av.className = 'mi-reader-avatar';
+      av.style.background = r.m?.color || avatarColor(name);
+      av.textContent = initials(name);
+      const nameEl = document.createElement('div'); nameEl.className = 'mi-reader-name'; nameEl.textContent = name;
+      const timeEl = document.createElement('div'); timeEl.className = 'mi-reader-time'; timeEl.textContent = r.at ? _miFmt(r.at) : '';
+      row.appendChild(av); row.appendChild(nameEl); row.appendChild(timeEl);
+      readersEl.appendChild(row);
+    }
+  }
+}
+
+function closeMsgInfo() {
+  const overlay = $('msg-info-modal');
+  if (overlay) overlay.style.display = 'none';
+}
+
 function updateAdminBadge() {
   const badge = $('my-admin-badge');
   if (!badge) return;
@@ -3336,6 +3433,7 @@ function showTypingUI(typers) {
 
 function renderMembers(snap) {
   _memberNames = [];
+  _memberByUid = new Map();
   const list = $('members-list'); if (!list) return;
   list.innerHTML = '';
 
@@ -3343,6 +3441,7 @@ function renderMembers(snap) {
 
   snap.forEach(doc => {
     const m = doc.data();
+    _memberByUid.set(doc.id, m);
     if (m.pubKey) _pubKeyCache.set(doc.id, m.pubKey);
 
     // D7: Live-update own role if promoted while in the room
@@ -4333,6 +4432,7 @@ function clearReply() {
 }
 
 let _memberNames  = [];      // tracked for @mention autocomplete
+let _memberByUid  = new Map(); // uid -> member data, for resolving read-by names in the message info panel
 let _editingDocId = null;    // docId of message currently being edited
 let _editingWrap  = null;
 let _editingTs    = 0;       // original message timestamp (for 2-min window)
@@ -5312,6 +5412,16 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     }
   });
   actRow.appendChild(replyBtn);
+
+  const infoBtn = document.createElement('button');
+  infoBtn.className = 'strip-action';
+  infoBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" width="15" height="15"><circle cx="10" cy="10" r="7.25" stroke="currentColor" stroke-width="1.5"/><path d="M10 9.2v4.3M10 6.8v.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span>Info</span>`;
+  infoBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    strip.remove();
+    openMsgInfo(currentId(), wrap);
+  });
+  actRow.appendChild(infoBtn);
 
   if (isMine) {
     const canEdit = plainText !== null && (Date.now() - (msgTs || 0)) < CONFIG.EDIT_WINDOW_MS;
@@ -6658,6 +6768,8 @@ function _wireAllHandlers() {
   // ── Member detail panel ──────────────────────────────────────────────────────
   on('member-detail-close-btn', 'click', () => closeMemberDetail());
   on('member-detail-modal', 'click', e => { if (e.target.id === 'member-detail-modal') closeMemberDetail(); });
+  on('msg-info-close-btn', 'click', () => closeMsgInfo());
+  on('msg-info-modal', 'click', e => { if (e.target.id === 'msg-info-modal') closeMsgInfo(); });
 
   // ── Settings modal ────────────────────────────────────────────────────────────
   on('settings-modal', 'click', e => closeModal(e));

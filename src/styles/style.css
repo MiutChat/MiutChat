@@ -258,6 +258,16 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 .md-key-note{font-family:var(--fmono);font-size:.6rem;color:var(--text3);line-height:1.6;margin:0 0 18px}
 .md-actions{display:flex;flex-direction:column;gap:8px}
 .md-action-btn{width:100%;padding:12px 16px;border-radius:var(--r);background:transparent;border:1px solid var(--teal-b);color:var(--teal);font-family:var(--fui);font-size:.68rem;font-weight:700;letter-spacing:1.5px;cursor:pointer;transition:background var(--fast) ease,transform var(--fast) var(--spring)}
+.msg-info{max-width:380px}
+.mi-section-label{font-family:var(--fui);font-size:.6rem;font-weight:700;letter-spacing:1.5px;color:var(--text2);margin:16px 0 8px}
+.mi-readers{display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--r2);overflow:hidden;contain:layout style}
+.mi-reader{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--border)}
+.mi-reader:last-child{border-bottom:none}
+.mi-reader-avatar{width:26px;height:26px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-family:var(--fui);font-size:.6rem;font-weight:800;color:var(--bg)}
+.mi-reader-name{font-family:var(--fmono);font-size:.7rem;color:var(--text);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mi-reader-time{font-family:var(--fmono);font-size:.62rem;color:var(--text2);flex-shrink:0;white-space:nowrap}
+.mi-empty{font-family:var(--fmono);font-size:.68rem;color:var(--text3);padding:14px;text-align:center;border:1px dashed var(--border);border-radius:var(--r2)}
+@media (max-width:380px){.mi-reader-time{display:none}}
 .md-action-btn:hover{background:var(--teal-dim)}
 .md-action-btn.danger{border-color:rgba(255,95,95,.4);color:var(--danger)}
 .md-action-btn.danger:hover{background:rgba(255,95,95,.12)}
