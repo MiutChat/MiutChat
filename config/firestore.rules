@@ -80,6 +80,23 @@ service cloud.firestore {
             && request.resource.data.autoDeleteAt > request.time);
     }
 
+    // An admin may redact (soft-delete) another member's message — exactly
+    // the shape _softDeleteRemote() writes in app.js — but never replace its
+    // content with something else. Only the sender themselves (handled in
+    // the update rule's other branch) can set arbitrary content.
+    function isAdminRedaction() {
+      return changedKeys().hasOnly(['deleted','deletedBy','deletedAt','enc','encData','fileName','mime','groupId','reactions'])
+        && request.resource.data.deleted == true
+        && request.resource.data.deletedBy == request.auth.uid
+        && request.resource.data.deletedAt == request.time
+        && request.resource.data.get('enc', null) == null
+        && request.resource.data.get('encData', null) == null
+        && request.resource.data.get('fileName', null) == null
+        && request.resource.data.get('mime', null) == null
+        && request.resource.data.get('groupId', null) == null
+        && request.resource.data.get('reactions', null) == null;
+    }
+
     function isMemberMessageUpdate() {
       return changedKeys().hasOnly(['readBy', 'reactions', 'replyTo'])
         && request.resource.data.get('readBy', {}).diff(resource.data.get('readBy', {})).affectedKeys().hasOnly([request.auth.uid])
@@ -204,7 +221,7 @@ service cloud.firestore {
           && request.resource.data.createdAt == resource.data.createdAt
           && (
             resource.data.senderId == request.auth.uid
-            || isRoomAdmin(roomCode)
+            || (isRoomAdmin(roomCode) && isAdminRedaction())
             || isMemberMessageUpdate()
           );
 

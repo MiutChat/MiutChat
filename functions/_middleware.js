@@ -133,14 +133,29 @@ function _takeToken(key, burst, perMin, now) {
   return Math.max(1, Math.ceil((1 - b.t) / rate / 1000));
 }
 
-function apiRateLimit(request, path, env) {
+async function apiRateLimit(request, path, env) {
   if (env?.API_RATE_LIMIT_DISABLED === '1') return null;
   const mv   = parseFloat(env?.API_RATE_LIMIT_MULT);
   let mult   = Number.isFinite(mv) ? Math.min(20, Math.max(0.1, mv)) : 1;
   const ipH  = request.headers.get('CF-Connecting-IP');
   if (!ipH) mult *= 5;                                                      // header is always set by Cloudflare; missing = local dev
-  const rule = API_LIMITS.find(r => (path === r.p || path.startsWith(r.p + '/')) && (r.m === '*' || r.m === request.method)) || API_DEFAULT_LIMIT;
-  const wait = _takeToken(`${rule.name}|${ipH || 'unknown'}`, Math.max(1, rule.burst * mult), rule.perMin * mult, Date.now());
+  const rule  = API_LIMITS.find(r => (path === r.p || path.startsWith(r.p + '/')) && (r.m === '*' || r.m === request.method)) || API_DEFAULT_LIMIT;
+  const burst = Math.max(1, rule.burst * mult);
+  const perMin = rule.perMin * mult;
+
+  let wait;
+  if (env?.MIUT_RL_DO) {
+    const stub = env.MIUT_RL_DO.get(env.MIUT_RL_DO.idFromName(ipH || 'unknown'));
+    const res = await stub.fetch('https://do/limit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'bucket', action: rule.name, burst, perMin }),
+    });
+    ({ wait } = await res.json());
+  } else {
+    wait = _takeToken(`${rule.name}|${ipH || 'unknown'}`, burst, perMin, Date.now());
+  }
+
   if (!wait) return null;
   return new Response(JSON.stringify({ error: 'Too many requests', retryAfter: wait }), {
     status: 429,
@@ -154,7 +169,7 @@ async function handle(ctx) {
   const path = url.pathname;
 
   if (path.startsWith('/api/')) {
-    const limited = apiRateLimit(request, path, env);
+    const limited = await apiRateLimit(request, path, env);
     if (limited) return limited;
   }
 

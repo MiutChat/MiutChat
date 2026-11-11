@@ -24,3 +24,8 @@ RL_SEND_WIN_S = "10"
 [[kv_namespaces]]
 binding = "MIUT_KV"
 id      = "f5973db3a599408ca5dbce63ed19487e"
+
+[[durable_objects.bindings]]
+name       = "MIUT_RL_DO"
+class_name = "RateLimiter"
+script_name = "miut-rate-limiter-do"

@@ -25,11 +25,17 @@ export async function onRequest(context) {
   const country = request.cf?.country || 'unknown';
   const now     = Date.now();
 
-  const entry = { ip, path, ua, country, ts: new Date(now).toISOString() };
+  const dest = request.headers.get('Sec-Fetch-Dest') || '';
+  const forcedBySomeOtherPage = ['image', 'script', 'style', 'iframe', 'object', 'embed', 'video', 'audio', 'font', 'track'].includes(dest);
+
+  const entry = { ip, path, ua, country, dest, ts: new Date(now).toISOString() };
   console.log('[CANARY-TRAP]', JSON.stringify(entry));
 
-  // Ban the IP for 24 hours via KV
-  if (env.MIUT_BAN) {
+  // Ban the IP for 24 hours via KV — skipped when the hit looks like a
+  // third-party page forcing a visitor's browser to load this URL as a
+  // subresource (img/script/iframe/etc.), since that bans an innocent
+  // visitor rather than a scanner.
+  if (env.MIUT_BAN && !forcedBySomeOtherPage) {
     await env.MIUT_BAN.put(`ban:${ip}`, JSON.stringify({
       reason: `canary_trap:${path}`,
       ua,

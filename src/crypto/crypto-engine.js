@@ -288,7 +288,7 @@ async function encryptFile(file, metadata, roomCode, senderId, epoch, salt, onPr
 
   await Promise.all(jobs.map(j => j()));
 
-  if (out.length > MAX_FIRESTORE_DOC) {
+  if (results.some(r => r && r.size > MAX_FIRESTORE_DOC)) {
     throw new Error(`OVERFLOW: chunk ${results.findIndex(r => r && r.size > MAX_FIRESTORE_DOC)} exceeds 1MB`);
   }
 

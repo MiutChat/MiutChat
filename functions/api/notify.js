@@ -289,6 +289,8 @@ async function runNotify(env, { roomCode, shard, type, senderId, senderName, ind
   if (!listed) return { error: 'Could not list members' };
   const members = listed.docs.map(readMember);
 
+  if (!members.some(m => m.uid === senderId)) return { error: 'sender is not a member of this room' };
+
   const targets = type === 'sync' ? [] : targetsFor(type, members, senderId);
   const dead = new Set();
   let results = [];

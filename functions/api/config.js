@@ -111,8 +111,6 @@ export async function onRequest(ctx) {
       'Content-Type':  'application/json;charset=UTF-8',
       // Cache 5 min at edge — rotate credentials without cache-bust issues
       'Cache-Control': 'public, max-age=300, s-maxage=300',
-      // Only this origin can read it — blocks cross-origin hotlinking
-      'Access-Control-Allow-Origin': 'same-origin',
     },
   });
 }

@@ -38,7 +38,7 @@ function isOriginAllowed(origin, env) {
   const allowed = env.MIUT_ALLOWED_ORIGINS
     ? env.MIUT_ALLOWED_ORIGINS.split(',').map(o => o.trim())
     : ALLOWED_ORIGINS_DEFAULT;
-  return allowed.some(o => origin.includes(o.replace('https://', '').replace('http://', '')));
+  return allowed.includes(origin);
 }
 
 const LIMITS = {
@@ -67,44 +67,49 @@ function getIp(req) {
  * @param {KVNamespace} MIUT_BAN
  * @returns {Promise<{ allowed: boolean, retryAfter?: number, reason?: string }>}
  */
-async function checkLimit(ip, action, limit, MIUT_RL, MIUT_BAN) {
-  // 1. Check permanent ban list first (fastest — single KV read)
-  const banned = await MIUT_BAN.get(`ban:${ip}`);
+async function checkLimitViaDO(MIUT_RL_DO, ip, action, maxCount, windowMs) {
+  const id = MIUT_RL_DO.idFromName(ip);
+  const stub = MIUT_RL_DO.get(id);
+  const res = await stub.fetch('https://do/limit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'window', action, maxCount, windowMs }),
+  });
+  return res.json();
+}
+
+async function checkLimitViaKV(MIUT_RL, ip, action, limit) {
+  const key = `rl:${ip}:${action}`;
+  const now = Date.now();
+  const windowMs = limit.windowSec * 1000;
+  const raw = await MIUT_RL.get(key);
+  let state = raw ? JSON.parse(raw) : { count: 0, windowStart: now };
+  if (now - state.windowStart >= windowMs) state = { count: 0, windowStart: now };
+  state.count++;
+  await MIUT_RL.put(key, JSON.stringify(state), { expirationTtl: limit.windowSec * 2 });
+  const allowed = state.count <= limit.max;
+  const retryAfter = allowed ? 0 : Math.ceil((state.windowStart + windowMs - now) / 1000);
+  return { allowed, count: state.count, retryAfter };
+}
+
+async function checkLimit(ip, action, limit, env) {
+  const banned = await env.MIUT_BAN.get(`ban:${ip}`);
   if (banned) {
     return { allowed: false, retryAfter: 86400, reason: 'ip_banned' };
   }
 
-  const key = `rl:${ip}:${action}`;
-  const now = Date.now();
+  const { allowed, count, retryAfter } = env.MIUT_RL_DO
+    ? await checkLimitViaDO(env.MIUT_RL_DO, ip, action, limit.max, limit.windowSec * 1000)
+    : await checkLimitViaKV(env.MIUT_RL, ip, action, limit);
 
-  // 2. Read current window state
-  const raw = await MIUT_RL.get(key);
-  let state = raw ? JSON.parse(raw) : { count: 0, windowStart: now };
-
-  // 3. Reset window if expired
-  const windowMs = limit.windowSec * 1000;
-  if (now - state.windowStart >= windowMs) {
-    state = { count: 0, windowStart: now };
-  }
-
-  // 4. Increment and check
-  state.count++;
-
-  // 5. Write back with TTL matching window size (auto-cleanup)
-  await MIUT_RL.put(key, JSON.stringify(state), { expirationTtl: limit.windowSec * 2 });
-
-  if (state.count > limit.max) {
-    const retryAfter = Math.ceil((state.windowStart + windowMs - now) / 1000);
-
-    // 6. If count is astronomically high (bot/scanner), add to ban list
-    if (state.count > limit.max * 10) {
-      await MIUT_BAN.put(`ban:${ip}`, JSON.stringify({
+  if (!allowed) {
+    if (count > limit.max * 10) {
+      await env.MIUT_BAN.put(`ban:${ip}`, JSON.stringify({
         reason: `rate_limit_abuse:${action}`,
-        count: state.count,
-        bannedAt: now,
-      }), { expirationTtl: 86400 }); // 24h ban
+        count,
+        bannedAt: Date.now(),
+      }), { expirationTtl: 86400 });
     }
-
     return { allowed: false, retryAfter: Math.max(1, retryAfter), reason: 'rate_limited' };
   }
 
@@ -155,7 +160,7 @@ export async function onRequestPost(context) {
     windowSec: parseInt(env[`RL_${action.toUpperCase()}_WIN_S`]|| LIMITS[action].windowSec),
   };
 
-  const result = await checkLimit(ip, action, limit, env.MIUT_RL, env.MIUT_BAN);
+  const result = await checkLimit(ip, action, limit, env);
 
   const status = result.allowed ? 200 : 429;
   const headers = {
