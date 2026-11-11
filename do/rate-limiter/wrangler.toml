@@ -1,0 +1,7 @@
+name = "miut-rate-limiter-do"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter"]
