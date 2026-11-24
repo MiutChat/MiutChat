@@ -13,10 +13,14 @@
  * Body:     { "action": "create" | "enter" | "send" }
  * Returns:  { "allowed": true } or { "allowed": false, "retryAfter": N, "reason": "..." }
  *
- * KV key format: rl:{ip}:{action}  (TTL = window size, auto-expires)
+ * KV key format: rl:{ipToken}:{action}  (TTL = twice the window, auto-expires)
+ * ipToken is a keyed hash of the IP using a random daily salt that is deleted after 36 hours;
+ * the raw IP is never written anywhere by this function.
  * KV value:      { count: N, windowStart: unixMs }
  * ═══════════════════════════════════════════════════════════════════════════════
  */
+
+import { ipToken } from '../_lib/ip-token.js';
 
 const ALLOWED_ORIGINS_DEFAULT = ['https://miutchat.pages.dev'];
 
@@ -47,17 +51,9 @@ const LIMITS = {
   send:   { max: 30, windowSec: 10  },
 };
 
-/**
- * Get the real client IP, preferring CF-Connecting-IP (set by Cloudflare
- * infrastructure — not spoofable by the client via headers).
- * @param {Request} req
- * @returns {string}
- */
-function getIp(req) {
-  return req.headers.get('CF-Connecting-IP')
-      || req.headers.get('X-Forwarded-For')?.split(',')[0]?.trim()
-      || 'unknown';
-}
+const BAN_TTL_SEC = 6 * 3600;
+const STRIKE_WINDOW_SEC = 600;
+const COOLDOWN_STEPS_SEC = [60, 300, 900, 1800];
 
 /**
  * @param {string} ip
@@ -95,7 +91,7 @@ async function checkLimitViaKV(MIUT_RL, ip, action, limit) {
 async function checkLimit(ip, action, limit, env) {
   const banned = await env.MIUT_BAN.get(`ban:${ip}`);
   if (banned) {
-    return { allowed: false, retryAfter: 86400, reason: 'ip_banned' };
+    return { allowed: false, retryAfter: BAN_TTL_SEC, reason: 'ip_banned' };
   }
 
   const { allowed, count, retryAfter } = env.MIUT_RL_DO
@@ -108,12 +104,38 @@ async function checkLimit(ip, action, limit, env) {
         reason: `rate_limit_abuse:${action}`,
         count,
         bannedAt: Date.now(),
-      }), { expirationTtl: 86400 });
+      }), { expirationTtl: BAN_TTL_SEC });
     }
     return { allowed: false, retryAfter: Math.max(1, retryAfter), reason: 'rate_limited' };
   }
 
   return { allowed: true };
+}
+
+async function safetyStrike(env, token, add) {
+  const kv = env.MIUT_RL;
+  if (!kv || token === 'unknown') return { cooldown: 0 };
+  const cdKey = `cd:${token}`;
+  const active = await kv.get(cdKey);
+  if (active) {
+    const until = parseInt(active, 10);
+    const left = Math.ceil((until - Date.now()) / 1000);
+    if (left > 0) return { cooldown: left };
+  }
+  if (!add) return { cooldown: 0 };
+  const stKey = `st:${token}`;
+  const count = (parseInt(await kv.get(stKey), 10) || 0) + 1;
+  if (count < 3) {
+    await kv.put(stKey, String(count), { expirationTtl: STRIKE_WINDOW_SEC });
+    return { cooldown: 0, strikes: count };
+  }
+  const lvKey = `lv:${token}`;
+  const level = Math.min(parseInt(await kv.get(lvKey), 10) || 0, COOLDOWN_STEPS_SEC.length - 1);
+  const secs = COOLDOWN_STEPS_SEC[level];
+  await kv.put(cdKey, String(Date.now() + secs * 1000), { expirationTtl: Math.max(60, secs) });
+  await kv.put(lvKey, String(level + 1), { expirationTtl: 3600 });
+  await kv.delete(stKey);
+  return { cooldown: secs };
 }
 
 export async function onRequestOptions(context) {
@@ -145,6 +167,16 @@ export async function onRequestPost(context) {
   }
 
   const action = body?.action;
+
+  if (action === 'strike' || action === 'strike-status') {
+    const token = await ipToken(request, env);
+    const out = await safetyStrike(env, token, action === 'strike');
+    return new Response(JSON.stringify(out), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
+    });
+  }
+
   if (!action || !LIMITS[action]) {
     return new Response(JSON.stringify({ allowed: false, reason: 'unknown_action' }), {
       status: 400,
@@ -152,7 +184,7 @@ export async function onRequestPost(context) {
     });
   }
 
-  const ip = getIp(request);
+  const ip = await ipToken(request, env);
 
   // Use env vars for limits if set, fall back to defaults
   const limit = {

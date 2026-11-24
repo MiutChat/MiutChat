@@ -68,6 +68,7 @@
 'use strict';
 
 import { ledgerAdd } from '../_lib/usage-ledger.js';
+import { ipToken } from '../_lib/ip-token.js';
 import { pickShard, utilization, safetyOf } from '../_lib/placement.js';
 
 export function discoverShards(env) {
@@ -283,7 +284,7 @@ async function bindingIdOf(env, codeHash) {
   const key = await crypto.subtle.importKey('raw', _enc.encode(String(pepper)), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return 'h_' + _hex(await crypto.subtle.sign('HMAC', key, _enc.encode(codeHash)));
 }
-const legacyEnabled = env => env?.REGISTRY_LEGACY !== 'off';
+const legacyEnabled = env => env?.REGISTRY_LEGACY === 'on';
 
 // body -> { id, codeHash, legacyCode } | { error }
 async function identify(body, env) {
@@ -400,7 +401,7 @@ async function handleGetLookup(request, env, waitUntil) {
   const fresh = url.searchParams.get('fresh') === '1';
   if (cache && !fresh) { const hit = await cache.match(cacheKey); if (hit) return hit; }
 
-  const wait = regTake(request.headers.get('CF-Connecting-IP') || 'unknown', 'lookup');
+  const wait = regTake(await ipToken(request, env), 'lookup');
   if (wait) return tooMany(wait);
 
   const shards = discoverShards(env).filter(s => s.active);
@@ -438,7 +439,7 @@ export async function onRequest(ctx) {
     body = JSON.parse(raw);
   } catch { return json({ error: 'invalid JSON' }, 400); }
   const action = body?.action;
-  { const wait = regTake(request.headers.get('CF-Connecting-IP') || 'unknown', String(action)); if (wait) return tooMany(wait); }
+  { const wait = regTake(await ipToken(request, env), String(action)); if (wait) return tooMany(wait); }
 
   const shards = discoverShards(env).filter(s => s.active);
   if (!shards.length) return json({ error: 'no active shards configured' }, 500);

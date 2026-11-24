@@ -239,6 +239,11 @@ export async function handleFileAttach(e) {
     toast('File too large', 'Max 25 MB per file', 'err'); return;
   }
 
+  const _screen = await window.__miutScreenFile?.(file);
+  if (_screen && _screen.action === 'block') {
+    toast('File not sent', _screen.message, 'warn'); return;
+  }
+
   const isImg   = file.type.startsWith('image/');
   const isVid   = file.type.startsWith('video/');
   const msgType = isImg ? 'image' : isVid ? 'video' : 'file';
@@ -578,6 +583,16 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
     if (el0) el0.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">Media unavailable</div>`;
     return;
   }
+  if (type === 'file') {
+    const _nameCheck = await window.__miutScreenFileName?.(fileName);
+    if (_nameCheck && _nameCheck.blocked) {
+      const elN = document.getElementById(domId);
+      if (elN) elN.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">Hidden by MiutChat safety \u2014 ${esc(_nameCheck.message)}</div>`;
+      return;
+    }
+  }
+
+  let blobRef = null;
   const cacheKey = 'blob_' + btoa((Array.isArray(encData) ? encData[0] : encData).slice(0, 32).replace(/[^a-zA-Z0-9]/g, '').padEnd(8, '0')).slice(0, 16);
 
   let url = null;
@@ -586,6 +601,7 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
   if (cachedBytes) {
     try {
       const blob = new Blob([cachedBytes], { type: mime });
+      blobRef = blob;
       url = URL.createObjectURL(blob);
       _log('debug', '[MIUT media] served from IDB cache:', domId);
     } catch (e) { _log('debug', '[MIUT media] cached blob construction failed, falling through to re-decrypt:', domId, e); }
@@ -594,6 +610,7 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
   if (!url) {
     try {
       const blob  = await decBytes(encData, mime, state.roomCode);
+      blobRef = blob;
       url = URL.createObjectURL(blob);
       (window.requestIdleCallback || setTimeout)(() => idbSetBlob(cacheKey, blob).catch(() => {}));
       _log('debug', '[MIUT media] decrypted fresh:', domId, { bytes: blob.size });
@@ -602,6 +619,16 @@ export async function decryptAndShow(encData, mime, type, fileName, domId) {
       const el = document.getElementById(domId);
       const why = String(e?.message || '').startsWith('decompress failed') ? "This file uses compression this browser can't open" : 'This message could not be decrypted';
       if (el) el.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">${why}</div>`;
+      return;
+    }
+  }
+
+  if (type === 'file' && blobRef && url) {
+    const _headCheck = await window.__miutScreenFile?.(new File([blobRef.slice(0, 16)], fileName || 'file'));
+    if (_headCheck && _headCheck.action === 'block') {
+      URL.revokeObjectURL(url);
+      const elH = document.getElementById(domId);
+      if (elH) elH.innerHTML = `<div style="padding:8px;color:var(--text2);font-size:.7rem">Hidden by MiutChat safety \u2014 ${esc(_headCheck.message)}</div>`;
       return;
     }
   }

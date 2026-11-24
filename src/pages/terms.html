@@ -62,9 +62,9 @@ footer .version-credit{color:var(--tx2);opacity:.7}
 <main>
   <div class="plbl">LEGAL DOCUMENT</div>
   <h1>Terms of Service</h1>
-  <div class="meta">Effective: 1 January 2025 &nbsp;&#183;&nbsp; Version 1.0 &nbsp;&#183;&nbsp; Jurisdiction-Neutral</div>
+  <div class="meta">Last updated: 20 November 2026 &nbsp;&#183;&nbsp; Version 1.1 &nbsp;&#183;&nbsp; Jurisdiction-Neutral</div>
 
-  <div class="hl"><p><strong>Plain-language summary:</strong> MiutChat is a zero-knowledge encrypted chat tool. You may use it for lawful purposes only. We store no readable data, sell nothing, and accept no liability for damages arising from use. Your use constitutes acceptance of these terms.</p></div>
+  <div class="hl"><p><strong>Plain-language summary:</strong> MiutChat is an anonymous chat tool with client-side encryption. You may use it for lawful purposes only. The app runs automated safety checks, and we review reports of illegal content. We sell nothing and accept no liability for damages arising from use. Your use constitutes acceptance of these terms.</p></div>
 
   <div class="toc">
     <div class="toc-t">TABLE OF CONTENTS</div>
@@ -75,6 +75,7 @@ footer .version-credit{color:var(--tx2);opacity:.7}
       <li><a href="#acceptable-use">Acceptable Use Policy</a></li>
       <li><a href="#prohibited">Prohibited Conduct</a></li>
       <li><a href="#encryption">Encryption and Data Handling</a></li>
+      <li><a href="#safety">Content Safety, Reporting and Takedown</a></li>
       <li><a href="#third-party">Third-Party Services</a></li>
       <li><a href="#disclaimers">Disclaimers of Warranties</a></li>
       <li><a href="#liability">Limitation of Liability</a></li>
@@ -95,12 +96,12 @@ footer .version-credit{color:var(--tx2);opacity:.7}
 
   <h2 id="description">2. Service Description</h2>
   <p>MiutChat is a browser-based, ephemeral, anonymous group chat application employing client-side end-to-end encryption (AES-256-GCM), ECDSA message signing, and Firebase Firestore as a transient data relay. The Service is designed to facilitate private communication without persistent identity records.</p>
-  <p>The Service operates on a zero-knowledge architecture: messages are encrypted before reaching our infrastructure. The Operator cannot read, decode, or reconstruct any message content. All room data is permanently deleted when the last participant departs.</p>
+  <p>Messages are encrypted in your browser before they reach our infrastructure, and the MiutChat application does not decrypt them on a server. The room code is both the shared secret from which the encryption key is derived and the identifier of the room record, so a person with administrative access to the database could in principle derive the key and read that room. MiutChat does not read messages as part of normal operation and may do so only to review reported content or to comply with legal process. All room data is permanently deleted when the last participant departs.</p>
 
   <h2 id="eligibility">3. Eligibility</h2>
-  <p>The Service is intended for users aged 13 and over. By using the Service you represent and warrant that:</p>
+  <p>The Service is intended for adults aged 18 and over. By using the Service you represent and warrant that:</p>
   <ul>
-    <li>You are at least 13 years of age, or 16 years of age in jurisdictions requiring a higher minimum age for digital services consent;</li>
+    <li>You are at least 18 years of age, or the age of majority in your country if it is higher;</li>
     <li>You have full legal capacity to enter into this agreement;</li>
     <li>You are not prohibited by any applicable law from receiving or using the Service;</li>
     <li>Your use does not violate any export control regulation, sanction program, or applicable law of your jurisdiction.</li>
@@ -121,22 +122,28 @@ footer .version-credit{color:var(--tx2);opacity:.7}
     <li><strong>Sanctions Violations:</strong> Using the Service to evade economic sanctions, embargoes, or financial restrictions imposed by competent authorities;</li>
     <li><strong>Interference:</strong> Disrupting the availability, integrity, or performance of the Service or its underlying infrastructure.</li>
   </ul>
-  <p><strong>No Responsibility for Rule Violations.</strong> If you engage in any of the conduct prohibited above, or otherwise use the Service in violation of these Terms or applicable law, you do so entirely at your own risk and on your own authority. The Operator, its contributors, and maintainers are not responsible — directly or indirectly — for any action you take in violation of these rules, nor for any result, consequence, damage, loss, or liability (to you, to any other person, or to any third party) arising from it. Because the Service is end-to-end encrypted and the Operator cannot read message content, the Operator has no practical ability to detect, prevent, or intervene in such conduct as it happens; responsibility for compliance with these rules and with applicable law rests solely with you.</p>
+  <p><strong>No Responsibility for Rule Violations.</strong> If you engage in any of the conduct prohibited above, or otherwise use the Service in violation of these Terms or applicable law, you do so entirely at your own risk and on your own authority. The Operator, its contributors, and maintainers are not responsible — directly or indirectly — for any action you take in violation of these rules, nor for any result, consequence, damage, loss, or liability (to you, to any other person, or to any third party) arising from it. The Operator does not monitor conversations and cannot detect or prevent all such conduct as it happens; the automatic safety checks and reporting process in Section 7 are best-effort measures, and responsibility for compliance with these rules and with applicable law rests with you.</p>
 
   <h2 id="encryption">6. Encryption and Data Handling</h2>
-  <p>All message content is encrypted using AES-256-GCM entirely within your browser prior to transmission. The Operator does not possess, and cannot derive, any key capable of decrypting message content. The following technical limitations apply:</p>
+  <p>All message content is encrypted using AES-256-GCM entirely within your browser prior to transmission. The key is derived from the room code. The room code is never sent to our servers: the database identifies each room only by a one-way hash of the code, and invite links carry the code in the part of the link that browsers do not send to servers. As a result, MiutChat and its database administrators cannot read message content, and cannot derive the key unless they can guess the room code, so choose a long, unpredictable code. Information about messages that is not encrypted, such as display names, timestamps, file names, file types and sizes, is visible to the Operator and to the infrastructure providers. The following limitations apply:</p>
   <ul>
-    <li>The Operator cannot assist law enforcement in decrypting message content, as no decryption capability exists;</li>
+    <li>The Operator can respond to valid legal process only with the information it holds, which does not include readable message content and cannot include room data that has already been deleted;</li>
     <li>Room data is automatically and irrevocably deleted upon room closure; no backup, archive, or recovery mechanism exists;</li>
     <li>Encryption provides no guarantee of absolute confidentiality; endpoint compromise, keyloggers, screen capture, or physical access to devices may defeat encryption;</li>
     <li>The Service should not be used for communications where professional-grade operational security is required (e.g., journalism in high-risk environments — use a dedicated, audited end-to-end encrypted secure messaging application).</li>
   </ul>
 
-  <h2 id="third-party">7. Third-Party Services</h2>
+  <h2 id="safety">7. Content Safety, Reporting and Takedown</h2>
+  <p><strong>Automated checks.</strong> The MiutChat app decides on its own, in your browser, whether a message or file may be sent or shown. It replaces common bad words with stars, blocks explicit threats of violence, hate slurs, content that sexualizes minors and offers to sell illegal goods and services, and blocks the sharing of executable and installer files. The checks run on the sender's device and again on the recipient's device. After repeated blocked attempts the app pauses sending for a short, increasing period, which is remembered by a temporary, pseudonymous network token and not by your identity. No person at MiutChat reads your messages. The checks are a best-effort measure: they do not catch everything, they can make mistakes, and a modified copy of the app can bypass them.</p>
+  <p><strong>Reporting.</strong> Any member can report a message from the message menu (long-press a message, then choose Report). A report contains only the room's hashed identifier, the message identifier and the category you choose; the message stays encrypted. When enough different members report the same message, the app hides it for everyone in the room automatically. Reports are deleted after seven days.</p>
+  <p><strong>Removal requests and authorities.</strong> Reports are handled automatically as described above. Because messages are encrypted, we cannot search for or read content ourselves. Valid legal orders and removal requests can be sent through the GitHub Issues page in Section 18, and we respond to valid legal process under applicable law with the limited information we hold. Child sexual abuse material is reported to the competent authorities where the law requires it.</p>
+  <p><strong>Complaints.</strong> If you think a message was hidden by mistake, report the issue on the GitHub Issues page in Section 18. The in-app Report and the automatic safety checks are our complaint and removal mechanism; no person reviews message content.</p>
+
+  <h2 id="third-party">8. Third-Party Services</h2>
   <p>The Service relies on Firebase (Google LLC) for backend infrastructure, Cloudflare for content delivery and edge computing, and Google Fonts for typography. These third parties operate under their own terms of service and privacy policies. The Operator does not control these services and accepts no liability for their conduct, availability, or data practices.</p>
   <p>Firebase Anonymous Authentication assigns a random, non-identifying session token. Google may process anonymized authentication signals per its own policies.</p>
 
-  <h2 id="disclaimers">8. Disclaimers of Warranties</h2>
+  <h2 id="disclaimers">9. Disclaimers of Warranties</h2>
   <p>THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY KIND, EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE OPERATOR EXPRESSLY DISCLAIMS ALL WARRANTIES, INCLUDING WITHOUT LIMITATION:</p>
   <ul>
     <li>Implied warranties of merchantability, fitness for a particular purpose, and non-infringement;</li>
@@ -146,7 +153,7 @@ footer .version-credit{color:var(--tx2);opacity:.7}
   </ul>
   <p>Some jurisdictions do not permit exclusion of implied warranties; the above exclusion may not apply to you to the extent prohibited by applicable law.</p>
 
-  <h2 id="liability">9. Limitation of Liability</h2>
+  <h2 id="liability">10. Limitation of Liability</h2>
   <p>TO THE FULLEST EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE OPERATOR, ITS CONTRIBUTORS, MAINTAINERS, OFFICERS, EMPLOYEES, AGENTS, PARTNERS, OR LICENSORS BE LIABLE FOR ANY:</p>
   <ul>
     <li>INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, CONSEQUENTIAL, OR PUNITIVE DAMAGES;</li>
@@ -158,17 +165,17 @@ footer .version-credit{color:var(--tx2);opacity:.7}
   <p>THE AGGREGATE LIABILITY OF THE OPERATOR FOR ALL CLAIMS ARISING FROM OR RELATED TO THE SERVICE SHALL NOT EXCEED ONE UNITED STATES DOLLAR (USD $1.00). THIS LIMITATION REFLECTS A REASONABLE ALLOCATION OF RISK GIVEN THAT NO FEES ARE CHARGED FOR THE SERVICE.</p>
   <p>CERTAIN JURISDICTIONS DO NOT PERMIT LIMITATION OR EXCLUSION OF LIABILITY FOR PERSONAL INJURY, DEATH, FRAUD, OR GROSS NEGLIGENCE. NOTHING IN THESE TERMS SHALL LIMIT LIABILITY WHERE SUCH LIMITATION IS PROHIBITED BY MANDATORY APPLICABLE LAW.</p>
 
-  <h2 id="indemnification">10. Indemnification</h2>
+  <h2 id="indemnification">11. Indemnification</h2>
   <p>You agree to defend, indemnify, and hold harmless the Operator and its contributors, maintainers, and agents from and against any and all claims, damages, obligations, losses, liabilities, costs, and expenses (including reasonable legal fees) arising from: (a) your use of the Service; (b) your violation of these Terms; (c) your violation of any applicable law; (d) content transmitted by you through the Service; or (e) any third-party claim related to your conduct on the Service.</p>
 
-  <h2 id="ip">11. Intellectual Property</h2>
+  <h2 id="ip">12. Intellectual Property</h2>
   <p>The MiutChat source code is released under the MIT License and is available at <a href="https://github.com/MiutChat/MiutChat" target="_blank" rel="noopener">github.com/MiutChat/MiutChat</a>. The MIT License governs your rights to copy, modify, merge, publish, distribute, sublicense, and sell copies of the software. These Terms govern your use of the hosted Service, not the underlying open-source code.</p>
   <p>You retain all rights in content you transmit through the Service. By transmitting content, you grant no license to the Operator, as the Operator cannot access such content.</p>
 
-  <h2 id="termination">12. Termination</h2>
+  <h2 id="termination">13. Termination</h2>
   <p>The Operator reserves the right to restrict, suspend, or terminate access to the Service at any time, with or without notice, for any reason, including but not limited to violation of these Terms, suspected abuse, technical necessity, or discontinuation of the Service. Upon termination, all associated Firestore data will be deleted in accordance with the automatic ephemeral deletion mechanisms of the Service.</p>
 
-  <h2 id="jurisdiction">13. Governing Law and Jurisdiction</h2>
+  <h2 id="jurisdiction">14. Governing Law and Jurisdiction</h2>
   <p>These Terms are drafted to comply with applicable law in a jurisdiction-neutral manner. Given the global nature of the Service and the absence of a registered corporate entity, these Terms shall be interpreted in accordance with the following hierarchy:</p>
   <ul>
     <li><strong>Primary:</strong> The law of the jurisdiction in which you primarily reside and use the Service shall govern disputes concerning your use;</li>
@@ -177,7 +184,7 @@ footer .version-credit{color:var(--tx2);opacity:.7}
   </ul>
   <p>The Operator makes no representation that the Service is appropriate or available in all jurisdictions. Access from jurisdictions where such access is prohibited is at your sole risk and responsibility.</p>
 
-  <h2 id="dispute">14. Dispute Resolution</h2>
+  <h2 id="dispute">15. Dispute Resolution</h2>
   <p>The Operator operates without a registered legal entity and therefore cannot be subject to formal legal process in a single jurisdiction. If you have a dispute:</p>
   <ul>
     <li>You may open a GitHub Issue at <a href="https://github.com/MiutChat/MiutChat/issues" target="_blank" rel="noopener">github.com/MiutChat/MiutChat/issues</a>;</li>
@@ -186,16 +193,15 @@ footer .version-credit{color:var(--tx2);opacity:.7}
   </ul>
   <p>Given that the Service is provided free of charge and processes no identifiable personal data, the practical scope for legal disputes is narrow. Any claim must be brought within one (1) year of the event giving rise to the claim, to the extent permitted by applicable law.</p>
 
-  <h2 id="modifications">15. Modifications</h2>
+  <h2 id="modifications">16. Modifications</h2>
   <p>The Operator reserves the right to modify these Terms at any time. Material modifications will be communicated via the GitHub repository. Continued use of the Service following publication of modified Terms constitutes acceptance of those modifications. If you do not agree to modified Terms, your sole remedy is to cease using the Service.</p>
 
-  <h2 id="severability">16. Severability</h2>
+  <h2 id="severability">17. Severability</h2>
   <p>If any provision of these Terms is found by a court of competent jurisdiction to be invalid, illegal, or unenforceable, such provision shall be modified to the minimum extent necessary to make it valid and enforceable. All remaining provisions shall continue in full force and effect. The failure of the Operator to enforce any right or provision shall not constitute a waiver of such right or provision.</p>
 
-  <h2 id="contact">17. Contact</h2>
-  <p>For questions, concerns, or legal notices, you can reach us by:</p>
+  <h2 id="contact">18. Contact</h2>
+  <p>MiutChat runs automatically and has no staffed helpdesk. For questions, concerns, or legal notices, use:</p>
   <ul>
-    <li><strong>Email:</strong> <a href="mailto:feedback.miut@zohomail.in">feedback.miut@zohomail.in</a></li>
     <li><strong>GitHub Issues:</strong> <a href="https://github.com/MiutChat/MiutChat/issues" target="_blank" rel="noopener">github.com/MiutChat/MiutChat/issues</a></li>
   </ul>
 </main>

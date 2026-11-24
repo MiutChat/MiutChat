@@ -1125,7 +1125,7 @@ window.addEventListener('DOMContentLoaded', () => {
   (window._dbFirebaseReady || Promise.resolve()).then(() => {
     try {
       const _bootDbName = (window.__MIUT_DB_CONFIGS__ || []).find(d => d.active)?.name || 'miut-db0';
-      db = firebase.firestore(firebase.app(_bootDbName));
+      db = window.__miutInstallRoomIds(firebase.firestore(firebase.app(_bootDbName)));
     } catch (e) {
     }
     _checkAnnouncement();
@@ -3171,6 +3171,8 @@ function updateOnlineUI() {
 }
 
 export function startChatListeners() {
+  _syncHiddenDocs();
+  _inviteTagOf(state.roomCode).catch(() => {});
   const code = state.roomCode;
 
   // Messages — only NEW since history fetch set _lastCachedTs
@@ -3612,7 +3614,7 @@ function _requestServerExpire(code, mode) {
   try {
     fetch('/api/expire-room', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(mode ? { code, mode } : { code }), keepalive: true,
+      body: JSON.stringify(mode ? { code: window.__miutRoomDocId(code), mode } : { code: window.__miutRoomDocId(code) }), keepalive: true,
     }).catch(() => {});
   } catch {}
 }
@@ -3649,19 +3651,7 @@ async function _checkRoomExpiry(code, db, knownSnap) {
 
 /** _ping — anonymous event counter, fire-and-forget. `n` > 1 reports a batch of events in one request.
  *  `dims` are low-cardinality labels (e.g. { ttl: 'm5' }); the server only accepts values from fixed lists. */
-function _ping(event, n, dims) {
-  try {
-    const body = { e: event };
-    if (n > 1) body.n = n;
-    if (dims) body.d = dims;
-    fetch('/api/analytics', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      keepalive: true,
-    }).catch(() => {});
-  } catch {}
-}
+function _ping() {}
 /** Public wrapper so the lazy modules (file-transfer, feedback) can report events too. */
 export function track(event, n, dims) { _ping(event, n, dims); }
 
@@ -3737,6 +3727,14 @@ function _enterSelectMode() {
       </button>
       <span class="msa-count" id="msa-count">0 selected</span>
       <div style="flex:1"></div>
+      <button class="msa-btn msa-info" id="msa-info" title="Message info" style="display:none">
+        <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>Info</span>
+      </button>
+      <button class="msa-btn msa-report" id="msa-report" title="Report message" style="display:none">
+        <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><path d="M5 17V3m0 0h9l-2 3.5L14 10H5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Report</span>
+      </button>
       <button class="msa-btn msa-del-me" id="msa-del-me" title="Delete for me" style="display:none">
         <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><path d="M5 6h10M8 6V4h4v2M7 6l.6 9h4.8L13 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Me</span>
@@ -3749,6 +3747,8 @@ function _enterSelectMode() {
     const header = document.getElementById('chat-header');
     if (header) header.parentNode.insertBefore(bar, header);
     document.getElementById('msa-cancel').addEventListener('click', _exitSelectMode);
+    document.getElementById('msa-info').addEventListener('click', _infoSelected);
+    document.getElementById('msa-report').addEventListener('click', _reportSelected);
     document.getElementById('msa-del-me').addEventListener('click', () => _deleteSelected(false));
     document.getElementById('msa-del-all').addEventListener('click', () => _deleteSelected(true));
   }
@@ -3779,6 +3779,24 @@ function _updateSelectBar() {
     const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
     return _isAdmin || w?.classList.contains('sent');
   });
+  const infoBtn = document.getElementById('msa-info');
+  if (infoBtn) {
+    let showInfo = false;
+    if (count === 1) {
+      const iw = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape([..._selectedIds][0])}"]`);
+      showInfo = !!iw && !iw.classList.contains('deleted') && !String(iw.dataset.docId).startsWith('local_');
+    }
+    infoBtn.style.display = showInfo ? '' : 'none';
+  }
+  const reportBtn = document.getElementById('msa-report');
+  if (reportBtn) {
+    let showReport = false;
+    if (count === 1) {
+      const rw = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape([..._selectedIds][0])}"]`);
+      showReport = !!rw && rw.classList.contains('received') && !rw.classList.contains('deleted') && !String(rw.dataset.docId).startsWith('local_');
+    }
+    reportBtn.style.display = showReport ? '' : 'none';
+  }
   const delMe  = document.getElementById('msa-del-me');
   const delAll = document.getElementById('msa-del-all');
   if (delMe)  delMe.style.display  = count ? '' : 'none';
@@ -3794,6 +3812,114 @@ function _toggleSelectMsg(docId, el) {
     el.classList.add('selected');
   }
   _updateSelectBar();
+}
+
+const _hiddenDocs = new Set();
+let _hiddenRoom = '';
+let _hiddenObserver = null;
+
+function _applyHiddenDocs() {
+  if (!_hiddenDocs.size) return;
+  document.querySelectorAll('.msg-wrapper[data-doc-id]').forEach(w => {
+    if (!_hiddenDocs.has(w.dataset.docId) || w.dataset.hiddenSafety) return;
+    const bubble = w.querySelector('.msg-bubble');
+    if (!bubble) return;
+    w.dataset.hiddenSafety = '1';
+    bubble.innerHTML = '<span class="msg-deleted-text">Hidden after reports from members</span>';
+  });
+}
+
+async function _syncHiddenDocs() {
+  if (!state.roomCode) return;
+  if (_hiddenRoom !== state.roomCode) { _hiddenDocs.clear(); _hiddenRoom = state.roomCode; }
+  const area = document.getElementById('messages-area');
+  if (area && !_hiddenObserver) {
+    _hiddenObserver = new MutationObserver(() => _applyHiddenDocs());
+    _hiddenObserver.observe(area, { childList: true, subtree: true });
+  }
+  try {
+    const r = await fetch('/api/report?room=' + encodeURIComponent(window.__miutRoomDocId(state.roomCode)), { cache: 'no-store' });
+    if (!r.ok) return;
+    const d = await r.json();
+    for (const id of d.hidden || []) _hiddenDocs.add(id);
+    _applyHiddenDocs();
+  } catch {}
+}
+
+window.__miutHideDoc = id => { _hiddenDocs.add(id); _applyHiddenDocs(); };
+setInterval(() => { if (state.roomCode && !document.hidden) _syncHiddenDocs(); }, 90000);
+
+function closeMsgInfo() {
+  const overlay = $('msg-info-modal');
+  if (overlay) overlay.style.display = 'none';
+}
+
+async function _showMsgInfo(docId) {
+  const overlay = $('msg-info-modal');
+  if (!overlay || !state.roomCode || !db) return;
+  let data;
+  try {
+    const snap = await db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).get();
+    data = snap.exists ? snap.data() : null;
+  } catch {
+    toast('Message info', "Couldn't load the details. Please try again.", 'err');
+    return;
+  }
+  if (!data) { toast('Message info', 'This message no longer exists.', 'warn'); return; }
+
+  const sentMs = _createdMs(data) || data.ts || 0;
+  const readBy = data.readBy || {};
+  const readerIds = Object.keys(readBy).filter(uid => uid !== data.senderId);
+  const kinds = { text: 'Text', image: 'Image', video: 'Video', audio: 'Audio', file: 'File' };
+  const rows = [
+    ['FROM', data.senderId === state.me?.id ? 'You' : (data.senderName || 'Unknown')],
+    ['TYPE', kinds[data.type] || 'Message'],
+    ['SENT', sentMs ? new Date(sentMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : 'Unknown'],
+    ['STATUS', readerIds.length ? `Read by ${readerIds.length}` : 'Delivered'],
+  ];
+  $('mi-rows').innerHTML = rows.map(([k, v]) =>
+    `<div class="md-row"><span class="md-row-label">${k}</span><span class="md-row-value">${esc(String(v))}</span></div>`
+  ).join('');
+
+  const readersEl = $('mi-readers');
+  const label = $('mi-readby-label');
+  readersEl.innerHTML = '';
+  label.style.display = 'none';
+  if (data.senderId === state.me?.id) {
+    label.style.display = '';
+    if (!readerIds.length) {
+      readersEl.innerHTML = '<div class="mi-empty">Nobody has read this yet</div>';
+    } else {
+      const people = await Promise.all(readerIds.map(async uid => {
+        try {
+          const m = await db.collection('rooms').doc(state.roomCode).collection('members').doc(uid).get();
+          return { name: m.exists ? (m.data().name || 'Member') : 'Left the room' };
+        } catch { return { name: 'Member' }; }
+      }));
+      readersEl.innerHTML = people.map(p =>
+        `<div class="mi-reader"><span class="mi-reader-avatar" style="background:${avatarColor(p.name)}">${esc(initials(p.name))}</span><span class="mi-reader-name">${esc(p.name)}</span></div>`
+      ).join('');
+    }
+  }
+  overlay.style.display = 'flex';
+}
+
+function _infoSelected() {
+  if (_selectedIds.size !== 1) return;
+  const docId = [..._selectedIds][0];
+  _exitSelectMode();
+  _showMsgInfo(docId);
+}
+
+async function _reportSelected() {
+  if (_selectedIds.size !== 1) return;
+  const docId = [..._selectedIds][0];
+  _exitSelectMode();
+  try {
+    (await _loadReport()).showReportModal({ roomId: window.__miutRoomDocId(state.roomCode), docId, reporter: state.me?.id || '' });
+  } catch (e) {
+    toast('Report', "Couldn't open the report form. Please try again.", 'err');
+  }
 }
 
 async function _deleteSelected(forEveryone) {
@@ -3969,8 +4095,16 @@ async function sendMessage() {
   if (!checkSendRateLimit()) return;
 
   const input = $('msg-input');
-  const text  = (input?.value || '').replace(/[​-‍﻿­]/g, '').trim();
-  if (!text || !state.roomCode || !db) return;
+  const _typed = (input?.value || '').replace(/[​-‍﻿­]/g, '').trim();
+  if (!_typed || !state.roomCode || !db) return;
+  const _wait = _loadModeration.peek()?.cooldownLeft() || 0;
+  if (_wait > 0) { toast('Slow down', 'Too many blocked messages. Try again in ' + _wait + 's.', 'warn'); return; }
+  let _verdict;
+  try { _verdict = (await _loadModeration()).screenOutgoing(_typed); }
+  catch { toast('Safety check unavailable', 'Please try again in a moment.', 'warn'); return; }
+  if (_verdict.action === 'block') { toast('Message not sent', _verdict.message, 'warn'); return; }
+  if (_verdict.action === 'mask') toast('Message adjusted', _verdict.message, 'warn');
+  const text = _verdict.text;
   input.value = ''; input.style.height = 'auto';
   updateActionBtn();
   clearMyTyping();
@@ -4391,6 +4525,7 @@ function _scheduleDecryptRetry(wrap, data, docId, onHealed) {
     if (!wrap.isConnected) return; // bubble was removed (deleted, room left) — nothing to patch
     let text;
     try { text = await dec(data.enc, state.roomCode, data.senderId); } catch { text = '[encrypted]'; }
+    if (text !== '[encrypted]') text = (await _screenIncomingText(text)).text;
     if (text !== '[encrypted]') {
       const bubbleEl = wrap.querySelector('.msg-bubble');
       if (bubbleEl) {
@@ -4485,6 +4620,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
   // handlers wired further down close over this same binding, so they see
   // the healed text too instead of staying stuck quoting "[encrypted]".
   let plainText = data.type === 'text' ? await dec(data.enc, state.roomCode, data.senderId) : null;
+  if (plainText) plainText = (await _screenIncomingText(plainText)).text;
 
   let bubble = '';
   let replyQuote = '';
@@ -4506,7 +4642,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
       const fname = data.replyTo.fileName ? ': ' + esc(data.replyTo.fileName.length > 20 ? data.replyTo.fileName.slice(0, 20) + '…' : data.replyTo.fileName) : '';
       rqContent = `<div class="rq-media"><svg viewBox="0 0 20 20" fill="none" width="12" height="12"><path d="M4 4a2 2 0 012-2h5l5 5v9a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" stroke="currentColor" stroke-width="1.4"/><path d="M11 2v5h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg> ${label}${fname}</div>`;
     } else {
-      const qText = data.replyTo.enc ? await dec(data.replyTo.enc, state.roomCode, data.senderId) : '';
+      const qText = data.replyTo.enc ? (await _screenIncomingText(await dec(data.replyTo.enc, state.roomCode, data.senderId))).text : '';
       rqContent = `<div class="rq-text">${esc(qText.length > 60 ? qText.slice(0, 60) + '…' : qText)}</div>`;
     }
     }
@@ -4942,7 +5078,7 @@ async function patchMsg(id, data) {
   if (data.readBy) _renderReadBadge(wrapEl, data.readBy);
   if (data.edited && data.type === 'text') {
     const bubble = wrapEl.querySelector('.msg-bubble');
-    if (bubble) bubble.innerHTML = renderTextContent(await dec(data.enc, state.roomCode, data.senderId)) + '<span class="msg-edited"> ✎</span>';
+    if (bubble) bubble.innerHTML = renderTextContent((await _screenIncomingText(await dec(data.enc, state.roomCode, data.senderId))).text) + '<span class="msg-edited"> ✎</span>';
     if (data.sig) requestAnimationFrame(() => verifyAndBadge(data, id));
   }
 }
@@ -5537,18 +5673,24 @@ async function submitEdit() {
   // below failed for ANY reason (network blip, permissions, wrong
   // database — as happened here), the person's edited text was gone with
   // no way back, on top of the failure itself.
+  let _editText = text;
+  try {
+    const _v = (await _loadModeration()).screenOutgoing(text);
+    if (_v.action === 'block') { toast('Edit not saved', _v.message, 'warn'); return; }
+    _editText = _v.text;
+  } catch { toast('Safety check unavailable', 'Please try again in a moment.', 'warn'); return; }
   const _wrap = _editingWrap, _ts = _editingTs;
   cancelEdit();
   try {
     const _ets   = Date.now();
-    const _eenc  = await enc(text, state.roomCode);
+    const _eenc  = await enc(_editText, state.roomCode);
     const _esig  = await signMsg(state.me.id, _ets, _eenc);
     await db.collection('rooms').doc(state.roomCode).collection('messages').doc(docId).update({
       enc: _eenc, edited: true, editedAt: ts_now(), sig: _esig, ts: _ets,
     });
   } catch(e) {
     toast('Edit failed — your text is restored, try again', e.message, 'err');
-    startEdit(docId, text, _wrap, _ts); // put the person right back where they were, text intact
+    startEdit(docId, _editText, _wrap, _ts); // put the person right back where they were, text intact
   }
 }
 
@@ -5732,11 +5874,35 @@ function copyRoomCode() {
   else fbCopy(code, cb);
 }
 
-function shareRoomLink() {
+/* INVITE-TAG-BEGIN */
+const _inviteTagCache = new Map();
+
+async function _inviteTagOf(code) {
+  const key = String(code);
+  if (_inviteTagCache.has(key)) return _inviteTagCache.get(key);
+  const enc = new TextEncoder();
+  const material = await crypto.subtle.importKey('raw', enc.encode(key), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('miut-invite-tag-v1'), iterations: 200000 },
+    material, 48
+  );
+  let bin = '';
+  for (const b of new Uint8Array(bits)) bin += String.fromCharCode(b);
+  const tag = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  _inviteTagCache.set(key, tag);
+  return tag;
+}
+/* INVITE-TAG-END */
+
+let _inviteTag = '';
+
+async function shareRoomLink() {
   if (!state.roomCode) return;
-  // Plain URL encoding — no base64 obfuscation (room code is the key; sharing = sharing)
   const base = window.location.origin + window.location.pathname.replace('index.html', '');
-  const url  = `${base}?r=${encodeURIComponent(state.roomCode)}`;
+  let tag;
+  try { tag = await _inviteTagOf(state.roomCode); }
+  catch { toast('Invite link', "Couldn't create the link. Please try again.", 'err'); return; }
+  const url = `${base}#j=${tag}`;
 
   if (navigator.share) {
     navigator.share({
@@ -5746,7 +5912,6 @@ function shareRoomLink() {
     }).catch(() => {});
     return;
   }
-  // Desktop: show a mini popup with QR + copy button
   _showSharePopup(url);
 }
 
@@ -5776,19 +5941,34 @@ function _showSharePopup(url) {
   pop.addEventListener('click', e => { if (e.target === pop) pop.remove(); });
 }
 
+function _legacyInviteCode() {
+  const hm = /^#r=(.+)$/.exec(window.location.hash || '');
+  const r = hm ? hm[1] : new URLSearchParams(window.location.search).get('r');
+  if (!r) return null;
+  try {
+    const decoded = decodeURIComponent(r);
+    if (/^[a-zA-Z0-9 _\-@#!?+*=.]{6,64}$/.test(decoded)) return decoded;
+  } catch {}
+  try { return decodeURIComponent(escape(atob(r))); } catch { return null; }
+}
+
+async function _scrubLegacyInvite(code) {
+  try {
+    _inviteTag = await _inviteTagOf(code);
+    window.history.replaceState({}, '', window.location.pathname + '#j=' + _inviteTag);
+  } catch {
+    window.history.replaceState({}, '', window.location.pathname);
+  }
+}
+
 function _detectInviteParam() {
   try {
-    const p = new URLSearchParams(window.location.search);
-    const r = p.get('r');
-    if (!r) return null;
-    // Support both plain encodeURIComponent (new) and legacy base64 (old links)
-    try {
-      const decoded = decodeURIComponent(r);
-      // If it looks like a valid room code, use it directly
-      if (/^[a-zA-Z0-9 _\-@#!?+*=.]{6,64}$/.test(decoded)) return decoded;
-    } catch {}
-    // Fallback: try base64 decode for old-style invite links
-    return decodeURIComponent(escape(atob(r)));
+    const hm = /^#j=([A-Za-z0-9_-]{8})$/.exec(window.location.hash || '');
+    if (hm) { _inviteTag = hm[1]; return hm[1]; }
+    const legacy = _legacyInviteCode();
+    if (!legacy) return null;
+    _scrubLegacyInvite(legacy);
+    return 'legacy';
   } catch { return null; }
 }
 
@@ -5801,6 +5981,7 @@ function showInviteScreen() {
 }
 
 function cancelInvite() {
+  _inviteTag = '';
   window.history.replaceState({}, '', window.location.pathname);
   showScreen('join-screen');
 }
@@ -5821,6 +6002,10 @@ async function joinFromInvite() {
   const err  = $('invite-error');
   if (!validateRoomCode(code)) {
     if (err) err.textContent = 'Room code contains invalid characters.';
+    return;
+  }
+  if (_inviteTag && (await _inviteTagOf(code)) !== _inviteTag) {
+    if (err) err.textContent = "That code doesn't match this invite link.";
     return;
   }
   if (!(await checkRateLimit('enter'))) return;
@@ -6399,7 +6584,7 @@ function _notifyRoomEvent(type, extra = {}) {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        roomCode:   state.roomCode,
+        roomCode:   window.__miutRoomDocId(state.roomCode),
         shard:      db?.app?.name || 'miut-db0',
         type,
         indexCount: Array.isArray(_roomPushUids) ? _roomPushUids.length : null,
@@ -6774,6 +6959,24 @@ function _lazyModule(importer, label) {
 const _loadFileTransfer = _lazyModule(q => import('./lazy/file-transfer.js' + q), 'file sharing');
 const _loadFeedback = _lazyModule(q => import('./lazy/feedback.js' + q), 'feedback');
 const _loadAnnouncement = _lazyModule(q => import('./lazy/announcement.js' + q), 'announcement');
+const _loadReport = _lazyModule(q => import('./lazy/report.js' + q), 'reporting');
+const _loadModeration = _lazyModule(q => import('./lazy/moderation.js' + q), 'safety filter');
+(window.requestIdleCallback || setTimeout)(() => { _loadModeration().catch(() => {}); });
+
+async function _screenIncomingText(text) {
+  if (!text || typeof text !== 'string') return { text, blocked: false };
+  try { return (_loadModeration.peek() || await _loadModeration()).screenIncoming(text); }
+  catch { return { text, blocked: false }; }
+}
+
+window.__miutScreenFile = async file => {
+  try { return (await _loadModeration()).screenFile(file); }
+  catch { return { action: 'block', message: 'Safety check unavailable. Please try again in a moment.' }; }
+};
+window.__miutScreenFileName = async name => {
+  try { return (await _loadModeration()).screenFileName(name); }
+  catch { return { blocked: false }; }
+};
 
 window.__MIUT_APP_READY__ = true;
 document.dispatchEvent(new CustomEvent('miut-app:ready'));

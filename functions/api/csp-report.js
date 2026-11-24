@@ -20,7 +20,6 @@ export async function onRequestPost(context) {
 
     const entry = {
       ts:             new Date().toISOString(),
-      ip:             request.headers.get('CF-Connecting-IP') || 'unknown',
       country:        request.cf?.country || 'unknown',
       blocked_uri:    csp['blocked-uri']     || csp.blockedURL || '',
       violated:       csp['violated-directive'] || csp.effectiveDirective || '',

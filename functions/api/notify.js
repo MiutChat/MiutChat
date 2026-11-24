@@ -169,7 +169,7 @@ async function importVapidPrivateKey(privateKeyB64url, publicKeyB64url) {
 async function buildVapidAuth(endpoint, privateKey, publicKeyB64url) {
   const origin = new URL(endpoint).origin;
   const header = { typ: 'JWT', alg: 'ES256' };
-  const claims = { aud: origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'mailto:admin@miutchat.pages.dev' };
+  const claims = { aud: origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'https://miutchat.pages.dev' };
   const seg = o => bytesToB64url(new TextEncoder().encode(JSON.stringify(o)));
   const signingInput = seg(header) + '.' + seg(claims);
   // Web Crypto's ECDSA sign() output is already the raw r||s (IEEE P1363)

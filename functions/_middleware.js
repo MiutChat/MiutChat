@@ -11,6 +11,7 @@
 
 const BYPASS_PATHS    = ['/maintenance.html','/404.html','/manifest.json','/robots.txt','/sitemap.xml','/security.txt'];
 import { flushSoon } from './_lib/usage-store.js';
+import { ipToken } from './_lib/ip-token.js';
 
 const BYPASS_PREFIXES = ['/api/','/icons/'];
 const BYPASS_EXT      = /\.(png|ico|svg|jpg|jpeg|webp|webmanifest|txt|xml|gz|br|woff2?|css|js|map)$/i;
@@ -137,8 +138,8 @@ async function apiRateLimit(request, path, env) {
   if (env?.API_RATE_LIMIT_DISABLED === '1') return null;
   const mv   = parseFloat(env?.API_RATE_LIMIT_MULT);
   let mult   = Number.isFinite(mv) ? Math.min(20, Math.max(0.1, mv)) : 1;
-  const ipH  = request.headers.get('CF-Connecting-IP');
-  if (!ipH) mult *= 5;                                                      // header is always set by Cloudflare; missing = local dev
+  const ipH  = await ipToken(request, env);
+  if (ipH === 'unknown') mult *= 5;                                                      // header is always set by Cloudflare; missing = local dev
   const rule  = API_LIMITS.find(r => (path === r.p || path.startsWith(r.p + '/')) && (r.m === '*' || r.m === request.method)) || API_DEFAULT_LIMIT;
   const burst = Math.max(1, rule.burst * mult);
   const perMin = rule.perMin * mult;

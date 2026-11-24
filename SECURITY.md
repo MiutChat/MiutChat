@@ -11,7 +11,7 @@ Older versions are not supported.
 
 We take security seriously. If you discover a vulnerability, please report it responsibly.
 
-📧 Contact: feedback.miut@zohomail.in
+🔒 Report privately: https://github.com/MiutChat/MiutChat/security/advisories/new
 
 Please include:
 - A clear description of the issue

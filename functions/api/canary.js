@@ -6,8 +6,8 @@
  * Real users never visit these paths. Any IP that lands here is a scanner.
  *
  * Action taken:
- *   1. Log the IP + path + User-Agent to console (visible in CF Logpush)
- *   2. Write IP to MIUT_BAN KV with 24h TTL
+ *   1. Log a pseudonymous client token + path to console (visible in CF Logpush)
+ *   2. Write the token to MIUT_BAN KV with a 6h TTL
  *   3. Optionally fire a webhook alert
  *   4. Return a convincing 200 response (tarpit — wastes scanner time)
  * ═══════════════════════════════════════════════════════════════════════════════
@@ -16,12 +16,14 @@
 // Convincing fake response to waste scanner time
 const FAKE_BODY = `{"status":"ok","version":"1.0","build":"${Math.random().toString(36).slice(2)}"}`;
 
+import { ipToken } from '../_lib/ip-token.js';
+
 export async function onRequest(context) {
   const { request, env } = context;
 
-  const ip      = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const ip      = await ipToken(request, env);
   const path    = new URL(request.url).pathname;
-  const ua      = request.headers.get('User-Agent') || '';
+  const ua      = '';
   const country = request.cf?.country || 'unknown';
   const now     = Date.now();
 
@@ -40,7 +42,7 @@ export async function onRequest(context) {
       reason: `canary_trap:${path}`,
       ua,
       bannedAt: now,
-    }), { expirationTtl: 86400 }).catch(() => {});
+    }), { expirationTtl: 21600 }).catch(() => {});
   }
 
   // Webhook alert for known-bad paths
@@ -49,7 +51,7 @@ export async function onRequest(context) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        text: `🪤 Canary triggered on MIUT\nIP: ${ip} (${country})\nPath: ${path}\nUA: ${ua}`,
+        text: `🪤 Canary triggered on MIUT\nClient: ${ip} (${country})\nPath: ${path}`,
       }),
     }).catch(() => {});
   }

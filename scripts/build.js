@@ -182,7 +182,7 @@ const APP_CHUNKS = [];
     );
     return t;
   };
-  const LAZY_MODULES = ['file-transfer.js', 'feedback.js', 'announcement.js'];
+  const LAZY_MODULES = ['file-transfer.js', 'feedback.js', 'announcement.js', 'moderation.js', 'report.js'];
   const chunkNames = {};
   for (const mod of LAZY_MODULES) {
     if (!fs.existsSync(srcPath(mod))) continue;

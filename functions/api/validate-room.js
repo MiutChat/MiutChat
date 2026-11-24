@@ -51,6 +51,7 @@ export async function onRequestOptions(context) {
 export async function onRequestPost(context) {
   const { request, env } = context;
   const CORS = getCorsHeaders(request, env || {});
+  return json({ valid: false, error: 'gone' }, 410, CORS);
 
   let body;
   try { body = await request.json(); }
