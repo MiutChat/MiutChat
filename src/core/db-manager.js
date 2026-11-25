@@ -64,10 +64,10 @@ function _ridSha256(msg) {
 
 const _ridCache = new Map();
 const _ridKnown = new Set();
+const _legacyRooms = new Set();
 
-function roomDocId(code) {
+function roomHashId(code) {
   const s = String(code);
-  if (_ridKnown.has(s)) return s;
   let id = _ridCache.get(s);
   if (!id) {
     const d = _ridSha256(new TextEncoder().encode('miut-room-doc-v1\u0000' + s));
@@ -80,14 +80,37 @@ function roomDocId(code) {
   return id;
 }
 
+function roomDocId(code) {
+  const s = String(code);
+  if (_ridKnown.has(s) || _legacyRooms.has(s)) return s;
+  return roomHashId(s);
+}
+
 function installRoomIds(fs) {
   if (!fs || fs.__miutRoomIds) return fs;
   const col = fs.collection.bind(fs);
+  const rawDoc = id => col('rooms').doc(id);
   fs.collection = function (path) {
     const c = col(path);
     if (path === 'rooms') {
       const doc = c.doc.bind(c);
-      c.doc = id => (id === undefined ? doc() : doc(roomDocId(id)));
+      c.doc = id => {
+        if (id === undefined) return doc();
+        const code = String(id);
+        const ref = doc(roomDocId(code));
+        if (typeof ref.get !== 'function' || _ridKnown.has(code) || _legacyRooms.has(code)) return ref;
+        const currentGet = ref.get.bind(ref);
+        ref.get = async opts => {
+          const snap = await currentGet(opts);
+          if (snap.exists || _legacyRooms.has(code)) return snap;
+          let old;
+          try { old = await rawDoc(code).get(opts); } catch { return snap; }
+          if (!old.exists) return snap;
+          _legacyRooms.add(code);
+          return old;
+        };
+        return ref;
+      };
     }
     return c;
   };
@@ -95,8 +118,19 @@ function installRoomIds(fs) {
   return fs;
 }
 
+async function resolveRoom(fs, code) {
+  const s = String(code);
+  if (!_legacyRooms.has(s)) {
+    try { await fs.collection('rooms').doc(s).get(); } catch {}
+  }
+  return _legacyRooms.has(s);
+}
+
 window.__miutRoomDocId = roomDocId;
+window.__miutRoomHashId = roomHashId;
 window.__miutInstallRoomIds = installRoomIds;
+window.__miutResolveRoom = resolveRoom;
+window.__miutIsLegacyRoom = code => _legacyRooms.has(String(code));
 /* ROOM-ID-END */
 
 /**

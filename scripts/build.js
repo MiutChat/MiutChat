@@ -182,7 +182,7 @@ const APP_CHUNKS = [];
     );
     return t;
   };
-  const LAZY_MODULES = ['file-transfer.js', 'feedback.js', 'announcement.js', 'moderation.js', 'report.js'];
+  const LAZY_MODULES = ['file-transfer.js', 'feedback.js', 'announcement.js', 'moderation.js'];
   const chunkNames = {};
   for (const mod of LAZY_MODULES) {
     if (!fs.existsSync(srcPath(mod))) continue;
@@ -366,7 +366,7 @@ const STATIC = [
   '_headers','_redirects','_middleware.js','config.js','privacy.html','landing.html',
   'terms.html','about.html','404.html','maintenance.html',
   'secure-chat-for-journalists.html','ephemeral-chat-for-support-groups.html',
-  'robots.txt','ads.txt','wrangler.toml','CNAME', // sitemap.xml generated at build time below
+  'robots.txt','wrangler.toml','CNAME', // sitemap.xml generated at build time below
 ];
 // Files that need the unified VERSION text-stamped in rather than a plain
 // byte copy. manifest.json/wrangler.toml carry their own version fields;

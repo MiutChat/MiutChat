@@ -1577,6 +1577,7 @@ async function handleEnter() {
     if (!_allowed) { setLoading(btn, false); return; }
     let uid = _firstUid;
     _log('log', `[MIUT handleEnter] room=${code} shard=${_dbName} uid=${uid} — reading room doc`);
+    await window.__miutResolveRoom(db, code);
     let _memberRead = db.collection('rooms').doc(code).collection('members').doc(uid).get().catch(() => null);
     // A snapshot pre-read while the code was being typed (db-manager's prefetchRoom) saves a round trip; it is one-shot,
     // seconds-old at most, and everything below (blocked list, expiry, member state) still runs on it exactly as before.
@@ -3731,10 +3732,6 @@ function _enterSelectMode() {
         <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         <span>Info</span>
       </button>
-      <button class="msa-btn msa-report" id="msa-report" title="Report message" style="display:none">
-        <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><path d="M5 17V3m0 0h9l-2 3.5L14 10H5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span>Report</span>
-      </button>
       <button class="msa-btn msa-del-me" id="msa-del-me" title="Delete for me" style="display:none">
         <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><path d="M5 6h10M8 6V4h4v2M7 6l.6 9h4.8L13 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Me</span>
@@ -3748,7 +3745,6 @@ function _enterSelectMode() {
     if (header) header.parentNode.insertBefore(bar, header);
     document.getElementById('msa-cancel').addEventListener('click', _exitSelectMode);
     document.getElementById('msa-info').addEventListener('click', _infoSelected);
-    document.getElementById('msa-report').addEventListener('click', _reportSelected);
     document.getElementById('msa-del-me').addEventListener('click', () => _deleteSelected(false));
     document.getElementById('msa-del-all').addEventListener('click', () => _deleteSelected(true));
   }
@@ -3788,15 +3784,6 @@ function _updateSelectBar() {
     }
     infoBtn.style.display = showInfo ? '' : 'none';
   }
-  const reportBtn = document.getElementById('msa-report');
-  if (reportBtn) {
-    let showReport = false;
-    if (count === 1) {
-      const rw = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape([..._selectedIds][0])}"]`);
-      showReport = !!rw && rw.classList.contains('received') && !rw.classList.contains('deleted') && !String(rw.dataset.docId).startsWith('local_');
-    }
-    reportBtn.style.display = showReport ? '' : 'none';
-  }
   const delMe  = document.getElementById('msa-del-me');
   const delAll = document.getElementById('msa-del-all');
   if (delMe)  delMe.style.display  = count ? '' : 'none';
@@ -3825,7 +3812,7 @@ function _applyHiddenDocs() {
     const bubble = w.querySelector('.msg-bubble');
     if (!bubble) return;
     w.dataset.hiddenSafety = '1';
-    bubble.innerHTML = '<span class="msg-deleted-text">Hidden after reports from members</span>';
+    bubble.innerHTML = '<span class="msg-deleted-text">Hidden by MiutChat safety</span>';
   });
 }
 
@@ -3838,7 +3825,7 @@ async function _syncHiddenDocs() {
     _hiddenObserver.observe(area, { childList: true, subtree: true });
   }
   try {
-    const r = await fetch('/api/report?room=' + encodeURIComponent(window.__miutRoomDocId(state.roomCode)), { cache: 'no-store' });
+    const r = await fetch('/api/flag?room=' + encodeURIComponent(window.__miutRoomHashId(state.roomCode)), { cache: 'no-store' });
     if (!r.ok) return;
     const d = await r.json();
     for (const id of d.hidden || []) _hiddenDocs.add(id);
@@ -3846,7 +3833,26 @@ async function _syncHiddenDocs() {
   } catch {}
 }
 
-window.__miutHideDoc = id => { _hiddenDocs.add(id); _applyHiddenDocs(); };
+const _flaggedDocs = new Set();
+const _FLAG_CATEGORY = { threat: 'threat', hate: 'hate', csam: 'child-safety', 'illegal-trade': 'illegal' };
+
+function _autoFlag(docId, category, senderId) {
+  const cat = _FLAG_CATEGORY[category];
+  if (!cat || !docId || !state.roomCode || String(docId).startsWith('local_')) return;
+  if (senderId === state.me?.id || _flaggedDocs.has(docId)) return;
+  _flaggedDocs.add(docId);
+  try {
+    fetch('/api/flag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: window.__miutRoomHashId(state.roomCode), docId, category: cat, from: state.me?.id || '' }),
+      keepalive: true
+    })
+      .then(r => r.json())
+      .then(d => { if (d && d.hidden) { _hiddenDocs.add(docId); _applyHiddenDocs(); } })
+      .catch(() => {});
+  } catch {}
+}
 setInterval(() => { if (state.roomCode && !document.hidden) _syncHiddenDocs(); }, 90000);
 
 function closeMsgInfo() {
@@ -3909,17 +3915,6 @@ function _infoSelected() {
   const docId = [..._selectedIds][0];
   _exitSelectMode();
   _showMsgInfo(docId);
-}
-
-async function _reportSelected() {
-  if (_selectedIds.size !== 1) return;
-  const docId = [..._selectedIds][0];
-  _exitSelectMode();
-  try {
-    (await _loadReport()).showReportModal({ roomId: window.__miutRoomDocId(state.roomCode), docId, reporter: state.me?.id || '' });
-  } catch (e) {
-    toast('Report', "Couldn't open the report form. Please try again.", 'err');
-  }
 }
 
 async function _deleteSelected(forEveryone) {
@@ -4525,7 +4520,7 @@ function _scheduleDecryptRetry(wrap, data, docId, onHealed) {
     if (!wrap.isConnected) return; // bubble was removed (deleted, room left) — nothing to patch
     let text;
     try { text = await dec(data.enc, state.roomCode, data.senderId); } catch { text = '[encrypted]'; }
-    if (text !== '[encrypted]') text = (await _screenIncomingText(text)).text;
+    if (text !== '[encrypted]') text = (await _screenIncomingText(text, docId, data.senderId)).text;
     if (text !== '[encrypted]') {
       const bubbleEl = wrap.querySelector('.msg-bubble');
       if (bubbleEl) {
@@ -4620,7 +4615,7 @@ export async function renderMsg(data, docId, insertBeforeEl) {
   // handlers wired further down close over this same binding, so they see
   // the healed text too instead of staying stuck quoting "[encrypted]".
   let plainText = data.type === 'text' ? await dec(data.enc, state.roomCode, data.senderId) : null;
-  if (plainText) plainText = (await _screenIncomingText(plainText)).text;
+  if (plainText) plainText = (await _screenIncomingText(plainText, docId, data.senderId)).text;
 
   let bubble = '';
   let replyQuote = '';
@@ -5078,7 +5073,7 @@ async function patchMsg(id, data) {
   if (data.readBy) _renderReadBadge(wrapEl, data.readBy);
   if (data.edited && data.type === 'text') {
     const bubble = wrapEl.querySelector('.msg-bubble');
-    if (bubble) bubble.innerHTML = renderTextContent((await _screenIncomingText(await dec(data.enc, state.roomCode, data.senderId))).text) + '<span class="msg-edited"> ✎</span>';
+    if (bubble) bubble.innerHTML = renderTextContent((await _screenIncomingText(await dec(data.enc, state.roomCode, data.senderId), id, data.senderId)).text) + '<span class="msg-edited"> ✎</span>';
     if (data.sig) requestAnimationFrame(() => verifyAndBadge(data, id));
   }
 }
@@ -6846,6 +6841,8 @@ function _wireAllHandlers() {
   // ── Member detail panel ──────────────────────────────────────────────────────
   on('member-detail-close-btn', 'click', () => closeMemberDetail());
   on('member-detail-modal', 'click', e => { if (e.target.id === 'member-detail-modal') closeMemberDetail(); });
+  on('msg-info-close-btn', 'click', () => closeMsgInfo());
+  on('msg-info-modal', 'click', e => { if (e.target.id === 'msg-info-modal') closeMsgInfo(); });
 
   // ── Settings modal ────────────────────────────────────────────────────────────
   on('settings-modal', 'click', e => closeModal(e));
@@ -6959,14 +6956,16 @@ function _lazyModule(importer, label) {
 const _loadFileTransfer = _lazyModule(q => import('./lazy/file-transfer.js' + q), 'file sharing');
 const _loadFeedback = _lazyModule(q => import('./lazy/feedback.js' + q), 'feedback');
 const _loadAnnouncement = _lazyModule(q => import('./lazy/announcement.js' + q), 'announcement');
-const _loadReport = _lazyModule(q => import('./lazy/report.js' + q), 'reporting');
 const _loadModeration = _lazyModule(q => import('./lazy/moderation.js' + q), 'safety filter');
 (window.requestIdleCallback || setTimeout)(() => { _loadModeration().catch(() => {}); });
 
-async function _screenIncomingText(text) {
+async function _screenIncomingText(text, docId, senderId) {
   if (!text || typeof text !== 'string') return { text, blocked: false };
-  try { return (_loadModeration.peek() || await _loadModeration()).screenIncoming(text); }
-  catch { return { text, blocked: false }; }
+  try {
+    const r = (_loadModeration.peek() || await _loadModeration()).screenIncoming(text);
+    if (r.blocked) _autoFlag(docId, r.category, senderId);
+    return r;
+  } catch { return { text, blocked: false }; }
 }
 
 window.__miutScreenFile = async file => {

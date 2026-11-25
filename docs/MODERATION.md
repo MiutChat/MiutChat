@@ -11,10 +11,10 @@ Nothing here needs a human. No one reads messages, reviews reports or answers em
 - Three blocked attempts in 10 minutes start a cooldown of 60 s, then 5, 15 and 30 minutes on repeats (the level resets after an hour).
 - Keys are `st:`, `cd:` and `lv:` plus a pseudonymous network token. They expire on their own. The browser also keeps `miut_safety` in local storage so a refresh does not reset the pause.
 
-## Reports (KV, `functions/api/report.js`)
-- A report carries only the hashed room id, the message id, a category and a hashed reporter id. No message text is ever sent.
-- A message is hidden for everyone automatically once 3 distinct members (from at least 2 network tokens) report it, or 2 members for child-safety, intimate-image or threat reports.
-- Records expire after 7 days.
+## Automatic flags (KV, `functions/api/flag.js`)
+- There is no manual report option. When a stock client blocks an incoming message, it sends an anonymous flag: hashed room id, message id, one of `threat`, `hate`, `child-safety`, `illegal`, and a hashed sender id. No message text is ever sent.
+- A message is hidden for everyone automatically once 3 distinct apps (from at least 2 network tokens) flag it, or 2 apps for `child-safety` and `threat`. Records expire after 7 days.
+- People can tell us about mistakes through the in-app Feedback form.
 
 ## Privacy of the infrastructure
 - Room codes never reach the server: Firestore documents are keyed by `r` + base64url(SHA-256("miut-room-doc-v1" + 0x00 + code)), the registry sees only its own hash, and invite links put the code after `#`.

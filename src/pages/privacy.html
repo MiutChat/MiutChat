@@ -52,8 +52,6 @@ footer{border-top:1px solid var(--bdr);padding:28px 6%;text-align:center;font-si
 footer a{color:var(--t)}
 footer .version-credit{color:var(--tx2);opacity:.7}
 </style>
-  <meta name="google-adsense-account" content="ca-pub-3612530304259447">
-  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3612530304259447" crossorigin="anonymous"></script>
 </head>
 <body>
 <nav>
@@ -70,7 +68,7 @@ footer .version-credit{color:var(--tx2);opacity:.7}
   <div class="meta">Effective Date: January 1, 2025 &nbsp;·&nbsp; Last Updated: November 20, 2026 &nbsp;·&nbsp; Version 1.1</div>
 
   <div class="highlight">
-    <p><strong>Summary:</strong> MiutChat requires no account and does not collect names, email addresses or phone numbers. Messages are encrypted in your browser before they are sent. Room data is deleted when the last member leaves. Messages that are reported to us are kept until they have been reviewed.</p>
+    <p><strong>Summary:</strong> MiutChat requires no account and does not collect names, email addresses or phone numbers. Messages are encrypted in your browser before they are sent. Room data is deleted when the last member leaves. Anonymous safety flags are deleted after seven days.</p>
   </div>
 
   <div class="badge-row">
@@ -119,7 +117,7 @@ footer .version-credit{color:var(--tx2);opacity:.7}
   <ul>
     <li><strong>Encrypted ciphertext:</strong> Your messages are encrypted in your browser before transmission. We store the ciphertext only. Your room code is never sent to our servers: the database identifies the room by a one-way hash of the code, and the encryption key is derived in your browser from the code. We cannot decrypt messages unless the room code is guessable, so choose a long, unpredictable code. File names, file types and sizes, display names and timestamps are not encrypted.</li>
     <li><strong>Network token (transient):</strong> To limit abuse, our edge function turns your IP address into a keyed hash using a random salt that changes daily and is deleted after 36 hours. We never store the raw IP address. The token is used only for security: rate-limit counters (they expire within about two minutes), temporary blocks (at most six hours), and safety-strike counters (ten minutes to one hour). It is pseudonymous, not anonymous. Cloudflare and Google process IP addresses to deliver the service under their own policies, which we cannot change.</li>
-    <li><strong>Reports:</strong> When a member reports a message, we store the room's hashed identifier, the message identifier, the category, a hashed reporter ID and a hashed network token. We never receive the message text. Reports are deleted after seven days.</li>
+    <li><strong>Automatic safety flags:</strong> When your app blocks an incoming message as harmful, it sends an anonymous flag with the room's hashed identifier, the message identifier, the category, a hashed sender-of-flag ID and a hashed network token. We never receive the message text. Flags are deleted after seven days.</li>
     <li><strong>Safety cooldown:</strong> If you repeatedly try to send blocked content, your browser stores a small <code>miut_safety</code> entry in local storage so that the pause survives a page refresh.</li>
     <li><strong>Anonymous session UID:</strong> Firebase Anonymous Authentication assigns a random UUID to your session. This is not linked to any personal identity.</li>
     <li><strong>Public signing key:</strong> An ECDSA P-256 public key used to verify message authenticity. The private key never leaves your device.</li>
@@ -150,7 +148,7 @@ footer .version-credit{color:var(--tx2);opacity:.7}
   <p>We use no advertising networks, analytics platforms, social SDKs, tracking pixels, or other third-party services. Font loading uses Google Fonts (Space Mono, Syne) which may log your IP per Google's policy.</p>
 
   <h2 id="data-storage">5. Data Storage & Retention</h2>
-  <p>All room data in Firestore (encrypted messages, member records, room metadata) is automatically and permanently deleted when the last approved member leaves a room. Reports are the exception: they are kept as described in Section 2. This deletion is performed by a Firestore transaction that cannot be undone.</p>
+  <p>All room data in Firestore (encrypted messages, member records, room metadata) is automatically and permanently deleted when the last approved member leaves a room. Automatic safety flags are the exception: they are kept for seven days as described in Section 2. This deletion is performed by a Firestore transaction that cannot be undone.</p>
   <p>Your device stores the following locally (in browser localStorage and IndexedDB):</p>
   <ul>
     <li>Your session state (anonymous UID, display name, room code) — cleared on "Leave Room"</li>
