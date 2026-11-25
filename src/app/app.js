@@ -3728,10 +3728,6 @@ function _enterSelectMode() {
       </button>
       <span class="msa-count" id="msa-count">0 selected</span>
       <div style="flex:1"></div>
-      <button class="msa-btn msa-info" id="msa-info" title="Message info" style="display:none">
-        <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-        <span>Info</span>
-      </button>
       <button class="msa-btn msa-del-me" id="msa-del-me" title="Delete for me" style="display:none">
         <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><path d="M5 6h10M8 6V4h4v2M7 6l.6 9h4.8L13 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Me</span>
@@ -3744,7 +3740,6 @@ function _enterSelectMode() {
     const header = document.getElementById('chat-header');
     if (header) header.parentNode.insertBefore(bar, header);
     document.getElementById('msa-cancel').addEventListener('click', _exitSelectMode);
-    document.getElementById('msa-info').addEventListener('click', _infoSelected);
     document.getElementById('msa-del-me').addEventListener('click', () => _deleteSelected(false));
     document.getElementById('msa-del-all').addEventListener('click', () => _deleteSelected(true));
   }
@@ -3775,15 +3770,6 @@ function _updateSelectBar() {
     const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
     return _isAdmin || w?.classList.contains('sent');
   });
-  const infoBtn = document.getElementById('msa-info');
-  if (infoBtn) {
-    let showInfo = false;
-    if (count === 1) {
-      const iw = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape([..._selectedIds][0])}"]`);
-      showInfo = !!iw && !iw.classList.contains('deleted') && !String(iw.dataset.docId).startsWith('local_');
-    }
-    infoBtn.style.display = showInfo ? '' : 'none';
-  }
   const delMe  = document.getElementById('msa-del-me');
   const delAll = document.getElementById('msa-del-all');
   if (delMe)  delMe.style.display  = count ? '' : 'none';
@@ -3883,6 +3869,26 @@ async function _showMsgInfo(docId) {
     ['SENT', sentMs ? new Date(sentMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : 'Unknown'],
     ['STATUS', readerIds.length ? `Read by ${readerIds.length}` : 'Delivered'],
   ];
+  if (data.edited && data.editedAt) {
+    const editedMs = _createdMs({ createdAt: data.editedAt }) || 0;
+    rows.push(['EDITED', editedMs ? new Date(editedMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : 'Yes']);
+  }
+  if (data.replyTo && data.replyTo.senderName) {
+    rows.push(['REPLYING TO', data.replyTo.senderName]);
+  }
+  if (data.fileName) rows.push(['FILE NAME', data.fileName]);
+  if (typeof data.fileSize === 'number' && data.fileSize > 0) {
+    const kb = data.fileSize / 1024;
+    rows.push(['FILE SIZE', kb < 1024 ? `${kb.toFixed(1)} KB` : `${(kb / 1024).toFixed(1)} MB`]);
+  }
+  if (data.mime) rows.push(['FILE TYPE', data.mime]);
+  if (data.reactions && Object.keys(data.reactions).length) {
+    const summary = Object.entries(data.reactions)
+      .map(([emoji, users]) => `${emoji} ${Object.keys(users || {}).length}`)
+      .join('  ');
+    if (summary) rows.push(['REACTIONS', summary]);
+  }
+  rows.push(['MESSAGE ID', docId]);
   $('mi-rows').innerHTML = rows.map(([k, v]) =>
     `<div class="md-row"><span class="md-row-label">${k}</span><span class="md-row-value">${esc(String(v))}</span></div>`
   ).join('');
@@ -3908,13 +3914,6 @@ async function _showMsgInfo(docId) {
     }
   }
   overlay.style.display = 'flex';
-}
-
-function _infoSelected() {
-  if (_selectedIds.size !== 1) return;
-  const docId = [..._selectedIds][0];
-  _exitSelectMode();
-  _showMsgInfo(docId);
 }
 
 async function _deleteSelected(forEveryone) {
@@ -5461,6 +5460,19 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
       });
       actRow.appendChild(editBtn);
     }
+  }
+
+  const _detailsId = currentId();
+  if (!wrap.classList.contains('deleted') && !String(_detailsId).startsWith('local_')) {
+    const detailsBtn = document.createElement('button');
+    detailsBtn.className = 'strip-action';
+    detailsBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" width="15" height="15"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Details</span>`;
+    detailsBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      strip.remove();
+      _showMsgInfo(_detailsId);
+    });
+    actRow.appendChild(detailsBtn);
   }
 
   strip.appendChild(actRow);
