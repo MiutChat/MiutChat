@@ -434,3 +434,94 @@ test('abandonedVerdict covers the edge cases', () => {
   assert.strictEqual(admin.abandonedVerdict({ inactivityTtlMs: { integerValue: '86400000' }, createdAt: iso(now - 30 * H) }, now - 30 * H, now), 'wipe');
   assert.strictEqual(admin.abandonedVerdict({ autoDeleteAt: iso(now + H), createdAt: iso(now - 99 * H) }, 0, now), 'keep');
 });
+
+
+const analyticsPost = (body, ip = '198.51.100.20') => new Request('https://x.test/api/analytics', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+  body: JSON.stringify(body)
+});
+
+test('analytics events are recorded in the KV counters and never store an ip', async () => {
+  const mod = await loadFn('analytics.js');
+  const env = { MIUT_KV: fakeKv() };
+  const call = body => mod.onRequest({ request: analyticsPost(body), env });
+  assert.strictEqual((await call({ e: 'room_created' })).status, 200);
+  assert.strictEqual((await call({ e: 'message_sent', n: 2 })).status, 200);
+  assert.strictEqual((await call({ e: 'message_sent', n: 2 })).status, 200);
+  assert.strictEqual((await call({ e: 'not_an_event' })).status, 200);
+  assert.strictEqual((await call({ e: '__proto__' })).status, 200);
+  assert.strictEqual(env.MIUT_KV.m.get('analytics:room_created'), '1');
+  assert.strictEqual(env.MIUT_KV.m.get('analytics:message_sent'), '4');
+  const day = new Date().toISOString().slice(0, 10);
+  assert.strictEqual(env.MIUT_KV.m.get(`analytics:day:${day}:message_sent`), '4');
+  assert.ok([...env.MIUT_KV.m.keys()].every(k => k.startsWith('analytics:')));
+  assert.ok(!JSON.stringify([...env.MIUT_KV.m.entries()]).includes('198.51.100'));
+});
+
+test('analytics falls back to KV when the Firestore write fails and always answers 200', async () => {
+  const mod = await loadFn('analytics.js');
+  const sa = JSON.stringify({ client_email: 'a@b.iam.gserviceaccount.com', private_key: 'not-a-real-key', project_id: 'demo' });
+  const env = { MIUT_KV: fakeKv(), FIREBASE_REGISTRY_SA_JSON: sa };
+  const res = await mod.onRequest({ request: analyticsPost({ e: 'room_created' }), env });
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(env.MIUT_KV.m.get('analytics:room_created'), '1');
+  const broken = { MIUT_KV: { get: async () => { throw new Error('kv down'); }, put: async () => { throw new Error('kv down'); } } };
+  const res2 = await mod.onRequest({ request: analyticsPost({ e: 'message_sent' }), env: broken });
+  assert.strictEqual(res2.status, 200);
+  const res3 = await mod.onRequest({ request: new Request('https://x.test/api/analytics', { method: 'POST', body: 'not json' }), env });
+  assert.strictEqual(res3.status, 200);
+});
+
+async function loadMiddleware() {
+  const out = esbuild.buildSync({
+    entryPoints: [path.join(root, 'functions', '_middleware.js')],
+    bundle: true, format: 'esm', write: false, platform: 'node', target: 'es2020'
+  });
+  const f = path.join(os.tmpdir(), 'miut-mw-' + process.pid + '.mjs');
+  fs.writeFileSync(f, out.outputFiles[0].text);
+  return import('file://' + f);
+}
+
+const mwCtx = (env, ip = '198.51.100.30') => ({
+  request: new Request('https://x.test/api/analytics', { method: 'POST', headers: { 'CF-Connecting-IP': ip }, body: '{}' }),
+  env,
+  next: async () => new Response('reached-handler', { status: 200 })
+});
+const doBinding = stubFetch => ({ idFromName: n => n, get: () => ({ fetch: stubFetch }) });
+
+test('a failing, erroring or hanging rate-limiter object never blocks api requests', async () => {
+  const mw = await loadMiddleware();
+  const kv = fakeKv();
+  const throwing = await mw.onRequest(mwCtx({ MIUT_RL: kv, MIUT_RL_DO: doBinding(async () => { throw new Error('Durable Object not found'); }) }));
+  assert.strictEqual(await throwing.text(), 'reached-handler');
+  const serverError = await mw.onRequest(mwCtx({ MIUT_RL: kv, MIUT_RL_DO: doBinding(async () => new Response('boom', { status: 500 })) }));
+  assert.strictEqual(await serverError.text(), 'reached-handler');
+  const badJson = await mw.onRequest(mwCtx({ MIUT_RL: kv, MIUT_RL_DO: doBinding(async () => new Response('<html>', { status: 200 })) }));
+  assert.strictEqual(await badJson.text(), 'reached-handler');
+  const hanging = await mw.onRequest(mwCtx({ MIUT_RL: kv, MIUT_RL_DO: doBinding(() => new Promise(() => {})) }));
+  assert.strictEqual(await hanging.text(), 'reached-handler');
+});
+
+test('a healthy rate limiter still blocks when it says to wait, and the key is the token not the ip', async () => {
+  const mw = await loadMiddleware();
+  const seen = [];
+  const env = { MIUT_RL: fakeKv(), MIUT_RL_DO: { idFromName: n => { seen.push(n); return n; }, get: () => ({ fetch: async () => new Response(JSON.stringify({ wait: 7 })) }) } };
+  const res = await mw.onRequest(mwCtx(env, '198.51.100.31'));
+  assert.strictEqual(res.status, 429);
+  assert.strictEqual(res.headers.get('Retry-After'), '7');
+  assert.ok(seen.length === 1 && !seen[0].includes('198.51.100'));
+});
+
+test('the bound KV is used for the ip salt when the dedicated one is missing', async () => {
+  const env = { MIUT_KV: fakeKv() };
+  const realNow = Date.now;
+  try {
+    Date.now = () => Date.UTC(2030, 0, 1, 12);
+    const token = await ipMod.ipToken(req('203.0.113.77'), env);
+    assert.notStrictEqual(token, 'unknown');
+    assert.ok(env.MIUT_KV.m.has('salt:2030-01-01'));
+  } finally {
+    Date.now = realNow;
+  }
+});

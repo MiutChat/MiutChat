@@ -53,6 +53,27 @@ function authorized(request, env) {
   return diff === 0;
 }
 
+async function kvCount(env, event, n) {
+  const kv = env && env.MIUT_KV;
+  if (!kv || (event !== 'room_created' && event !== 'message_sent')) return false;
+  const totalKey = `analytics:${event}`;
+  const cur = parseInt(await kv.get(totalKey) || '0', 10);
+  await kv.put(totalKey, String(cur + n));
+  const day = new Date().toISOString().slice(0, 10);
+  const dayKey = `analytics:day:${day}:${event}`;
+  const dayVal = parseInt(await kv.get(dayKey) || '0', 10);
+  await kv.put(dayKey, String(dayVal + n), { expirationTtl: 90 * 24 * 3600 });
+  return true;
+}
+
+async function recordWithFallback(env, item) {
+  if (registryAdmin(env)) {
+    const r = await recordEvents(env, [item]);
+    if (r && r.ok) return true;
+  }
+  return kvCount(env, item.event, item.n);
+}
+
 export async function onRequest(ctx) {
   const { request, env } = ctx;
   const url = new URL(request.url);
@@ -127,34 +148,21 @@ export async function onRequest(ctx) {
     }
 
     // ── POST — record an event ──────────────────────────────────────────────
+    // Never throws and always answers 200: analytics must never affect the app.
     let body;
     try { body = await request.json(); } catch { return new Response('ok', { status: 200, headers: CORS }); }
     const event = body?.e;
     if (!event || !Object.prototype.hasOwnProperty.call(CLIENT_EVENTS, event)) return new Response('ok', { status: 200, headers: CORS });
 
-    // A client may report several events in one request (`n`, 1..10).
     const n = Math.min(10, Math.max(1, Math.floor(Number(body?.n)) || 1));
-
-    if (registryAdmin(env)) {
-      const work = recordEvents(env, [{
-        event, n, dims: body?.d,
-        hour: new Date().getUTCHours(),
-        country: env.ANALYTICS_GEO === 'off' ? null : request.cf?.country,
-      }]);
-      if (ctx.waitUntil) ctx.waitUntil(work); else await work;
-      return new Response('ok', { status: 200, headers: CORS });
-    }
-
-    // ── Legacy KV fallback (only the two original events) ───────────────────
-    const kv = env?.MIUT_KV;
-    if (!kv || (event !== 'room_created' && event !== 'message_sent')) return new Response('ok', { status: 200, headers: CORS });
-    const totalKey = `analytics:${event}`;
-    const cur = parseInt(await kv.get(totalKey) || '0', 10);
-    await kv.put(totalKey, String(cur + n));
-    const day = new Date().toISOString().slice(0, 10);
-    const dayKey = `analytics:day:${day}:${event}`;
-    const dayVal = parseInt(await kv.get(dayKey) || '0', 10);
-    await kv.put(dayKey, String(dayVal + n), { expirationTtl: 90 * 24 * 3600 }); // keep 90 days
+    const item = {
+      event, n, dims: body?.d,
+      hour: new Date().getUTCHours(),
+      country: env.ANALYTICS_GEO === 'off' ? null : request.cf?.country,
+    };
+    const work = recordWithFallback(env, item)
+      .catch(e => console.error('[MIUT analytics] record failed', e && e.message || e));
+    if (ctx.waitUntil) ctx.waitUntil(work); else await work;
     return new Response('ok', { status: 200, headers: CORS });
   }
 

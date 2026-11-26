@@ -19,4 +19,5 @@ Nothing here needs a human. No one reads messages, reviews reports or answers em
 ## Privacy of the infrastructure
 - Room codes never reach the server: Firestore documents are keyed by `r` + base64url(SHA-256("miut-room-doc-v1" + 0x00 + code)), the registry sees only its own hash, and invite links put the code after `#`.
 - `functions/_lib/ip-token.js` is the only place a raw IP is read. It produces an HMAC with a random daily salt stored in KV for 36 hours. Rate limits, bans (6 h) and strikes use only that token.
-- Analytics: the browser sends none, and `/api/analytics` discards writes.
+- Analytics: anonymous aggregate counters only (no IP, room code or user id), recorded by `/api/analytics` into the registry Firestore project, with the `MIUT_KV` counters `analytics:room_created` and `analytics:message_sent` as the fallback if that write fails.
+- Rate limiting never blocks the API when its Durable Object fails: the middleware and `rate-limit.js` fall back to an in-memory or KV limiter.

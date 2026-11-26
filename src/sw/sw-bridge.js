@@ -292,6 +292,7 @@ window.requestPushPermission = async function() {
   const _wasDefault = perm === 'default';
   if (_wasDefault) perm = await Notification.requestPermission();
   if (perm !== 'granted') return perm; // 'denied' — nothing more we can do from here
+  if (_wasDefault) { try { fetch('/api/analytics', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"e":"push_enabled"}', keepalive: true }).catch(() => {}); } catch {} }
 
   let sub = null;
   try {

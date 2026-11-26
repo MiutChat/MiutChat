@@ -106,6 +106,8 @@ const API_LIMITS = [
   { p: '/api/validate-room',  m: '*',    name: 'validate',    burst: 20, perMin: 40 },
   { p: '/api/analytics',      m: 'POST', name: 'analytics-w', burst: 10, perMin: 20 },   // writes KV
   { p: '/api/analytics',      m: '*',    name: 'analytics-r', burst: 5,  perMin: 10 },   // admin read (Bearer secret)
+  { p: '/api/flag',           m: 'POST', name: 'flag-w',      burst: 10, perMin: 20 },
+  { p: '/api/flag',           m: '*',    name: 'flag-r',      burst: 10, perMin: 30 },
   { p: '/api/usage',          m: 'POST', name: 'usage-w',    burst: 20, perMin: 30 },
   { p: '/api/usage',          m: '*',    name: 'usage-r',    burst: 5,  perMin: 10 },
   { p: '/api/notify',         m: '*',    name: 'notify',      burst: 20, perMin: 30 },
@@ -134,11 +136,40 @@ function _takeToken(key, burst, perMin, now) {
   return Math.max(1, Math.ceil((1 - b.t) / rate / 1000));
 }
 
+let _limiterWarnedAt = 0;
+function _warnLimiter(e) {
+  const now = Date.now();
+  if (now - _limiterWarnedAt < 60000) return;
+  _limiterWarnedAt = now;
+  console.warn('[MIUT limiter] falling back to the in-memory limiter:', e && e.message || e);
+}
+
+async function _bucketViaDO(env, ipH, rule, burst, perMin) {
+  const stub = env.MIUT_RL_DO.get(env.MIUT_RL_DO.idFromName(ipH || 'unknown'));
+  const call = stub.fetch('https://do/limit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'bucket', action: rule.name, burst, perMin }),
+  });
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('rate limiter timeout')), 1500); });
+  try {
+    const res = await Promise.race([call, timeout]);
+    if (!res.ok) throw new Error('rate limiter status ' + res.status);
+    const data = await res.json();
+    return Number(data && data.wait) || 0;
+  } finally {
+    clearTimeout(timer);
+    call.catch(() => {});
+  }
+}
+
 async function apiRateLimit(request, path, env) {
   if (env?.API_RATE_LIMIT_DISABLED === '1') return null;
   const mv   = parseFloat(env?.API_RATE_LIMIT_MULT);
   let mult   = Number.isFinite(mv) ? Math.min(20, Math.max(0.1, mv)) : 1;
-  const ipH  = await ipToken(request, env);
+  let ipH = 'unknown';
+  try { ipH = await ipToken(request, env); } catch (e) { _warnLimiter(e); }
   if (ipH === 'unknown') mult *= 5;                                                      // header is always set by Cloudflare; missing = local dev
   const rule  = API_LIMITS.find(r => (path === r.p || path.startsWith(r.p + '/')) && (r.m === '*' || r.m === request.method)) || API_DEFAULT_LIMIT;
   const burst = Math.max(1, rule.burst * mult);
@@ -146,13 +177,12 @@ async function apiRateLimit(request, path, env) {
 
   let wait;
   if (env?.MIUT_RL_DO) {
-    const stub = env.MIUT_RL_DO.get(env.MIUT_RL_DO.idFromName(ipH || 'unknown'));
-    const res = await stub.fetch('https://do/limit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'bucket', action: rule.name, burst, perMin }),
-    });
-    ({ wait } = await res.json());
+    try {
+      wait = await _bucketViaDO(env, ipH, rule, burst, perMin);
+    } catch (e) {
+      _warnLimiter(e);
+      wait = _takeToken(`${rule.name}|${ipH || 'unknown'}`, burst, perMin, Date.now());
+    }
   } else {
     wait = _takeToken(`${rule.name}|${ipH || 'unknown'}`, burst, perMin, Date.now());
   }
@@ -170,7 +200,8 @@ async function handle(ctx) {
   const path = url.pathname;
 
   if (path.startsWith('/api/')) {
-    const limited = await apiRateLimit(request, path, env);
+    let limited = null;
+    try { limited = await apiRateLimit(request, path, env); } catch (e) { _warnLimiter(e); }
     if (limited) return limited;
   }
 

@@ -1,6 +1,6 @@
 'use strict';
 
-import { ipToken } from '../_lib/ip-token.js';
+import { ipToken, kvOf } from '../_lib/ip-token.js';
 
 const CATEGORIES = ['child-safety', 'threat', 'hate', 'illegal'];
 const SENSITIVE = new Set(['child-safety', 'threat']);
@@ -31,7 +31,7 @@ async function readJson(kv, key, fallback) {
 
 export async function onRequest(context) {
   const { request, env } = context;
-  const kv = env && env.MIUT_RL;
+  const kv = kvOf(env);
   if (!kv) return json({ error: 'not_configured' }, 501);
 
   if (request.method === 'GET') {
@@ -55,14 +55,7 @@ export async function onRequest(context) {
   const key = `rc:${roomId}:${docId}`;
   const rec = await readJson(kv, key, { u: [], i: [] });
   const uh = await short('u|' + from);
-  // 14-day rotation, not the default daily one: this record's TTL is 7 days
-  // (TTL_SEC above), and a daily-rotating token would make the SAME reporter
-  // look like a new, distinct IP every time the UTC day rolls over during
-  // that window -- artificially inflating the unique-IP count this dedup
-  // check exists to measure, and making the auto-hide threshold easier to
-  // trigger than intended. Same bug as report.js had; fixing it here before
-  // this file ships. See ip-token.js's ipToken() doc.
-  const ih = await ipToken(request, env, 14);
+  const ih = await ipToken(request, env);
   if (!rec.u.includes(uh) && rec.u.length < MAX_ENTRIES) rec.u.push(uh);
   if (!rec.i.includes(ih) && rec.i.length < MAX_ENTRIES) rec.i.push(ih);
   if (SENSITIVE.has(category)) rec.s = true;

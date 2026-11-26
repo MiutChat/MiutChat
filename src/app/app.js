@@ -3690,7 +3690,19 @@ async function _checkRoomExpiry(code, db, knownSnap) {
 
 /** _ping — anonymous event counter, fire-and-forget. `n` > 1 reports a batch of events in one request.
  *  `dims` are low-cardinality labels (e.g. { ttl: 'm5' }); the server only accepts values from fixed lists. */
-function _ping() {}
+function _ping(event, n, dims) {
+  try {
+    const body = { e: event };
+    if (n > 1) body.n = n;
+    if (dims) body.d = dims;
+    fetch('/api/analytics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {}
+}
 /** Public wrapper so the lazy modules (file-transfer, feedback) can report events too. */
 export function track(event, n, dims) { _ping(event, n, dims); }
 

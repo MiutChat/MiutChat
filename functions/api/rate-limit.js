@@ -20,7 +20,7 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
-import { ipToken } from '../_lib/ip-token.js';
+import { ipToken, kvOf } from '../_lib/ip-token.js';
 
 const ALLOWED_ORIGINS_DEFAULT = ['https://miutchat.pages.dev'];
 
@@ -89,17 +89,25 @@ async function checkLimitViaKV(MIUT_RL, ip, action, limit) {
 }
 
 async function checkLimit(ip, action, limit, env) {
-  const banned = await env.MIUT_BAN.get(`ban:${ip}`);
+  const banned = await (env.MIUT_BAN ? env.MIUT_BAN.get(`ban:${ip}`).catch(() => null) : null);
   if (banned) {
     return { allowed: false, retryAfter: BAN_TTL_SEC, reason: 'ip_banned' };
   }
 
-  const { allowed, count, retryAfter } = env.MIUT_RL_DO
-    ? await checkLimitViaDO(env.MIUT_RL_DO, ip, action, limit.max, limit.windowSec * 1000)
-    : await checkLimitViaKV(env.MIUT_RL, ip, action, limit);
+  let verdict;
+  try {
+    verdict = env.MIUT_RL_DO
+      ? await checkLimitViaDO(env.MIUT_RL_DO, ip, action, limit.max, limit.windowSec * 1000)
+      : await checkLimitViaKV(env.MIUT_RL, ip, action, limit);
+  } catch (e) {
+    console.warn('[MIUT rate-limit] primary limiter failed, trying KV:', e && e.message || e);
+    try { verdict = kvOf(env) ? await checkLimitViaKV(kvOf(env), ip, action, limit) : { allowed: true, count: 0 }; }
+    catch { verdict = { allowed: true, count: 0 }; }
+  }
+  const { allowed, count, retryAfter } = verdict;
 
   if (!allowed) {
-    if (count > limit.max * 10) {
+    if (count > limit.max * 10 && env.MIUT_BAN) {
       await env.MIUT_BAN.put(`ban:${ip}`, JSON.stringify({
         reason: `rate_limit_abuse:${action}`,
         count,
@@ -113,7 +121,7 @@ async function checkLimit(ip, action, limit, env) {
 }
 
 async function safetyStrike(env, token, add) {
-  const kv = env.MIUT_RL;
+  const kv = kvOf(env);
   if (!kv || token === 'unknown') return { cooldown: 0 };
   const cdKey = `cd:${token}`;
   const active = await kv.get(cdKey);
@@ -169,11 +177,7 @@ export async function onRequestPost(context) {
   const action = body?.action;
 
   if (action === 'strike' || action === 'strike-status') {
-    // 14-day rotation: cooldowns here top out at 30 minutes, but using the
-    // same long-lived token as the ban check below keeps one caller
-    // recognized consistently across every anti-abuse mechanism in this
-    // file, not just the short ones. See ip-token.js's ipToken() doc.
-    const token = await ipToken(request, env, 14);
+    const token = await ipToken(request, env);
     const out = await safetyStrike(env, token, action === 'strike');
     return new Response(JSON.stringify(out), {
       status: 200,
@@ -188,14 +192,7 @@ export async function onRequestPost(context) {
     });
   }
 
-  // 14-day rotation, not the default daily one: checkLimit() below both
-  // checks AND writes the KV ban list (6h TTL) keyed by this value — a
-  // daily-rotating token can change value mid-ban across a UTC-midnight
-  // boundary, letting an active ban lapse hours early. See ip-token.js.
-  // (The create/enter/send window itself is short enough that this
-  // wouldn't matter on its own, but it shares the same `ip` value as the
-  // ban check/write in checkLimit(), so it has to use the same token.)
-  const ip = await ipToken(request, env, 14);
+  const ip = await ipToken(request, env);
 
   // Use env vars for limits if set, fall back to defaults
   const limit = {
