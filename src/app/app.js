@@ -226,6 +226,8 @@ Object.defineProperty(window, 'db', {
 });
 let _unsubMsgs     = null;
 let _unsubMembers  = null;
+let _presenceSnap  = null;
+let _presenceTimer = null;
 let _unsubTyping   = null;
 let _heartbeat     = null;
 let _typingTimer   = null;
@@ -2176,7 +2178,7 @@ async function openMemberDetail(uid, m) {
   roleEl.classList.toggle('is-admin', m.role === 'admin');
 
   const statusEl = $('md-status');
-  const online = m.online === true;
+  const online = _isLiveMember(m, uid, state.me?.id, Date.now());
   statusEl.textContent = online ? '● Online' : 'Offline';
   statusEl.className = 'md-row-value ' + (online ? 'status-online' : 'status-offline');
 
@@ -2441,7 +2443,7 @@ function _isPurger() {
   if (!me || !_lastMembersSnap) return true;
   let min = null;
   _lastMembersSnap.docs.forEach(d => {
-    if (d.data()?.online && (min === null || d.id < min)) min = d.id;
+    if (_isLiveMember(d.data(), d.id, me, Date.now()) && (min === null || d.id < min)) min = d.id;
   });
   return min === null || min === me;
 }
@@ -2958,6 +2960,43 @@ function _updateLoadEarlierBtn() {
   btn.textContent = '↑ Load earlier messages';
 }
 
+/* PRESENCE-BEGIN */
+function _hbMillis(md) {
+  const ls = md && md.lastSeen;
+  return ls && ls.toMillis ? ls.toMillis() : (Number(ls) || 0);
+}
+
+function _isLiveMember(md, id, myId, now) {
+  if (!md || md.online !== true) return false;
+  if (id === myId) return true;
+  return _hbMillis(md) > now - CONFIG.PRESENCE_STALE_MS;
+}
+
+function _liveDocs(snap, myId, now) {
+  return snap.docs.filter(d => _isLiveMember(d.data(), d.id, myId, now));
+}
+
+function _liveSnap(snap, docs) {
+  return { docs, size: docs.length, forEach: fn => docs.forEach(fn), docChanges: () => snap.docChanges() };
+}
+/* PRESENCE-END */
+
+async function _liveOthersCount(code, myId) {
+  const snap = await db.collection('rooms').doc(code).collection('members').where('online', '==', true).get({ source: 'server' });
+  const now = Date.now();
+  return snap.docs.filter(d => d.id !== myId && _isLiveMember(d.data(), d.id, myId, now)).length;
+}
+
+async function _presenceTick() {
+  if (!_presenceSnap || !state.me || !state.roomCode) return;
+  const live = _liveDocs(_presenceSnap, state.me.id, Date.now());
+  if (live.length === _onlineCount) return;
+  _onlineCount = live.length;
+  updateOnlineUI();
+  renderMembers(_liveSnap(_presenceSnap, live));
+  if (_presenceSettled && live.length === 0) await _handleRoomBecameEmpty(state.roomCode);
+}
+
 function startPresenceListener() {
   const code = state.roomCode;
   // Matches the equivalent teardown at line ~3280 (stopChatListeners): a
@@ -2967,10 +3006,15 @@ function startPresenceListener() {
   // the rest of that session (an undercount, not a double-listen risk).
   if (_unsubMembers) { try { _unsubMembers(); } catch {} }
 
+  clearInterval(_presenceTimer);
+  _presenceTimer = setInterval(() => { _presenceTick().catch(() => {}); }, 60000);
+
   _unsubMembers = db.collection('rooms').doc(code)
     .collection('members').where('online', '==', true)
     .onSnapshot(async snap => {
-      _onlineCount = snap.size;
+      _presenceSnap = snap;
+      const _liveNow = _liveDocs(snap, state.me?.id, Date.now());
+      _onlineCount = _liveNow.length;
 
       // Notify admin of new pending users
       if (_canManage()) {
@@ -3016,7 +3060,7 @@ function startPresenceListener() {
 
       updateOnlineUI();   // updateOnlineUI also called inside renderMembers with correct approved count
       _lastMembersSnap = snap;
-      renderMembers(snap);
+      renderMembers(_liveSnap(snap, _liveNow));
 
       // Wipe empty room when last member leaves.
       // _presenceSettled guards against the very first snapshot firing before
@@ -3024,15 +3068,8 @@ function startPresenceListener() {
       // restore sees count=0 and wipes a perfectly healthy room.
       // Only wipe if NO approved members exist at all (not just online ones)
       // so offline-but-approved members don't lose their room.
-      // Count truly-online members: online:true AND heartbeat within 90s
-      const _staleMs = Date.now() - CONFIG.PRESENCE_STALE_MS;
-      let _realOnlineCount = 0;
-      snap.docs.forEach(d => {
-        const md = d.data();
-        if (!md.online) return;
-        const hb = md.lastSeen?.toMillis ? md.lastSeen.toMillis() : (md.lastSeen || 0);
-        if (d.id === state.me?.id || hb > _staleMs) _realOnlineCount++;
-      });
+      // Truly-online members: online:true AND a recent heartbeat (CONFIG.PRESENCE_STALE_MS)
+      const _realOnlineCount = _liveNow.length;
 
       if (_presenceSettled && _realOnlineCount === 0 && state.me) {
         await _handleRoomBecameEmpty(code);
@@ -3321,6 +3358,7 @@ function stopListeners() {
   _clearPurgeTimers();
   stopChatListeners();
   if (_unsubMembers) { try { _unsubMembers(); } catch {} _unsubMembers = null; }
+  clearInterval(_presenceTimer); _presenceTimer = null; _presenceSnap = null;
   if (_unsubRoom)    { try { _unsubRoom();    } catch {} _unsubRoom    = null; }
 }
 
@@ -3728,6 +3766,10 @@ function _enterSelectMode() {
       </button>
       <span class="msa-count" id="msa-count">0 selected</span>
       <div style="flex:1"></div>
+      <button class="msa-btn msa-info" id="msa-info" title="Message info" style="display:none">
+        <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>Info</span>
+      </button>
       <button class="msa-btn msa-del-me" id="msa-del-me" title="Delete for me" style="display:none">
         <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><path d="M5 6h10M8 6V4h4v2M7 6l.6 9h4.8L13 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Me</span>
@@ -3740,6 +3782,7 @@ function _enterSelectMode() {
     const header = document.getElementById('chat-header');
     if (header) header.parentNode.insertBefore(bar, header);
     document.getElementById('msa-cancel').addEventListener('click', _exitSelectMode);
+    document.getElementById('msa-info').addEventListener('click', _infoSelected);
     document.getElementById('msa-del-me').addEventListener('click', () => _deleteSelected(false));
     document.getElementById('msa-del-all').addEventListener('click', () => _deleteSelected(true));
   }
@@ -3770,6 +3813,15 @@ function _updateSelectBar() {
     const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
     return _isAdmin || w?.classList.contains('sent');
   });
+  const infoBtn = document.getElementById('msa-info');
+  if (infoBtn) {
+    let showInfo = false;
+    if (count === 1) {
+      const iw = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape([..._selectedIds][0])}"]`);
+      showInfo = !!iw && !iw.classList.contains('deleted') && !String(iw.dataset.docId).startsWith('local_');
+    }
+    infoBtn.style.display = showInfo ? '' : 'none';
+  }
   const delMe  = document.getElementById('msa-del-me');
   const delAll = document.getElementById('msa-del-all');
   if (delMe)  delMe.style.display  = count ? '' : 'none';
@@ -3869,26 +3921,6 @@ async function _showMsgInfo(docId) {
     ['SENT', sentMs ? new Date(sentMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : 'Unknown'],
     ['STATUS', readerIds.length ? `Read by ${readerIds.length}` : 'Delivered'],
   ];
-  if (data.edited && data.editedAt) {
-    const editedMs = _createdMs({ createdAt: data.editedAt }) || 0;
-    rows.push(['EDITED', editedMs ? new Date(editedMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : 'Yes']);
-  }
-  if (data.replyTo && data.replyTo.senderName) {
-    rows.push(['REPLYING TO', data.replyTo.senderName]);
-  }
-  if (data.fileName) rows.push(['FILE NAME', data.fileName]);
-  if (typeof data.fileSize === 'number' && data.fileSize > 0) {
-    const kb = data.fileSize / 1024;
-    rows.push(['FILE SIZE', kb < 1024 ? `${kb.toFixed(1)} KB` : `${(kb / 1024).toFixed(1)} MB`]);
-  }
-  if (data.mime) rows.push(['FILE TYPE', data.mime]);
-  if (data.reactions && Object.keys(data.reactions).length) {
-    const summary = Object.entries(data.reactions)
-      .map(([emoji, users]) => `${emoji} ${Object.keys(users || {}).length}`)
-      .join('  ');
-    if (summary) rows.push(['REACTIONS', summary]);
-  }
-  rows.push(['MESSAGE ID', docId]);
   $('mi-rows').innerHTML = rows.map(([k, v]) =>
     `<div class="md-row"><span class="md-row-label">${k}</span><span class="md-row-value">${esc(String(v))}</span></div>`
   ).join('');
@@ -3914,6 +3946,13 @@ async function _showMsgInfo(docId) {
     }
   }
   overlay.style.display = 'flex';
+}
+
+function _infoSelected() {
+  if (_selectedIds.size !== 1) return;
+  const docId = [..._selectedIds][0];
+  _exitSelectMode();
+  _showMsgInfo(docId);
 }
 
 async function _deleteSelected(forEveryone) {
@@ -5462,19 +5501,6 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     }
   }
 
-  const _detailsId = currentId();
-  if (!wrap.classList.contains('deleted') && !String(_detailsId).startsWith('local_')) {
-    const detailsBtn = document.createElement('button');
-    detailsBtn.className = 'strip-action';
-    detailsBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" width="15" height="15"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Details</span>`;
-    detailsBtn.addEventListener('click', e => {
-      e.stopPropagation();
-      strip.remove();
-      _showMsgInfo(_detailsId);
-    });
-    actRow.appendChild(detailsBtn);
-  }
-
   strip.appendChild(actRow);
 
   // "Delete for me" is always available (local-only, no confirm needed —
@@ -6122,8 +6148,9 @@ async function _handoffAdminRole(roomCodeOverride, meOverride) {
     let nextUid = null, nextName = null;
 
     // First try online members
+    const _handoffNow = Date.now();
     snap.forEach(doc => {
-      if (doc.id !== _me.id && doc.data().role !== 'admin' && !nextUid) {
+      if (doc.id !== _me.id && doc.data().role !== 'admin' && !nextUid && _isLiveMember(doc.data(), doc.id, _me.id, _handoffNow)) {
         nextUid  = doc.id;
         nextName = doc.data().name;
       }
@@ -6249,7 +6276,10 @@ async function handleLogout() {
       // rejoinable indefinitely. Calling it explicitly from the leaving
       // client closes that gap regardless of whether anyone else happens
       // to be watching.
-      if (_leavingEmptiesRoom) {
+      let _emptiesNow = _leavingEmptiesRoom;
+      try { _emptiesNow = (await _liveOthersCount(_leavingRoomCode, _leavingMe.id)) === 0; }
+      catch (e) { _log('warn', '[MIUT] Fresh presence check failed, using cached count:', e); }
+      if (_emptiesNow) {
         try { await _handleRoomBecameEmpty(_leavingRoomCode); }
         catch (e) { _log('warn', '[MIUT] Empty-room expiry check failed:', e); }
       }

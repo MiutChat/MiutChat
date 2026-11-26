@@ -341,6 +341,61 @@ export async function sweepExpiredMessages(client, budget, cursor = 0) {
   return { processed, deleted, more, nextCursor: more ? cursor + processed : 0 };
 }
 
+export const ABANDONED_GRACE_MS = 30 * 60 * 1000;
+const DEFAULT_ROOM_TTL_MS = 300000;
+
+export function abandonedVerdict(room, freshestSeenMs, now = Date.now()) {
+  const ttlField = room && room.inactivityTtlMs;
+  const ttlMs = ttlField ? fieldMillis(ttlField) : DEFAULT_ROOM_TTL_MS;
+  if (ttlMs < 0) return 'keep';
+  if (fieldMillis(room && room.autoDeleteAt)) return 'keep';
+  const last = Math.max(freshestSeenMs || 0, fieldMillis(room && room.lastActivity), fieldMillis(room && room.createdAt));
+  if (!last) return 'keep';
+  return now - last > ttlMs + ABANDONED_GRACE_MS ? 'wipe' : 'keep';
+}
+
+/**
+ * Wipes rooms that were abandoned without anyone leaving cleanly (phone died, browser killed),
+ * judged by the freshest member heartbeat and never by the stuck `online` flag.
+ * `cursor` is an offset into the name-ordered room list; rooms that get wiped do not advance it.
+ */
+export async function sweepAbandonedRooms(client, budget, cursor = 0) {
+  const ROOMS_PER_PAGE = 6;
+  let processed = 0, wiped = 0, more = false;
+  try {
+    const rooms = await client.runQuery('', {
+      from: [{ collectionId: 'rooms' }],
+      orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+      select: { fields: ['inactivityTtlMs', 'autoDeleteAt', 'lastActivity', 'createdAt'].map(fieldPath => ({ fieldPath })) },
+      offset: cursor,
+      limit: ROOMS_PER_PAGE,
+    });
+    for (const r of rooms) {
+      const room = r.document.fields || {};
+      const code = roomIdFromName(r.document.name);
+      const ttl = room.inactivityTtlMs ? fieldMillis(room.inactivityTtlMs) : DEFAULT_ROOM_TTL_MS;
+      let verdict = 'keep';
+      if (ttl >= 0 && !fieldMillis(room.autoDeleteAt)) {
+        const top = await client.runQuery(`rooms/${encodeURIComponent(code)}`, {
+          from: [{ collectionId: 'members' }],
+          orderBy: [{ field: { fieldPath: 'lastSeen' }, direction: 'DESCENDING' }],
+          select: { fields: [{ fieldPath: 'lastSeen' }] },
+          limit: 1,
+        });
+        const freshest = top.length ? fieldMillis(top[0].document.fields && top[0].document.fields.lastSeen) : 0;
+        verdict = abandonedVerdict(room, freshest);
+      }
+      if (verdict === 'wipe') { await wipeRoom(client, code); wiped++; }
+      processed++;
+    }
+    more = rooms.length === ROOMS_PER_PAGE;
+  } catch (e) {
+    if (!(e instanceof BudgetExceeded)) throw e;
+    more = true;
+  }
+  return { processed, wiped, more, nextCursor: more ? cursor + processed - wiped : 0 };
+}
+
 /**
  * One resumable pass over all admin-enabled shards.
  *
@@ -364,9 +419,12 @@ export async function runAdminCleanup(shards, { cursors = {}, totalBudget = 44, 
       const msgs = await sweepExpiredMessages(client, budget, Number(cursors[shard.name]) || 0);
       r.messagesDeleted = msgs.deleted;
       out.cursors[shard.name] = msgs.nextCursor;
-      if (rooms.more || msgs.more) out.more = true;
+      const ab = await sweepAbandonedRooms(client, budget, Number(cursors[shard.name + '#abandoned']) || 0);
+      r.abandonedWiped = ab.wiped;
+      out.cursors[shard.name + '#abandoned'] = ab.nextCursor;
+      if (rooms.more || msgs.more || ab.more) out.more = true;
     } catch (e) {
-      if (e instanceof BudgetExceeded) { out.more = true; out.cursors[shard.name] = Number(cursors[shard.name]) || 0; r.deferred = true; }
+      if (e instanceof BudgetExceeded) { out.more = true; out.cursors[shard.name] = Number(cursors[shard.name]) || 0; out.cursors[shard.name + '#abandoned'] = Number(cursors[shard.name + '#abandoned']) || 0; r.deferred = true; }
       else r.error = String(e && e.message || e);
     }
     remaining -= (slice - budget.left);

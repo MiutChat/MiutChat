@@ -302,3 +302,135 @@ test('no ad scripts or ad files remain anywhere', () => {
   assert.ok(!fs.existsSync(path.join(root, 'public', 'ads.txt')));
   assert.ok(!fs.readFileSync(path.join(root, 'scripts', 'build.js'), 'utf8').includes('ads.txt'));
 });
+
+
+function loadPresence() {
+  const src = fs.readFileSync(path.join(root, 'src', 'app', 'app.js'), 'utf8');
+  const a = src.indexOf('/* PRESENCE-BEGIN */');
+  const b = src.indexOf('/* PRESENCE-END */');
+  assert.ok(a > 0 && b > a);
+  return new Function('CONFIG', src.slice(a, b) + '\nreturn { _isLiveMember, _liveDocs, _liveSnap, _hbMillis };')({ PRESENCE_STALE_MS: 300000 });
+}
+
+const doc = (id, data) => ({ id, data: () => data });
+
+test('a member with a stuck online flag but an old heartbeat does not count as online', () => {
+  const { _isLiveMember, _liveDocs, _liveSnap } = loadPresence();
+  const now = Date.now();
+  const ts = ms => ({ toMillis: () => ms });
+  assert.strictEqual(_isLiveMember({ online: true, lastSeen: ts(now - 60000) }, 'a', 'me', now), true);
+  assert.strictEqual(_isLiveMember({ online: true, lastSeen: ts(now - 3600000) }, 'a', 'me', now), false);
+  assert.strictEqual(_isLiveMember({ online: true, lastSeen: now - 1000 }, 'a', 'me', now), true);
+  assert.strictEqual(_isLiveMember({ online: true }, 'a', 'me', now), false);
+  assert.strictEqual(_isLiveMember({ online: false, lastSeen: ts(now) }, 'a', 'me', now), false);
+  assert.strictEqual(_isLiveMember({ online: true, lastSeen: ts(now - 9999999) }, 'me', 'me', now), true);
+  const snap = { docs: [doc('me', { online: true }), doc('dead', { online: true, lastSeen: ts(now - 7200000) }), doc('live', { online: true, lastSeen: ts(now - 1000) })], docChanges: () => [] };
+  const live = _liveDocs(snap, 'me', now);
+  assert.deepStrictEqual(live.map(d => d.id), ['me', 'live']);
+  const wrapped = _liveSnap(snap, live);
+  const seen = [];
+  wrapped.forEach(d => seen.push(d.id));
+  assert.deepStrictEqual(seen, ['me', 'live']);
+  assert.strictEqual(wrapped.size, 2);
+});
+
+test('leaving checks fresh presence instead of the cached online count', () => {
+  const src = fs.readFileSync(path.join(root, 'src', 'app', 'app.js'), 'utf8');
+  assert.ok(src.includes('_liveOthersCount(_leavingRoomCode, _leavingMe.id)'));
+  assert.ok(src.includes('const _realOnlineCount = _liveNow.length;'));
+  assert.ok(!/_onlineCount = snap\.size/.test(src));
+  assert.ok(src.includes('_presenceTimer = setInterval'));
+});
+
+let admin;
+test.before(async () => {
+  const out = esbuild.buildSync({
+    entryPoints: [path.join(root, 'functions', '_lib', 'firebase-admin.js')],
+    bundle: true, format: 'esm', write: false, platform: 'node', target: 'es2020'
+  });
+  const f = path.join(os.tmpdir(), 'miut-admin-' + process.pid + '.mjs');
+  fs.writeFileSync(f, out.outputFiles[0].text);
+  admin = await import('file://' + f);
+});
+
+const iso = ms => ({ timestampValue: new Date(ms).toISOString() });
+const NAME = c => 'projects/p/databases/(default)/documents/rooms/' + encodeURIComponent(c);
+
+function fakeStore(rooms) {
+  const store = new Map(Object.entries(rooms).map(([code, r]) => [code, {
+    fields: r.fields,
+    subs: { members: (r.members || []).map((m, i) => ({ name: NAME(code) + '/members/m' + i, fields: m })), messages: [{ name: NAME(code) + '/messages/x', fields: {} }], typing: [] }
+  }]));
+  return {
+    store,
+    async runQuery(parent, q) {
+      const sub = q.from[0].collectionId;
+      if (!parent) {
+        const codes = [...store.keys()].sort().slice(q.offset || 0, (q.offset || 0) + q.limit);
+        return codes.map(c => ({ document: { name: NAME(c), fields: store.get(c).fields } }));
+      }
+      const code = decodeURIComponent(parent.split('/')[1]);
+      const room = store.get(code);
+      let rows = room ? room.subs[sub].slice() : [];
+      if (q.orderBy && q.orderBy[0].field.fieldPath === 'lastSeen') {
+        rows = rows.filter(r => r.fields.lastSeen).sort((a, b) => Date.parse(b.fields.lastSeen.timestampValue) - Date.parse(a.fields.lastSeen.timestampValue));
+      }
+      return rows.slice(0, q.limit || 300).map(r => ({ document: r }));
+    },
+    async batchDelete(names) {
+      for (const n of names) {
+        const code = decodeURIComponent(n.split('/rooms/')[1].split('/')[0]);
+        const room = store.get(code);
+        if (!room) continue;
+        for (const k of Object.keys(room.subs)) room.subs[k] = room.subs[k].filter(r => r.name !== n);
+      }
+    },
+    async deleteDoc(pathStr) { store.delete(decodeURIComponent(pathStr.split('/')[1])); }
+  };
+}
+
+test('abandoned rooms are wiped by heartbeat age, never by the stuck online flag', async () => {
+  const now = Date.now();
+  const H = 3600000;
+  const rooms = {
+    'a-never': { fields: { inactivityTtlMs: { integerValue: '-1' }, createdAt: iso(now - 240 * H) }, members: [{ online: { booleanValue: true }, lastSeen: iso(now - 200 * H) }] },
+    'b-recent': { fields: { inactivityTtlMs: { integerValue: '300000' }, createdAt: iso(now - 5 * H) }, members: [{ online: { booleanValue: true }, lastSeen: iso(now - 600000) }] },
+    'c-stuck-flag': { fields: { inactivityTtlMs: { integerValue: '300000' }, createdAt: iso(now - 30 * H) }, members: [{ online: { booleanValue: true }, lastSeen: iso(now - 2 * H) }, { online: { booleanValue: false }, lastSeen: iso(now - 5 * H) }] },
+    'd-instant': { fields: { inactivityTtlMs: { integerValue: '0' }, createdAt: iso(now - 10 * H) }, members: [{ online: { booleanValue: true }, lastSeen: iso(now - 40 * 60000) }] },
+    'e-scheduled': { fields: { inactivityTtlMs: { integerValue: '300000' }, autoDeleteAt: iso(now + H), createdAt: iso(now - 30 * H) }, members: [{ online: { booleanValue: true }, lastSeen: iso(now - 20 * H) }] },
+    'f-empty-old': { fields: { inactivityTtlMs: { integerValue: '300000' }, createdAt: iso(now - 3 * H) }, members: [] },
+  };
+  const client = fakeStore(rooms);
+  const res = await admin.sweepAbandonedRooms(client, new admin.Budget(200), 0);
+  assert.deepStrictEqual([...client.store.keys()].sort(), ['a-never', 'b-recent', 'e-scheduled']);
+  assert.strictEqual(res.wiped, 3);
+  assert.strictEqual(res.more, true);
+  assert.strictEqual(res.nextCursor, res.processed - res.wiped);
+});
+
+test('abandoned sweep resumes from its cursor, respects the budget and wraps around', async () => {
+  const now = Date.now();
+  const fresh = { fields: { inactivityTtlMs: { integerValue: '300000' }, createdAt: iso(now - 60000) }, members: [{ online: { booleanValue: true }, lastSeen: iso(now - 30000) }] };
+  const many = Object.fromEntries(Array.from({ length: 8 }, (_, i) => ['room-' + i, fresh]));
+  const client = fakeStore(many);
+  const first = await admin.sweepAbandonedRooms(client, new admin.Budget(200), 0);
+  assert.strictEqual(first.wiped, 0);
+  assert.strictEqual(first.nextCursor, 6);
+  const second = await admin.sweepAbandonedRooms(client, new admin.Budget(200), first.nextCursor);
+  assert.strictEqual(second.processed, 2);
+  assert.strictEqual(second.more, false);
+  assert.strictEqual(second.nextCursor, 0);
+  const starved = await admin.sweepAbandonedRooms(client, new admin.Budget(0), 0).catch(e => e);
+  assert.ok(starved instanceof Error || starved.more === true);
+});
+
+test('abandonedVerdict covers the edge cases', () => {
+  const now = Date.now();
+  const H = 3600000;
+  assert.strictEqual(admin.abandonedVerdict({ inactivityTtlMs: { integerValue: '-1' } }, now - 99 * H, now), 'keep');
+  assert.strictEqual(admin.abandonedVerdict({}, now - 5 * H, now), 'wipe');
+  assert.strictEqual(admin.abandonedVerdict({ createdAt: iso(now - 20 * 60000) }, 0, now), 'keep');
+  assert.strictEqual(admin.abandonedVerdict({ inactivityTtlMs: { integerValue: '86400000' }, createdAt: iso(now - 10 * H) }, now - 10 * H, now), 'keep');
+  assert.strictEqual(admin.abandonedVerdict({ inactivityTtlMs: { integerValue: '86400000' }, createdAt: iso(now - 30 * H) }, now - 30 * H, now), 'wipe');
+  assert.strictEqual(admin.abandonedVerdict({ autoDeleteAt: iso(now + H), createdAt: iso(now - 99 * H) }, 0, now), 'keep');
+});

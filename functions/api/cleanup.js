@@ -218,13 +218,21 @@ async function runCleanup(env, opts = {}) {
 
   // Independent per shard — one project having a bad day (auth hiccup,
   // query failure) never blocks cleanup on the others.
-  const adminResult = admin.length ? await runAdminCleanup(admin, { cursors: opts.cursors }) : null;
+  const kv = env && env.MIUT_RL;
+  let cursors = opts.cursors;
+  if (!cursors && kv) {
+    try { cursors = JSON.parse((await kv.get('cl:cursors')) || '{}'); } catch { cursors = {}; }
+  }
+  const adminResult = admin.length ? await runAdminCleanup(admin, { cursors }) : null;
+  if (adminResult && kv && !opts.cursors) {
+    try { await kv.put('cl:cursors', JSON.stringify(adminResult.cursors), { expirationTtl: 172800 }); } catch {}
+  }
 
   const results = await Promise.all(legacy.map(cleanupShard));
 
   // Count what the server actually removed (anonymous totals — see analytics-store.js).
   if (adminResult) {
-    const rooms = adminResult.shards.reduce((a, r) => a + (r.roomsWiped || 0), 0);
+    const rooms = adminResult.shards.reduce((a, r) => a + (r.roomsWiped || 0) + (r.abandonedWiped || 0), 0);
     const msgs  = adminResult.shards.reduce((a, r) => a + (r.messagesDeleted || 0), 0);
     const items = [];
     if (rooms) items.push({ event: 'rooms_wiped', n: rooms });

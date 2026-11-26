@@ -55,7 +55,13 @@ export async function onRequest(context) {
   const key = `rc:${roomId}:${docId}`;
   const rec = await readJson(kv, key, { u: [], i: [] });
   const uh = await short('u|' + reporter);
-  const ih = await ipToken(request, env);
+  // 14-day rotation, not the default daily one: this record's TTL is 7 days
+  // (TTL_SEC above), and a daily-rotating token would make the SAME reporter
+  // look like a new, distinct IP every time the UTC day rolls over during
+  // that window — artificially inflating the unique-IP count this dedup
+  // check exists to measure, and making the auto-hide threshold easier to
+  // trigger than intended. See ip-token.js's ipToken() doc.
+  const ih = await ipToken(request, env, 14);
   if (!rec.u.includes(uh) && rec.u.length < MAX_ENTRIES) rec.u.push(uh);
   if (!rec.i.includes(ih) && rec.i.length < MAX_ENTRIES) rec.i.push(ih);
   if (SENSITIVE.has(category)) rec.s = true;

@@ -21,7 +21,11 @@ import { ipToken } from '../_lib/ip-token.js';
 export async function onRequest(context) {
   const { request, env } = context;
 
-  const ip      = await ipToken(request, env);
+  // 14-day rotation, not the default daily one: this token is the KV ban-list
+  // key below (6h TTL) — a daily-rotating token can silently change value
+  // mid-ban across a UTC-midnight boundary, letting the ban lapse hours
+  // early for no reason other than bad luck on timing. See ip-token.js.
+  const ip      = await ipToken(request, env, 14);
   const path    = new URL(request.url).pathname;
   const ua      = '';
   const country = request.cf?.country || 'unknown';

@@ -169,7 +169,11 @@ export async function onRequestPost(context) {
   const action = body?.action;
 
   if (action === 'strike' || action === 'strike-status') {
-    const token = await ipToken(request, env);
+    // 14-day rotation: cooldowns here top out at 30 minutes, but using the
+    // same long-lived token as the ban check below keeps one caller
+    // recognized consistently across every anti-abuse mechanism in this
+    // file, not just the short ones. See ip-token.js's ipToken() doc.
+    const token = await ipToken(request, env, 14);
     const out = await safetyStrike(env, token, action === 'strike');
     return new Response(JSON.stringify(out), {
       status: 200,
@@ -184,7 +188,14 @@ export async function onRequestPost(context) {
     });
   }
 
-  const ip = await ipToken(request, env);
+  // 14-day rotation, not the default daily one: checkLimit() below both
+  // checks AND writes the KV ban list (6h TTL) keyed by this value — a
+  // daily-rotating token can change value mid-ban across a UTC-midnight
+  // boundary, letting an active ban lapse hours early. See ip-token.js.
+  // (The create/enter/send window itself is short enough that this
+  // wouldn't matter on its own, but it shares the same `ip` value as the
+  // ban check/write in checkLimit(), so it has to use the same token.)
+  const ip = await ipToken(request, env, 14);
 
   // Use env vars for limits if set, fall back to defaults
   const limit = {
