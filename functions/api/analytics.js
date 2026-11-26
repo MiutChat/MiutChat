@@ -59,8 +59,6 @@ export async function onRequest(ctx) {
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
 
-  if (request.method === 'POST' && !url.searchParams.get('action')) return new Response('ok', { status: 200, headers: JSON_HDR });
-
   // ── GET — read stats (admin only) ─────────────────────────────────────────
   if (request.method === 'GET') {
     if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401);
