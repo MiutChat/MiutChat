@@ -226,8 +226,6 @@ Object.defineProperty(window, 'db', {
 });
 let _unsubMsgs     = null;
 let _unsubMembers  = null;
-let _presenceSnap  = null;
-let _presenceTimer = null;
 let _unsubTyping   = null;
 let _heartbeat     = null;
 let _typingTimer   = null;
@@ -1510,6 +1508,24 @@ async function handleCreate() {
     let [uid, allowed] = await Promise.all([getUID(_dbName), rateLimitCheck]);
     if (!allowed) { setLoading(btn, false); return; }
 
+    // Client-side preview of the firestore.rules room-creation cooldown (see
+    // quota/{uid} in config/firestore.rules) — checked here purely so the
+    // person sees a friendly countdown instead of a generic "Access denied"
+    // from a doomed write. The rule itself is what actually enforces this;
+    // if this read fails or is skipped for any reason, the write below still
+    // gets rejected server-side exactly the same, just with a worse message.
+    try {
+      const _quotaSnap = await db.collection('quota').doc(uid).get();
+      const _lastMs = _quotaSnap.exists ? (_quotaSnap.data()?.lastRoomCreatedAt?.toMillis?.() || 0) : 0;
+      const _remainingMs = 60000 - (Date.now() - _lastMs);
+      if (_remainingMs > 0) {
+        const _secs = Math.ceil(_remainingMs / 1000);
+        showError(`You're creating rooms quickly — try again in ${Math.floor(_secs / 60)}:${String(_secs % 60).padStart(2, '0')}`);
+        setLoading(btn, false);
+        return;
+      }
+    } catch { /* best-effort — fall through to the real, rule-enforced attempt */ }
+
     if (!placement.isNew) {
       const existing = window.takeProbeSnap?.(code) || await db.collection('rooms').doc(code).get();
       if (existing.exists || (placement.viaRegistry && await window.findRoomAcrossShards?.(code))) {
@@ -2178,7 +2194,7 @@ async function openMemberDetail(uid, m) {
   roleEl.classList.toggle('is-admin', m.role === 'admin');
 
   const statusEl = $('md-status');
-  const online = _isLiveMember(m, uid, state.me?.id, Date.now());
+  const online = _isTrulyOnline(uid, m);
   statusEl.textContent = online ? '● Online' : 'Offline';
   statusEl.className = 'md-row-value ' + (online ? 'status-online' : 'status-offline');
 
@@ -2224,6 +2240,15 @@ async function openMemberDetail(uid, m) {
     }
     const fp = await _pubKeyFingerprint(pub);
     fpEl.textContent = fp || 'Not available yet — they may not have sent a signed message';
+    const verifyBox = $('md-key-verify'), qrImg = $('md-fingerprint-qr');
+    if (verifyBox && qrImg) {
+      if (fp) {
+        qrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&color=091413&bgcolor=ffffff&data=${encodeURIComponent(fp)}`;
+        verifyBox.style.display = '';
+      } else {
+        verifyBox.style.display = 'none';
+      }
+    }
   })();
 
   // Actions — admin viewers only, never shown for your own row
@@ -2443,7 +2468,7 @@ function _isPurger() {
   if (!me || !_lastMembersSnap) return true;
   let min = null;
   _lastMembersSnap.docs.forEach(d => {
-    if (_isLiveMember(d.data(), d.id, me, Date.now()) && (min === null || d.id < min)) min = d.id;
+    if (d.data()?.online && (min === null || d.id < min)) min = d.id;
   });
   return min === null || min === me;
 }
@@ -2960,41 +2985,18 @@ function _updateLoadEarlierBtn() {
   btn.textContent = '↑ Load earlier messages';
 }
 
-/* PRESENCE-BEGIN */
-function _hbMillis(md) {
-  const ls = md && md.lastSeen;
-  return ls && ls.toMillis ? ls.toMillis() : (Number(ls) || 0);
-}
-
-function _isLiveMember(md, id, myId, now) {
-  if (!md || md.online !== true) return false;
-  if (id === myId) return true;
-  return _hbMillis(md) > now - CONFIG.PRESENCE_STALE_MS;
-}
-
-function _liveDocs(snap, myId, now) {
-  return snap.docs.filter(d => _isLiveMember(d.data(), d.id, myId, now));
-}
-
-function _liveSnap(snap, docs) {
-  return { docs, size: docs.length, forEach: fn => docs.forEach(fn), docChanges: () => snap.docChanges() };
-}
-/* PRESENCE-END */
-
-async function _liveOthersCount(code, myId) {
-  const snap = await db.collection('rooms').doc(code).collection('members').where('online', '==', true).get({ source: 'server' });
-  const now = Date.now();
-  return snap.docs.filter(d => d.id !== myId && _isLiveMember(d.data(), d.id, myId, now)).length;
-}
-
-async function _presenceTick() {
-  if (!_presenceSnap || !state.me || !state.roomCode) return;
-  const live = _liveDocs(_presenceSnap, state.me.id, Date.now());
-  if (live.length === _onlineCount) return;
-  _onlineCount = live.length;
-  updateOnlineUI();
-  renderMembers(_liveSnap(_presenceSnap, live));
-  if (_presenceSettled && live.length === 0) await _handleRoomBecameEmpty(state.roomCode);
+// A member's raw `online` flag can get stuck `true` after a real tab/browser
+// close — beforeunload's write is a plain async Firestore call with no
+// delivery guarantee on page teardown, so it very often never lands. Every
+// UI surface that shows presence must treat `online` as a claim that needs
+// corroborating with a recent heartbeat (`lastSeen`), not as ground truth on
+// its own — otherwise a member who closed their browser can show "online"
+// indefinitely to everyone else in the room.
+function _isTrulyOnline(uid, m) {
+  if (!m || m.online !== true) return false;
+  if (uid === state.me?.id) return true; // our own tab always knows its real state
+  const hb = m.lastSeen?.toMillis ? m.lastSeen.toMillis() : (m.lastSeen || 0);
+  return hb > Date.now() - CONFIG.PRESENCE_STALE_MS;
 }
 
 function startPresenceListener() {
@@ -3006,15 +3008,10 @@ function startPresenceListener() {
   // the rest of that session (an undercount, not a double-listen risk).
   if (_unsubMembers) { try { _unsubMembers(); } catch {} }
 
-  clearInterval(_presenceTimer);
-  _presenceTimer = setInterval(() => { _presenceTick().catch(() => {}); }, 60000);
-
   _unsubMembers = db.collection('rooms').doc(code)
     .collection('members').where('online', '==', true)
     .onSnapshot(async snap => {
-      _presenceSnap = snap;
-      const _liveNow = _liveDocs(snap, state.me?.id, Date.now());
-      _onlineCount = _liveNow.length;
+      _onlineCount = snap.size;
 
       // Notify admin of new pending users
       if (_canManage()) {
@@ -3060,7 +3057,7 @@ function startPresenceListener() {
 
       updateOnlineUI();   // updateOnlineUI also called inside renderMembers with correct approved count
       _lastMembersSnap = snap;
-      renderMembers(_liveSnap(snap, _liveNow));
+      renderMembers(snap);
 
       // Wipe empty room when last member leaves.
       // _presenceSettled guards against the very first snapshot firing before
@@ -3068,8 +3065,9 @@ function startPresenceListener() {
       // restore sees count=0 and wipes a perfectly healthy room.
       // Only wipe if NO approved members exist at all (not just online ones)
       // so offline-but-approved members don't lose their room.
-      // Truly-online members: online:true AND a recent heartbeat (CONFIG.PRESENCE_STALE_MS)
-      const _realOnlineCount = _liveNow.length;
+      // Count truly-online members: online:true AND heartbeat not stale
+      let _realOnlineCount = 0;
+      snap.docs.forEach(d => { if (_isTrulyOnline(d.id, d.data())) _realOnlineCount++; });
 
       if (_presenceSettled && _realOnlineCount === 0 && state.me) {
         await _handleRoomBecameEmpty(code);
@@ -3358,7 +3356,6 @@ function stopListeners() {
   _clearPurgeTimers();
   stopChatListeners();
   if (_unsubMembers) { try { _unsubMembers(); } catch {} _unsubMembers = null; }
-  clearInterval(_presenceTimer); _presenceTimer = null; _presenceSnap = null;
   if (_unsubRoom)    { try { _unsubRoom();    } catch {} _unsubRoom    = null; }
 }
 
@@ -3401,27 +3398,28 @@ function renderMembers(snap) {
   });
 
   // ── Approved members ───────────────────────────
-  const approvedCount = approved.filter(m => m.uid !== state.me?.id || true).length;
+  const onlineCount = approved.filter(m => _isTrulyOnline(m.uid, m)).length;
   const oc = $('online-count'), ms = $('member-status-text');
-  if (oc) oc.textContent = approvedCount <= 1 ? '' : approvedCount;
-  if (ms) ms.textContent = approvedCount <= 1 ? 'Only you are online' : `${approvedCount} members online`;
+  if (oc) oc.textContent = onlineCount <= 1 ? '' : onlineCount;
+  if (ms) ms.textContent = onlineCount <= 1 ? 'Only you are online' : `${onlineCount} members online`;
 
   approved.forEach(m => {
     const isMe = m.uid === state.me?.id;
     if (!isMe) _memberNames.push(m.name);
+    const online = _isTrulyOnline(m.uid, m);
 
     const div = document.createElement('div');
     div.className = 'member-item';
     div.innerHTML = `
       <div class="avatar-wrap">
         <div class="avatar" style="background:${esc(m.color||avatarColor(m.name))}">${esc(initials(m.name))}</div>
-        <div class="status-dot online"></div>
+        <div class="status-dot ${online ? 'online' : 'offline'}"></div>
       </div>
       <div class="member-info">
         <div class="member-name">
           ${m.role === 'admin' ? '<span class="admin-crown" title="Admin">◆</span> ' : ''}${esc(m.name)}${isMe ? '<span class="me-tag"> (you)</span>' : ''}
         </div>
-        <div class="member-activity">● Online</div>
+        <div class="member-activity">${online ? '● Online' : 'Offline'}</div>
       </div>
       ${_canManage() && !isMe && m.role !== 'admin' ? `
         ${_isAdmin ? `<button class="member-promote-btn" title="Promote to Admin"
@@ -3690,19 +3688,7 @@ async function _checkRoomExpiry(code, db, knownSnap) {
 
 /** _ping — anonymous event counter, fire-and-forget. `n` > 1 reports a batch of events in one request.
  *  `dims` are low-cardinality labels (e.g. { ttl: 'm5' }); the server only accepts values from fixed lists. */
-function _ping(event, n, dims) {
-  try {
-    const body = { e: event };
-    if (n > 1) body.n = n;
-    if (dims) body.d = dims;
-    fetch('/api/analytics', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      keepalive: true,
-    }).catch(() => {});
-  } catch {}
-}
+function _ping() {}
 /** Public wrapper so the lazy modules (file-transfer, feedback) can report events too. */
 export function track(event, n, dims) { _ping(event, n, dims); }
 
@@ -3778,10 +3764,6 @@ function _enterSelectMode() {
       </button>
       <span class="msa-count" id="msa-count">0 selected</span>
       <div style="flex:1"></div>
-      <button class="msa-btn msa-info" id="msa-info" title="Message info" style="display:none">
-        <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-        <span>Info</span>
-      </button>
       <button class="msa-btn msa-del-me" id="msa-del-me" title="Delete for me" style="display:none">
         <svg viewBox="0 0 20 20" fill="none" width="18" height="18"><path d="M5 6h10M8 6V4h4v2M7 6l.6 9h4.8L13 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Me</span>
@@ -3794,7 +3776,6 @@ function _enterSelectMode() {
     const header = document.getElementById('chat-header');
     if (header) header.parentNode.insertBefore(bar, header);
     document.getElementById('msa-cancel').addEventListener('click', _exitSelectMode);
-    document.getElementById('msa-info').addEventListener('click', _infoSelected);
     document.getElementById('msa-del-me').addEventListener('click', () => _deleteSelected(false));
     document.getElementById('msa-del-all').addEventListener('click', () => _deleteSelected(true));
   }
@@ -3825,15 +3806,6 @@ function _updateSelectBar() {
     const w = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape(id)}"]`);
     return _isAdmin || w?.classList.contains('sent');
   });
-  const infoBtn = document.getElementById('msa-info');
-  if (infoBtn) {
-    let showInfo = false;
-    if (count === 1) {
-      const iw = document.querySelector(`.msg-wrapper[data-doc-id="${CSS.escape([..._selectedIds][0])}"]`);
-      showInfo = !!iw && !iw.classList.contains('deleted') && !String(iw.dataset.docId).startsWith('local_');
-    }
-    infoBtn.style.display = showInfo ? '' : 'none';
-  }
   const delMe  = document.getElementById('msa-del-me');
   const delAll = document.getElementById('msa-del-all');
   if (delMe)  delMe.style.display  = count ? '' : 'none';
@@ -3933,6 +3905,26 @@ async function _showMsgInfo(docId) {
     ['SENT', sentMs ? new Date(sentMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : 'Unknown'],
     ['STATUS', readerIds.length ? `Read by ${readerIds.length}` : 'Delivered'],
   ];
+  if (data.edited && data.editedAt) {
+    const editedMs = _createdMs({ createdAt: data.editedAt }) || 0;
+    rows.push(['EDITED', editedMs ? new Date(editedMs).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' }) : 'Yes']);
+  }
+  if (data.replyTo && data.replyTo.senderName) {
+    rows.push(['REPLYING TO', data.replyTo.senderName]);
+  }
+  if (data.fileName) rows.push(['FILE NAME', data.fileName]);
+  if (typeof data.fileSize === 'number' && data.fileSize > 0) {
+    const kb = data.fileSize / 1024;
+    rows.push(['FILE SIZE', kb < 1024 ? `${kb.toFixed(1)} KB` : `${(kb / 1024).toFixed(1)} MB`]);
+  }
+  if (data.mime) rows.push(['FILE TYPE', data.mime]);
+  if (data.reactions && Object.keys(data.reactions).length) {
+    const summary = Object.entries(data.reactions)
+      .map(([emoji, users]) => `${emoji} ${Object.keys(users || {}).length}`)
+      .join('  ');
+    if (summary) rows.push(['REACTIONS', summary]);
+  }
+  rows.push(['MESSAGE ID', docId]);
   $('mi-rows').innerHTML = rows.map(([k, v]) =>
     `<div class="md-row"><span class="md-row-label">${k}</span><span class="md-row-value">${esc(String(v))}</span></div>`
   ).join('');
@@ -3958,13 +3950,6 @@ async function _showMsgInfo(docId) {
     }
   }
   overlay.style.display = 'flex';
-}
-
-function _infoSelected() {
-  if (_selectedIds.size !== 1) return;
-  const docId = [..._selectedIds][0];
-  _exitSelectMode();
-  _showMsgInfo(docId);
 }
 
 async function _deleteSelected(forEveryone) {
@@ -4088,24 +4073,79 @@ function startHeartbeat() {
 // delivers anything missed. Rebuilding is kept as a safety net for a LONG
 // absence, when a mobile OS may have silently killed the socket; it also resets
 // the typing indicator, which is why doing it on every switch was noisy.
+// ── Panic wipe ──────────────────────────────────────────────────────────
+// Five taps on the room name (#chat-name) within 2 seconds instantly and
+// irreversibly clears everything stored on this device — no confirmation
+// dialog, by design: a panic gesture that stops to ask "are you sure?" has
+// already failed at the one job it has. This is local-only and runs even
+// offline; it does not (and cannot, by design) also mark the user offline
+// server-side, so other members may still briefly show this device as
+// online until CONFIG.PRESENCE_STALE_MS elapses (see _isTrulyOnline above) —
+// that's an acceptable tradeoff for a wipe that must not depend on a network
+// round trip to actually happen.
+async function _panicWipe() {
+  try { localStorage.clear(); } catch {}
+  try { await new Promise(res => {
+    const req = indexedDB.deleteDatabase(CONFIG.IDB_NAME);
+    req.onsuccess = req.onerror = req.onblocked = () => res();
+  }); } catch {}
+  try {
+    if (window.caches?.keys) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch {}
+  location.replace(location.origin + location.pathname.replace(/[^/]*$/, ''));
+}
+
+(function _installPanicWipeGesture() {
+  const TAPS_NEEDED = 5, WINDOW_MS = 2000;
+  let taps = [];
+  document.addEventListener('click', e => {
+    if (!e.target.closest?.('#chat-name')) return;
+    const now = Date.now();
+    taps = taps.filter(t => now - t < WINDOW_MS);
+    taps.push(now);
+    if (taps.length >= TAPS_NEEDED) { taps = []; _panicWipe(); }
+  });
+})();
+
 const _LISTENER_REBUILD_AFTER_MS = 30000;
+// A brief tab/app switch (notification shade, app switcher, alt-tab) used to
+// write online:false the instant visibility was lost, making presence flicker
+// for everyone else in the room over switches lasting a second or two. Only
+// commit the offline write if the tab is still hidden after a short grace
+// window — if the user comes back before it fires, cancel it and never write
+// anything, so a quick glance away no longer shows as a blip to other members.
+const _PRESENCE_HIDE_GRACE_MS = 6000;
 let _hiddenAt = 0;
+let _hideOfflineTimer = null;
 document.addEventListener('visibilitychange', () => {
   if (!state.me || !state.roomCode || !db) return;
   const online = !document.hidden;
-  if (!online) _hiddenAt = Date.now();
-  db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
-    .update({ online, lastSeen: ts_now() }).catch(() => {});
-  if (online) {
-    _unreadCount = 0;
-    document.title = 'MIUT';
-    if (!_hiddenAt || Date.now() - _hiddenAt >= _LISTENER_REBUILD_AFTER_MS || !_unsubMsgs) {
-      stopChatListeners(); startChatListeners();
-    }
-    _hiddenAt = 0;
-    try { _runExpirySweep(); } catch {}                 // refresh TTL bars right away
-    setTimeout(_markVisibleAsRead, 400); // mark newly visible messages as read
+
+  if (!online) {
+    _hiddenAt = Date.now();
+    clearTimeout(_hideOfflineTimer);
+    _hideOfflineTimer = setTimeout(() => {
+      if (!document.hidden || !state.me || !state.roomCode || !db) return;
+      db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
+        .update({ online: false, lastSeen: ts_now() }).catch(() => {});
+    }, _PRESENCE_HIDE_GRACE_MS);
+    return;
   }
+
+  clearTimeout(_hideOfflineTimer);
+  db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
+    .update({ online: true, lastSeen: ts_now() }).catch(() => {});
+  _unreadCount = 0;
+  document.title = 'MIUT';
+  if (!_hiddenAt || Date.now() - _hiddenAt >= _LISTENER_REBUILD_AFTER_MS || !_unsubMsgs) {
+    stopChatListeners(); startChatListeners();
+  }
+  _hiddenAt = 0;
+  try { _runExpirySweep(); } catch {}                 // refresh TTL bars right away
+  setTimeout(_markVisibleAsRead, 400); // mark newly visible messages as read
 });
 
 // SW update notification: intentionally NOT handled here. sw-bridge.js's
@@ -4121,13 +4161,13 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('beforeunload', () => {
   if (!state.me || !state.roomCode || !db) return;
   clearMyTyping();
-  // Synchronous best-effort update — beacon preferred for reliability
-  const payload = JSON.stringify({ online: false, lastSeen: Date.now() });
-  if (navigator.sendBeacon) {
-    // sendBeacon for reliability on page close (ignored if endpoint absent)
-    // Primary: direct Firestore REST update via sendBeacon is not feasible,
-    // so fall back to synchronous XHR.
-  }
+  // Best-effort only — an async Firestore write started during beforeunload
+  // frequently never completes before the page actually tears down, so this
+  // cannot be relied on to flip `online` to false promptly. That's fine: every
+  // UI surface that reads presence (_isTrulyOnline) treats `online` as stale
+  // once `lastSeen` is older than CONFIG.PRESENCE_STALE_MS regardless of
+  // whether this write ever lands, so a closed tab shows offline to everyone
+  // else within that window even when this call is silently dropped.
   try {
     db.collection('rooms').doc(state.roomCode).collection('members').doc(state.me.id)
       .update({ online: false, lastSeen: ts_now() }).catch(() => {});
@@ -5513,6 +5553,19 @@ function showInlineActions(wrap, docId, plainText, msgTs, isMine) {
     }
   }
 
+  const _detailsId = currentId();
+  if (!wrap.classList.contains('deleted') && !String(_detailsId).startsWith('local_')) {
+    const detailsBtn = document.createElement('button');
+    detailsBtn.className = 'strip-action';
+    detailsBtn.innerHTML = `<svg viewBox="0 0 20 20" fill="none" width="15" height="15"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Details</span>`;
+    detailsBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      strip.remove();
+      _showMsgInfo(_detailsId);
+    });
+    actRow.appendChild(detailsBtn);
+  }
+
   strip.appendChild(actRow);
 
   // "Delete for me" is always available (local-only, no confirm needed —
@@ -6160,9 +6213,8 @@ async function _handoffAdminRole(roomCodeOverride, meOverride) {
     let nextUid = null, nextName = null;
 
     // First try online members
-    const _handoffNow = Date.now();
     snap.forEach(doc => {
-      if (doc.id !== _me.id && doc.data().role !== 'admin' && !nextUid && _isLiveMember(doc.data(), doc.id, _me.id, _handoffNow)) {
+      if (doc.id !== _me.id && doc.data().role !== 'admin' && !nextUid) {
         nextUid  = doc.id;
         nextName = doc.data().name;
       }
@@ -6288,10 +6340,7 @@ async function handleLogout() {
       // rejoinable indefinitely. Calling it explicitly from the leaving
       // client closes that gap regardless of whether anyone else happens
       // to be watching.
-      let _emptiesNow = _leavingEmptiesRoom;
-      try { _emptiesNow = (await _liveOthersCount(_leavingRoomCode, _leavingMe.id)) === 0; }
-      catch (e) { _log('warn', '[MIUT] Fresh presence check failed, using cached count:', e); }
-      if (_emptiesNow) {
+      if (_leavingEmptiesRoom) {
         try { await _handleRoomBecameEmpty(_leavingRoomCode); }
         catch (e) { _log('warn', '[MIUT] Empty-room expiry check failed:', e); }
       }
